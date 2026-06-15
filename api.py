@@ -21,6 +21,7 @@ import sys
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -72,6 +73,7 @@ def _patched_tqdm_init(self, *args, **kwargs):
 tqdm.__init__ = _patched_tqdm_init
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_NAME_TO_ID
 
 logging.basicConfig(
@@ -94,7 +96,14 @@ _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
 _API_DEVICE = None
 _API_LOAD_ASR = False
-_API_LOCK = asyncio.Lock()
+_MODEL_LOAD_LOCK = asyncio.Lock()
+_API_INFER_LOCK = asyncio.Lock()
+
+_DURATION_ESTIMATOR = RuleDurationEstimator()
+_VOICE_PROMPT_CACHE: OrderedDict[str, Any] = OrderedDict()
+_MAX_VOICE_PROMPT_CACHE_SIZE = int(
+    os.environ.get("OMNIVOICE_VOICE_PROMPT_CACHE_SIZE", "100")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -218,16 +227,81 @@ def _audio_duration_seconds(path):
     return None
 
 
-def _write_base64_audio(b64_data, out_path):
-    """Decode base64 audio data and write to file. Supports data URI prefix."""
+def _decode_base64_audio_bytes(b64_data):
+    """Decode base64 audio data to bytes. Supports data URI prefix."""
     b64_data = str(b64_data or "").strip()
     if b64_data.startswith("data:"):
         b64_data = b64_data.split(",", 1)[1] if "," in b64_data else b64_data
-    audio_bytes = base64.b64decode(b64_data)
+    return base64.b64decode(b64_data)
+
+
+def _write_base64_audio(b64_data, out_path):
+    """Decode base64 audio data and write to file. Supports data URI prefix.
+
+    Returns the written path.
+    """
+    audio_bytes = _decode_base64_audio_bytes(b64_data)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(audio_bytes)
     return out_path
+
+
+def _make_voice_prompt_cache_key(audio_bytes: bytes, prompt_text: str, preprocess_prompt: bool) -> str:
+    """Hash reference audio bytes + prompt metadata for prompt caching."""
+    payload = {
+        "audio_sha256": hashlib.sha256(audio_bytes).hexdigest(),
+        "prompt_text": prompt_text,
+        "preprocess_prompt": preprocess_prompt,
+        "model_id": _API_MODEL_ID,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _get_cached_voice_clone_prompt(
+    model,
+    audio_path: str,
+    audio_bytes: bytes,
+    prompt_text: str,
+    preprocess_prompt: bool,
+):
+    """Create a voice-clone prompt, caching by audio content hash."""
+    cache_key = _make_voice_prompt_cache_key(audio_bytes, prompt_text, preprocess_prompt)
+    cached = _VOICE_PROMPT_CACHE.get(cache_key)
+    if cached is not None:
+        logger.debug("Voice clone prompt cache hit: %s", cache_key[:16])
+        return cached
+
+    prompt = _create_voice_clone_prompt(
+        model,
+        audio_path,
+        prompt_audio=None,
+        prompt_text=prompt_text,
+    )
+
+    # Simple LRU: pop oldest if cache is full.
+    if len(_VOICE_PROMPT_CACHE) >= _MAX_VOICE_PROMPT_CACHE_SIZE:
+        _VOICE_PROMPT_CACHE.popitem(last=False)
+    _VOICE_PROMPT_CACHE[cache_key] = prompt
+    return prompt
+
+
+def _estimate_natural_duration(
+    text: str,
+    ref_text: Optional[str],
+    ref_duration: Optional[float],
+) -> float:
+    """Estimate natural duration for the target text using the rule estimator."""
+    if ref_duration and ref_text:
+        return _DURATION_ESTIMATOR.estimate_duration(
+            text, ref_text, ref_duration, low_threshold=2.0
+        )
+    # Fallback: assume a neutral reference when no prompt text/audio is available.
+    return _DURATION_ESTIMATOR.estimate_duration(
+        text, "Nice to meet you.", 1.5, low_threshold=2.0
+    )
 
 
 def _read_audio_base64(path):
@@ -266,7 +340,12 @@ def _load_api_model_sync():
 
 async def _ensure_api_model():
     global _API_MODEL
-    if _API_MODEL is None:
+    if _API_MODEL is not None:
+        return _API_MODEL
+    async with _MODEL_LOAD_LOCK:
+        # Double-check after acquiring lock.
+        if _API_MODEL is not None:
+            return _API_MODEL
         _API_MODEL = await asyncio.to_thread(_load_api_model_sync)
     return _API_MODEL
 
@@ -363,13 +442,13 @@ def _resolve_language(value):
     return raw
 
 
-def _write_generated_audio(model, audio, out_path):
-    wav = audio[0]
-    if hasattr(wav, "detach"):
-        wav = wav.detach().cpu()
-    if hasattr(wav, "numpy"):
-        wav = wav.numpy()
-    waveform = np.squeeze(wav).astype(np.float32)
+def _write_generated_audio(model, waveform, out_path):
+    """Write a generated audio waveform (np.ndarray, shape (T,) or (C, T)) to disk."""
+    if hasattr(waveform, "detach"):
+        waveform = waveform.detach().cpu()
+    if hasattr(waveform, "numpy"):
+        waveform = waveform.numpy()
+    waveform = np.squeeze(waveform).astype(np.float32)
     sf.write(str(out_path), waveform, int(model.sampling_rate), subtype="PCM_16")
 
 
@@ -397,13 +476,47 @@ def _is_empty_reference_after_preprocess(exc):
     return "Reference audio is empty after silence removal" in str(exc)
 
 
-def _synthesize_omnivoice_to_file(
+def _cleanup_temp_paths(*paths):
+    for path in paths:
+        if path is not None:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _make_generation_config(
+    cfg_value=2.0,
+    inference_timesteps=32,
+    denoise=True,
+    preprocess_prompt=True,
+    postprocess_output=True,
+    t_shift=0.1,
+    layer_penalty_factor=5.0,
+    position_temperature=5.0,
+    class_temperature=0.0,
+    audio_chunk_duration=15.0,
+    audio_chunk_threshold=30.0,
+):
+    return OmniVoiceGenerationConfig(
+        num_step=int(inference_timesteps),
+        guidance_scale=float(cfg_value),
+        t_shift=float(t_shift),
+        layer_penalty_factor=float(layer_penalty_factor),
+        position_temperature=float(position_temperature),
+        class_temperature=float(class_temperature),
+        denoise=bool(denoise),
+        preprocess_prompt=bool(preprocess_prompt),
+        postprocess_output=bool(postprocess_output),
+        audio_chunk_duration=float(audio_chunk_duration),
+        audio_chunk_threshold=float(audio_chunk_threshold),
+    )
+
+
+def _generate_omnivoice_audio(
     model,
     text,
-    out_path,
-    reference_audio=None,
-    prompt_audio=None,
-    prompt_text="",
+    voice_clone_prompt=None,
     cfg_value=2.0,
     inference_timesteps=32,
     denoise=True,
@@ -421,22 +534,20 @@ def _synthesize_omnivoice_to_file(
     audio_chunk_duration=15.0,
     audio_chunk_threshold=30.0,
 ):
-    def make_gen_config(enable_preprocess):
-        return OmniVoiceGenerationConfig(
-            num_step=int(inference_timesteps),
-            guidance_scale=float(cfg_value),
-            t_shift=float(t_shift),
-            layer_penalty_factor=float(layer_penalty_factor),
-            position_temperature=float(position_temperature),
-            class_temperature=float(class_temperature),
-            denoise=bool(denoise),
-            preprocess_prompt=bool(enable_preprocess),
-            postprocess_output=bool(postprocess_output),
-            audio_chunk_duration=float(audio_chunk_duration),
-            audio_chunk_threshold=float(audio_chunk_threshold),
-        )
-
-    gen_config = make_gen_config(preprocess_prompt)
+    """Run model.generate and return the first audio waveform (np.ndarray)."""
+    gen_config = _make_generation_config(
+        cfg_value=cfg_value,
+        inference_timesteps=inference_timesteps,
+        denoise=denoise,
+        preprocess_prompt=preprocess_prompt,
+        postprocess_output=postprocess_output,
+        t_shift=t_shift,
+        layer_penalty_factor=layer_penalty_factor,
+        position_temperature=position_temperature,
+        class_temperature=class_temperature,
+        audio_chunk_duration=audio_chunk_duration,
+        audio_chunk_threshold=audio_chunk_threshold,
+    )
     kw: Dict[str, Any] = {
         "text": text.strip(),
         "language": _resolve_language(language),
@@ -446,16 +557,11 @@ def _synthesize_omnivoice_to_file(
         kw["speed"] = float(speed)
     if duration is not None and float(duration) > 0:
         kw["duration"] = float(duration)
-    clone_audio = reference_audio or prompt_audio
-    if clone_audio:
-        kw["voice_clone_prompt"] = _create_voice_clone_prompt(
-            model,
-            clone_audio,
-            prompt_audio=prompt_audio if reference_audio else None,
-            prompt_text=prompt_text,
-        )
+    if voice_clone_prompt is not None:
+        kw["voice_clone_prompt"] = voice_clone_prompt
     if instruct and str(instruct).strip() and str(instruct).strip() != "None":
         kw["instruct"] = str(instruct).strip()
+
     def generate_with_seed():
         _apply_seed(seed)
         return model.generate(**kw)
@@ -468,9 +574,267 @@ def _synthesize_omnivoice_to_file(
         logger.warning(
             "Reference audio became empty after OmniVoice silence removal; retrying with preprocess_prompt=False"
         )
-        kw["generation_config"] = make_gen_config(False)
+        kw["generation_config"] = _make_generation_config(
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            denoise=denoise,
+            preprocess_prompt=False,
+            postprocess_output=postprocess_output,
+            t_shift=t_shift,
+            layer_penalty_factor=layer_penalty_factor,
+            position_temperature=position_temperature,
+            class_temperature=class_temperature,
+            audio_chunk_duration=audio_chunk_duration,
+            audio_chunk_threshold=audio_chunk_threshold,
+        )
         audio = generate_with_seed()
-    _write_generated_audio(model, audio, out_path)
+
+    # model.generate returns list[np.ndarray]; take the first (and only) item.
+    return audio[0]
+
+
+def _generate_with_duration_refinement(
+    model,
+    text,
+    target_duration,
+    duration_tolerance,
+    max_attempts,
+    voice_clone_prompt=None,
+    **gen_kwargs,
+):
+    """Generate audio, optionally retrying until duration is within tolerance.
+
+    Returns:
+        (audio_waveform, attempts_made, attempt_log)
+    """
+    if target_duration is None or target_duration <= 0:
+        audio = _generate_omnivoice_audio(
+            model, text, voice_clone_prompt=voice_clone_prompt, **gen_kwargs
+        )
+        return audio, 1, []
+
+    current_duration = float(target_duration)
+    best_audio = None
+    best_error = float("inf")
+    attempt_log = []
+
+    for attempt in range(max_attempts):
+        kwargs = dict(gen_kwargs)
+        kwargs["duration"] = current_duration
+        audio = _generate_omnivoice_audio(
+            model, text, voice_clone_prompt=voice_clone_prompt, **kwargs
+        )
+        actual_duration = audio.shape[-1] / model.sampling_rate
+        error = abs(actual_duration - current_duration)
+        attempt_log.append(
+            {
+                "attempt": attempt + 1,
+                "target_duration": current_duration,
+                "actual_duration": actual_duration,
+                "error": error,
+            }
+        )
+
+        if duration_tolerance is None or error <= duration_tolerance:
+            return audio, attempt + 1, attempt_log
+
+        if error < best_error:
+            best_error = error
+            best_audio = audio
+
+        if attempt < max_attempts - 1 and actual_duration > 0:
+            # Scale target duration by the observed ratio.
+            ratio = current_duration / actual_duration
+            next_duration = current_duration * ratio
+            logger.info(
+                "Duration refinement attempt %d: target=%.3fs actual=%.3fs; "
+                "retrying with duration=%.3fs",
+                attempt + 1,
+                current_duration,
+                actual_duration,
+                next_duration,
+            )
+            current_duration = next_duration
+
+    logger.warning(
+        "Duration refinement did not converge within tolerance %.3fs after %d attempts; "
+        "returning closest result (error=%.3fs)",
+        duration_tolerance if duration_tolerance is not None else 0.0,
+        max_attempts,
+        best_error,
+    )
+    return best_audio, max_attempts, attempt_log
+
+
+def _audio_duration(waveform, sampling_rate: int) -> float:
+    """Return audio duration in seconds from a 1-D waveform."""
+    arr = np.asarray(waveform)
+    return float(arr.shape[-1]) / sampling_rate
+
+
+def _measure_silence_ratio(waveform, threshold: float = 0.01) -> float:
+    """Return ratio of samples whose absolute amplitude is below threshold."""
+    arr = np.asarray(waveform)
+    if arr.size == 0:
+        return 1.0
+    return float(np.mean(np.abs(arr) < threshold))
+
+
+def _compute_rms(waveform) -> float:
+    arr = np.asarray(waveform)
+    if arr.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
+
+
+def _check_audio_quality(
+    waveform,
+    sampling_rate: int,
+    target_duration: Optional[float] = None,
+    duration_tolerance: Optional[float] = None,
+    ref_duration: Optional[float] = None,
+) -> list[str]:
+    """Check generated audio for common badcase patterns.
+
+    Returns a list of issue labels; empty list means no detected issue.
+    """
+    issues = []
+    arr = np.asarray(waveform)
+    duration = _audio_duration(arr, sampling_rate)
+    peak = float(np.abs(arr).max()) if arr.size > 0 else 0.0
+    rms = _compute_rms(arr)
+    silence_ratio = _measure_silence_ratio(arr)
+
+    if arr.size == 0 or duration < 0.05:
+        issues.append("empty")
+    if silence_ratio > 0.5:
+        issues.append("too_much_silence")
+    if peak > 0.99:
+        issues.append("clipping")
+    if 0 < rms < 0.005:
+        issues.append("too_quiet")
+
+    if target_duration is not None and target_duration > 0:
+        tol = duration_tolerance if duration_tolerance is not None else 0.0
+        # Flag if deviation is more than 2x tolerance or > 0.5s, whichever is larger.
+        if abs(duration - target_duration) > max(tol * 2, 0.5):
+            issues.append("duration_off_target")
+
+    if ref_duration is not None and ref_duration > 0:
+        ratio = duration / ref_duration
+        if ratio > 3.0 or ratio < 0.33:
+            issues.append("duration_off_reference")
+
+    return issues
+
+
+def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dict[str, Any]:
+    """Build a more conservative generation config for badcase retry."""
+    fallback = dict(gen_kwargs)
+
+    # More decoding steps + slightly stronger guidance for stability.
+    fallback["inference_timesteps"] = min(
+        int(fallback.get("inference_timesteps", 32) * 1.5), 64
+    )
+    fallback["guidance_scale"] = min(
+        float(fallback.get("guidance_scale", 2.0)) + 0.2, 3.0
+    )
+
+    if "too_much_silence" in issues or "empty" in issues:
+        # Tighter position sampling to reduce random unmasking of silences.
+        fallback["position_temperature"] = max(
+            float(fallback.get("position_temperature", 5.0)) * 0.6, 1.0
+        )
+
+    if "clipping" in issues:
+        # Disable post-processing in case aggressive trimming/leveling caused clipping.
+        fallback["postprocess_output"] = False
+
+    if "too_quiet" in issues:
+        # Keep post-processing so RMS normalization can boost quiet output.
+        fallback["postprocess_output"] = True
+
+    if "duration_off_target" in issues or "duration_off_reference" in issues:
+        # Reduce t_shift to emphasize earlier (lower-SNR) steps, often yields
+        # more stable timing.
+        fallback["t_shift"] = max(float(fallback.get("t_shift", 0.1)) * 0.7, 0.03)
+
+    return fallback
+
+
+def _duration_error(waveform, sampling_rate: int, target_duration: Optional[float]) -> float:
+    if target_duration is None or target_duration <= 0:
+        return 0.0
+    return abs(_audio_duration(waveform, sampling_rate) - target_duration)
+
+
+def _generate_with_quality_retry(
+    model,
+    text,
+    target_duration,
+    duration_tolerance,
+    voice_clone_prompt=None,
+    ref_duration=None,
+    enable_quality_retry=True,
+    **gen_kwargs,
+):
+    """Generate audio with duration refinement and one badcase retry.
+
+    Returns:
+        (audio_waveform, duration_attempts, duration_log, quality_issues, quality_retried)
+    """
+    audio, attempts, log = _generate_with_duration_refinement(
+        model,
+        text,
+        target_duration=target_duration,
+        duration_tolerance=duration_tolerance,
+        max_attempts=2,
+        voice_clone_prompt=voice_clone_prompt,
+        **gen_kwargs,
+    )
+    issues = _check_audio_quality(
+        audio,
+        model.sampling_rate,
+        target_duration=target_duration,
+        duration_tolerance=duration_tolerance,
+        ref_duration=ref_duration,
+    )
+
+    if not issues or not enable_quality_retry:
+        return audio, attempts, log, issues, False
+
+    logger.info(
+        "Quality issues detected on first attempt: %s; retrying with fallback params",
+        issues,
+    )
+    fallback_kwargs = _apply_fallback_params(gen_kwargs, issues)
+    # For retry, use the original target without refinement to keep latency bounded.
+    audio2, attempts2, log2 = _generate_with_duration_refinement(
+        model,
+        text,
+        target_duration=target_duration,
+        duration_tolerance=None,
+        max_attempts=1,
+        voice_clone_prompt=voice_clone_prompt,
+        **fallback_kwargs,
+    )
+    issues2 = _check_audio_quality(
+        audio2,
+        model.sampling_rate,
+        target_duration=target_duration,
+        duration_tolerance=duration_tolerance,
+        ref_duration=ref_duration,
+    )
+
+    # Choose the result with fewer issues; tie-break by duration closeness.
+    if len(issues2) < len(issues) or (
+        len(issues2) == len(issues)
+        and _duration_error(audio2, model.sampling_rate, target_duration)
+        < _duration_error(audio, model.sampling_rate, target_duration)
+    ):
+        return audio2, attempts + attempts2, log + log2, issues2, True
+
+    return audio, attempts, log, issues, False
 
 
 routes = web.RouteTableDef()
@@ -508,6 +872,7 @@ async def unload(request):
     global _API_MODEL
     count = 1 if _API_MODEL is not None else 0
     _API_MODEL = None
+    _VOICE_PROMPT_CACHE.clear()
     import gc
     gc.collect()
     if sys.platform != "win32":
@@ -558,6 +923,19 @@ async def synthesize(request):
     user_speed = float(data.get("speed", 1.0))
     seed = _stable_seed_from_request(data, text, effective_prompt_text, reference_audio_base64, prompt_wav_base64)
 
+    # Parse duration control parameters.
+    target_duration_sec = (
+        float(target_duration_ms) / 1000.0 if target_duration_ms is not None else None
+    )
+    max_duration_sec = (
+        float(max_duration_ms) / 1000.0 if max_duration_ms is not None else None
+    )
+    duration_tolerance_sec = (
+        float(duration_tolerance_ms) / 1000.0
+        if duration_tolerance_ms is not None
+        else None
+    )
+
     # Prepare output directory
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -568,12 +946,15 @@ async def synthesize(request):
     resolved_ref = None
     resolved_prompt = None
     ref_duration = None
+    ref_audio_bytes = None
+    prompt_audio_bytes = None
 
     if reference_audio_base64:
         ref_temp_path = out_dir / f"ref_{uuid.uuid4().hex}.wav"
         ref_temp_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _write_base64_audio(reference_audio_base64, ref_temp_path)
+            ref_audio_bytes = _decode_base64_audio_bytes(reference_audio_base64)
+            ref_temp_path.write_bytes(ref_audio_bytes)
             resolved_ref = str(ref_temp_path)
             ref_duration = _get_ref_audio_duration(ref_temp_path)
             logger.info(f"[{req_id}] reference audio decoded: {ref_temp_path} ({ref_temp_path.stat().st_size} bytes), duration={ref_duration}s")
@@ -589,7 +970,8 @@ async def synthesize(request):
         out_dir.mkdir(parents=True, exist_ok=True)
         prompt_temp_path = out_dir / f"prompt_{uuid.uuid4().hex}.wav"
         try:
-            _write_base64_audio(prompt_wav_base64, prompt_temp_path)
+            prompt_audio_bytes = _decode_base64_audio_bytes(prompt_wav_base64)
+            prompt_temp_path.write_bytes(prompt_audio_bytes)
             resolved_prompt = str(prompt_temp_path)
             logger.info(f"[{req_id}] prompt wav decoded: {prompt_temp_path} ({prompt_temp_path.stat().st_size} bytes)")
         except Exception as exc:
@@ -615,21 +997,39 @@ async def synthesize(request):
     position_temperature = adaptive_params["position_temperature"]
     class_temperature = adaptive_params["class_temperature"]
 
+    # Estimate natural duration for the target text (used for badcase avoidance
+    # and max-duration validation).
+    estimated_natural_duration = _estimate_natural_duration(
+        text,
+        ref_text=effective_prompt_text if effective_prompt_text else None,
+        ref_duration=ref_duration,
+    )
+
+    # Validate against max_duration_ms early.
+    if max_duration_sec is not None and estimated_natural_duration > max_duration_sec:
+        logger.warning(
+            f"[{req_id}] Estimated natural duration {estimated_natural_duration:.2f}s "
+            f"exceeds max_duration_ms={max_duration_ms}"
+        )
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+        return _error(
+            f"Estimated natural duration ({estimated_natural_duration:.2f}s) exceeds "
+            f"max_duration_ms ({max_duration_sec:.2f}s). Try shorter text or increase max_duration_ms.",
+            status=400,
+        )
+
     # Adaptive duration: try to match ref audio length when user doesn't specify duration
     # Strategy: use ref audio duration as target, but avoid badcases by checking text length
     effective_duration = user_duration
     effective_speed = user_speed
-    if user_duration is None and ref_duration is not None and user_speed == 1.0:
-        # Estimate if forcing ref_duration would cause badcase
-        # Heuristic: if text is short enough relative to ref audio, use ref_duration
-        # A typical speaker produces ~3-5 chars/sec for Chinese, ~10-15 chars/sec for English
-        is_chinese_text = bool(re.search(r'[\u4e00-\u9fff]', text))
-        if is_chinese_text:
-            chars_per_sec = 4.0  # conservative estimate for Chinese
-        else:
-            chars_per_sec = 12.0  # conservative estimate for English
-
-        estimated_natural_duration = len(text) / chars_per_sec
+    if user_duration is None and target_duration_sec is not None:
+        # target_duration_ms takes precedence over ref-duration matching.
+        effective_duration = target_duration_sec
+        logger.info(
+            f"[{req_id}] Using target_duration_ms={target_duration_ms} "
+            f"as target duration={effective_duration:.3f}s"
+        )
+    elif user_duration is None and ref_duration is not None and user_speed == 1.0:
         # If ref_duration can accommodate the text without rushing (>=70% of natural duration)
         if ref_duration >= estimated_natural_duration * 0.7:
             effective_duration = ref_duration
@@ -640,6 +1040,22 @@ async def synthesize(request):
     elif user_duration is None and ref_duration is not None and user_speed != 1.0:
         # User specified speed, respect it but log for debugging
         logger.info(f"[{req_id}] User specified speed={user_speed}, skipping ref_duration matching")
+
+    # Final validation: requested/fallback duration must not exceed max_duration_ms.
+    if (
+        max_duration_sec is not None
+        and effective_duration is not None
+        and effective_duration > max_duration_sec
+    ):
+        logger.warning(
+            f"[{req_id}] Requested target duration {effective_duration:.2f}s "
+            f"exceeds max_duration_ms={max_duration_ms}"
+        )
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+        return _error(
+            f"Target duration ({effective_duration:.2f}s) exceeds max_duration_ms ({max_duration_sec:.2f}s).",
+            status=400,
+        )
 
     logger.info(
         f"[{req_id}] params: text_len={len(text)}, has_ref={bool(reference_audio_base64)}, "
@@ -687,61 +1103,136 @@ async def synthesize(request):
             ref_temp_path = new_ref_path
             resolved_ref = str(ref_temp_path)
 
+    # Load model (loading is serialized via _MODEL_LOAD_LOCK).
+    model = await _ensure_api_model()
+
+    preprocess_prompt = _bool_option(data.get("preprocess_prompt"), True)
+    postprocess_output = _bool_option(data.get("postprocess_output"), True)
+
+    if (
+        target_duration_sec is not None
+        and postprocess_output
+        and (duration_tolerance_sec is None or duration_tolerance_sec < 0.05)
+    ):
+        logger.warning(
+            f"[{req_id}] target_duration_ms requested with tight tolerance and "
+            f"postprocess_output=True; post-processing may trim trailing silence "
+            f"and break exact duration matching."
+        )
+
+    language = (
+        data.get("language")
+        or data.get("target_lang")
+        or data.get("target_language")
+        or data.get("output_language_code")
+    )
+    instruct = data.get("instruct")
+
+    gen_kwargs = {
+        "cfg_value": cfg_value,
+        "inference_timesteps": inference_timesteps,
+        "denoise": denoise,
+        "speed": effective_speed,
+        "duration": None,  # overridden by refinement loop
+        "language": language,
+        "instruct": instruct,
+        "preprocess_prompt": preprocess_prompt,
+        "postprocess_output": postprocess_output,
+        "seed": seed,
+        "t_shift": t_shift,
+        "layer_penalty_factor": layer_penalty_factor,
+        "position_temperature": position_temperature,
+        "class_temperature": class_temperature,
+        "audio_chunk_duration": float(data.get("audio_chunk_duration", 15.0)),
+        "audio_chunk_threshold": float(data.get("audio_chunk_threshold", 30.0)),
+    }
+
+    # Serialize prompt creation + generation to keep deterministic seeding safe
+    # and to avoid concurrent ASR/tokenizer issues. Audio I/O before/after this
+    # block can still overlap across requests.
     start_time = time.time()
     try:
-        async with _API_LOCK:
-            model = await _ensure_api_model()
+        async with _API_INFER_LOCK:
             logger.info(f"[{req_id}] synthesis started -> {out_path}")
-            await asyncio.to_thread(
-                _synthesize_omnivoice_to_file,
+
+            # Build voice-clone prompt (cached) inside the lock to avoid concurrent
+            # ASR/tokenizer access; repeated references still benefit from the cache.
+            voice_clone_prompt = None
+            if reference_audio_base64 or prompt_wav_base64:
+                clone_audio_path = resolved_ref or resolved_prompt
+                clone_audio_bytes = ref_audio_bytes or prompt_audio_bytes
+                prompt_for_clone = effective_prompt_text if resolved_prompt else ""
+                if clone_audio_path and clone_audio_bytes:
+                    try:
+                        voice_clone_prompt = _get_cached_voice_clone_prompt(
+                            model,
+                            audio_path=clone_audio_path,
+                            audio_bytes=clone_audio_bytes,
+                            prompt_text=prompt_for_clone,
+                            preprocess_prompt=preprocess_prompt,
+                        )
+                    except ValueError as exc:
+                        if not preprocess_prompt or not _is_empty_reference_after_preprocess(exc):
+                            raise
+                        logger.warning(
+                            f"[{req_id}] Reference audio became empty after silence removal; "
+                            f"retrying with preprocess_prompt=False"
+                        )
+                        preprocess_prompt = False
+                        gen_kwargs["preprocess_prompt"] = False
+                        voice_clone_prompt = _get_cached_voice_clone_prompt(
+                            model,
+                            audio_path=clone_audio_path,
+                            audio_bytes=clone_audio_bytes,
+                            prompt_text=prompt_for_clone,
+                            preprocess_prompt=False,
+                        )
+
+            (
+                audio_waveform,
+                attempts_made,
+                attempt_log,
+                quality_issues,
+                quality_retried,
+            ) = await asyncio.to_thread(
+                _generate_with_quality_retry,
                 model,
                 text,
-                out_path,
-                reference_audio=resolved_ref,
-                prompt_audio=resolved_prompt,
-                prompt_text=effective_prompt_text if resolved_prompt else "",
-                cfg_value=cfg_value,
-                inference_timesteps=inference_timesteps,
-                denoise=denoise,
-                speed=effective_speed,
-                duration=effective_duration,
-                language=data.get("language")
-                or data.get("target_lang")
-                or data.get("target_language")
-                or data.get("output_language_code"),
-                instruct=data.get("instruct"),
-                preprocess_prompt=_bool_option(data.get("preprocess_prompt"), True),
-                postprocess_output=_bool_option(data.get("postprocess_output"), True),
-                seed=seed,
-                t_shift=t_shift,
-                layer_penalty_factor=layer_penalty_factor,
-                position_temperature=position_temperature,
-                class_temperature=class_temperature,
-                audio_chunk_duration=float(data.get("audio_chunk_duration", 15.0)),
-                audio_chunk_threshold=float(data.get("audio_chunk_threshold", 30.0)),
+                target_duration=effective_duration,
+                duration_tolerance=duration_tolerance_sec,
+                voice_clone_prompt=voice_clone_prompt,
+                ref_duration=ref_duration,
+                enable_quality_retry=_bool_option(
+                    data.get("quality_retry"), True
+                ),
+                **gen_kwargs,
             )
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] Synthesis failed: {exc}\n{tb}")
-        if ref_temp_path and ref_temp_path.exists():
-            ref_temp_path.unlink(missing_ok=True)
-        if prompt_temp_path and prompt_temp_path.exists():
-            prompt_temp_path.unlink(missing_ok=True)
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
         return _error(f"Synthesis failed: {exc}\n{tb}", status=502)
+
+    try:
+        _write_generated_audio(model, audio_waveform, out_path)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"[{req_id}] Failed to write output audio: {exc}\n{tb}")
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+        return _error(f"Failed to write output audio: {exc}\n{tb}", status=502)
 
     elapsed = round(time.time() - start_time, 3)
     if not out_path.exists():
         logger.error(f"[{req_id}] Output file not created: {out_path}")
-        if ref_temp_path and ref_temp_path.exists():
-            ref_temp_path.unlink(missing_ok=True)
-        if prompt_temp_path and prompt_temp_path.exists():
-            prompt_temp_path.unlink(missing_ok=True)
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
         return _error("Synthesis finished but output file was not created.", status=502)
 
     audio_duration = _audio_duration_seconds(out_path)
     logger.info(
         f"[{req_id}] synthesis finished in {elapsed}s, output: {out_path} "
-        f"({out_path.stat().st_size} bytes), audio_duration={audio_duration}"
+        f"({out_path.stat().st_size} bytes), audio_duration={audio_duration}, "
+        f"duration_attempts={attempts_made}, quality_issues={quality_issues}, "
+        f"quality_retried={quality_retried}"
     )
 
     try:
@@ -749,16 +1240,10 @@ async def synthesize(request):
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] Failed to encode output audio: {exc}\n{tb}")
-        if ref_temp_path and ref_temp_path.exists():
-            ref_temp_path.unlink(missing_ok=True)
-        if prompt_temp_path and prompt_temp_path.exists():
-            prompt_temp_path.unlink(missing_ok=True)
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
         return _error(f"Failed to encode output audio: {exc}\n{tb}", status=502)
 
-    if ref_temp_path and ref_temp_path.exists():
-        ref_temp_path.unlink(missing_ok=True)
-    if prompt_temp_path and prompt_temp_path.exists():
-        prompt_temp_path.unlink(missing_ok=True)
+    _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
 
     logger.info(f"[{req_id}] response sent, audio_base64_len={len(output_base64)}")
     return _json_response({
@@ -772,6 +1257,10 @@ async def synthesize(request):
         "max_duration_ms": max_duration_ms,
         "duration_tolerance_ms": duration_tolerance_ms,
         "seed": seed,
+        "duration_attempts": attempts_made,
+        "duration_refinement_log": attempt_log,
+        "quality_issues": quality_issues,
+        "quality_retried": quality_retried,
         "duration_match": {
             "ref_duration": ref_duration,
             "target_duration": effective_duration,
@@ -819,9 +1308,10 @@ Request (JSON):
   "class_temperature": 0.0,            // 可选；0=贪心解码
   "denoise": true,
   "optimize": false,
-  "target_duration_ms": 2200,
-  "max_duration_ms": 3000,
-  "duration_tolerance_ms": 176,
+  "target_duration_ms": 2200,          // 可选；目标时长（毫秒），优先于 ref_duration 匹配
+  "max_duration_ms": 3000,             // 可选；允许的最大时长（毫秒），超出时提前拒绝
+  "duration_tolerance_ms": 176,        // 可选；目标时长容差，超容差会自动重试一次
+  "quality_retry": true,               // 可选；检测空/静音/削顶等 badcase 后自动重试
   "audio_chunk_duration": 15.0,        // 可选；长文本分块时长
   "audio_chunk_threshold": 30.0,       // 可选；触发分块阈值
   "seed": 123456789                    // 可选；不传时默认派生稳定 seed
@@ -832,6 +1322,9 @@ Adaptive Quality Profiles (based on reference audio length):
   2-4s: num_step=40, guidance_scale=2.0, t_shift=0.08 (balanced)
   4-5s: num_step=36, guidance_scale=2.0, t_shift=0.10 (optimal)
   > 5s: num_step=32, guidance_scale=2.2, t_shift=0.10 (standard)
+
+Duration control priority: target_duration_ms > duration > ref_duration heuristic > speed.
+Note: exact duration matching works best with postprocess_output=false.
 
 Response (JSON):
 {
@@ -844,6 +1337,12 @@ Response (JSON):
   "target_duration_ms": 2200,
   "max_duration_ms": 3000,
   "duration_tolerance_ms": 176,
+  "duration_attempts": 1,
+  "duration_refinement_log": [
+    {"attempt": 1, "target_duration": 2.2, "actual_duration": 2.431, "error": 0.231}
+  ],
+  "quality_issues": [],
+  "quality_retried": false,
   "seed": 123456789,
   "adaptive_params": {
     "ref_duration": 3.5,
