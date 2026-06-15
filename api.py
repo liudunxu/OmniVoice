@@ -104,6 +104,11 @@ _VOICE_PROMPT_CACHE: OrderedDict[str, Any] = OrderedDict()
 _MAX_VOICE_PROMPT_CACHE_SIZE = int(
     os.environ.get("OMNIVOICE_VOICE_PROMPT_CACHE_SIZE", "100")
 )
+# Whether max_duration_ms should hard-reject requests whose natural duration
+# exceeds the limit. Default warn-only to avoid breaking existing callers.
+_ENFORCE_MAX_DURATION = str(
+    os.environ.get("OMNIVOICE_ENFORCE_MAX_DURATION", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -293,12 +298,24 @@ def _estimate_natural_duration(
     ref_text: Optional[str],
     ref_duration: Optional[float],
 ) -> float:
-    """Estimate natural duration for the target text using the rule estimator."""
-    if ref_duration and ref_text:
-        return _DURATION_ESTIMATOR.estimate_duration(
-            text, ref_text, ref_duration, low_threshold=2.0
-        )
-    # Fallback: assume a neutral reference when no prompt text/audio is available.
+    """Estimate natural duration for the target text using the rule estimator.
+
+    Falls back to a default speaking rate when the provided reference text/audio
+    imply an unrealistic speed (e.g. prompt text much shorter than the reference
+    audio), which would otherwise wildly over/under-estimate the duration.
+    """
+    if ref_duration and ref_text and ref_duration > 0:
+        ref_weight = _DURATION_ESTIMATOR.calculate_total_weight(ref_text)
+        if ref_weight > 0:
+            speed = ref_weight / ref_duration
+            # Normal speech roughly spans 1-50 weighted chars/sec. Outside this
+            # range we treat the reference as inconsistent and use a default rate.
+            if 1.0 <= speed <= 50.0:
+                return _DURATION_ESTIMATOR.estimate_duration(
+                    text, ref_text, ref_duration, low_threshold=2.0
+                )
+    # Fallback: assume a neutral reference when no prompt text/audio is available
+    # or when the reference is inconsistent.
     return _DURATION_ESTIMATOR.estimate_duration(
         text, "Nice to meet you.", 1.5, low_threshold=2.0
     )
@@ -1007,15 +1024,19 @@ async def synthesize(request):
 
     # Validate against max_duration_ms early.
     if max_duration_sec is not None and estimated_natural_duration > max_duration_sec:
-        logger.warning(
-            f"[{req_id}] Estimated natural duration {estimated_natural_duration:.2f}s "
-            f"exceeds max_duration_ms={max_duration_ms}"
-        )
-        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
-        return _error(
+        msg = (
             f"Estimated natural duration ({estimated_natural_duration:.2f}s) exceeds "
-            f"max_duration_ms ({max_duration_sec:.2f}s). Try shorter text or increase max_duration_ms.",
-            status=400,
+            f"max_duration_ms ({max_duration_sec:.2f}s)."
+        )
+        if _ENFORCE_MAX_DURATION:
+            logger.warning(f"[{req_id}] {msg}")
+            _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+            return _error(
+                f"{msg} Try shorter text or increase max_duration_ms.", status=400
+            )
+        logger.warning(
+            f"[{req_id}] {msg} Allowing request because "
+            f"OMNIVOICE_ENFORCE_MAX_DURATION is not set."
         )
 
     # Adaptive duration: try to match ref audio length when user doesn't specify duration
