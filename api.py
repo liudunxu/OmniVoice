@@ -736,8 +736,8 @@ def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dic
     fallback["inference_timesteps"] = min(
         int(fallback.get("inference_timesteps", 32) * 1.5), 64
     )
-    fallback["guidance_scale"] = min(
-        float(fallback.get("guidance_scale", 2.0)) + 0.2, 3.0
+    fallback["cfg_value"] = min(
+        float(fallback.get("cfg_value", 2.0)) + 0.2, 3.0
     )
 
     if "too_much_silence" in issues or "empty" in issues:
