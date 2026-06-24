@@ -74,7 +74,6 @@ def _patched_tqdm_init(self, *args, **kwargs):
 tqdm.__init__ = _patched_tqdm_init
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
-from omnivoice.utils.audio import load_audio_bytes
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_NAME_TO_ID
 
@@ -256,12 +255,6 @@ def _decode_base64_audio_bytes(b64_data):
     if b64_data.startswith("data:"):
         b64_data = b64_data.split(",", 1)[1] if "," in b64_data else b64_data
     return base64.b64decode(b64_data)
-
-
-def _bytes_to_waveform_tuple(audio_bytes: bytes, sampling_rate: int) -> Tuple[np.ndarray, int]:
-    """Decode raw audio bytes into a (waveform, sample_rate) tuple for OmniVoice."""
-    waveform = load_audio_bytes(audio_bytes, sampling_rate)
-    return waveform, sampling_rate
 
 
 def _write_base64_audio(b64_data, out_path):
@@ -1226,22 +1219,19 @@ async def synthesize(request):
                     )
                     pre_have = cache_key in _VOICE_PROMPT_CACHE
                     if pre_have:
-                        audio_wav_tuple = _bytes_to_waveform_tuple(
-                            clone_audio_bytes, model.sampling_rate
-                        )
-                        audio_path_or_tuple = audio_wav_tuple
+                        ref_path_for_prompt = None
                     else:
                         ref_temp_path = out_dir / f"ref_{uuid.uuid4().hex}.wav"
                         ref_temp_path.parent.mkdir(parents=True, exist_ok=True)
                         ref_temp_path.write_bytes(clone_audio_bytes)
-                        audio_path_or_tuple = str(ref_temp_path)
+                        ref_path_for_prompt = str(ref_temp_path)
 
                     try:
                         voice_clone_prompt = _get_cached_voice_clone_prompt(
                             model,
-                            audio_path=audio_path_or_tuple if isinstance(audio_path_or_tuple, str) else None,
-                            audio_bytes=None,
-                            audio_wav=audio_path_or_tuple if not isinstance(audio_path_or_tuple, str) else None,
+                            audio_path=ref_path_for_prompt,
+                            audio_bytes=clone_audio_bytes,
+                            audio_wav=None,
                             prompt_text=prompt_for_clone,
                             preprocess_prompt=preprocess_prompt,
                         )
@@ -1256,9 +1246,9 @@ async def synthesize(request):
                         gen_kwargs["preprocess_prompt"] = False
                         voice_clone_prompt = _get_cached_voice_clone_prompt(
                             model,
-                            audio_path=audio_path_or_tuple if isinstance(audio_path_or_tuple, str) else None,
-                            audio_bytes=None,
-                            audio_wav=audio_path_or_tuple if not isinstance(audio_path_or_tuple, str) else None,
+                            audio_path=ref_path_for_prompt,
+                            audio_bytes=clone_audio_bytes,
+                            audio_wav=None,
                             prompt_text=prompt_for_clone,
                             preprocess_prompt=False,
                         )
