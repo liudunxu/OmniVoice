@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import os
@@ -73,6 +74,7 @@ def _patched_tqdm_init(self, *args, **kwargs):
 tqdm.__init__ = _patched_tqdm_init
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.audio import load_audio_bytes
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_NAME_TO_ID
 
@@ -97,7 +99,12 @@ _API_MODEL_ID = "k2-fsa/OmniVoice"
 _API_DEVICE = None
 _API_LOAD_ASR = False
 _MODEL_LOAD_LOCK = asyncio.Lock()
-_API_INFER_LOCK = asyncio.Lock()
+# Inference concurrency is gated by a semaphore (not a lock) so multi-GPU or
+# high-VRAM GPUs can serve requests in parallel. Default 1 preserves the
+# previous serialized behaviour. Set OMNIVOICE_MAX_CONCURRENCY > 1 to enable.
+_API_INFER_SEM = asyncio.Semaphore(
+    int(os.environ.get("OMNIVOICE_MAX_CONCURRENCY", "1"))
+)
 
 _DURATION_ESTIMATOR = RuleDurationEstimator()
 _VOICE_PROMPT_CACHE: OrderedDict[str, Any] = OrderedDict()
@@ -163,6 +170,17 @@ def _get_ref_audio_duration(audio_path: str) -> Optional[float]:
             return round(info.frames / info.samplerate, 3)
     except Exception:
         pass
+    return None
+
+
+def _bytes_audio_duration(audio_bytes: bytes) -> Optional[float]:
+    """Read duration from raw audio bytes without touching disk."""
+    try:
+        info = sf.info(io.BytesIO(audio_bytes))
+        if info.samplerate > 0:
+            return round(info.frames / info.samplerate, 3)
+    except Exception:
+        return None
     return None
 
 
@@ -240,6 +258,12 @@ def _decode_base64_audio_bytes(b64_data):
     return base64.b64decode(b64_data)
 
 
+def _bytes_to_waveform_tuple(audio_bytes: bytes, sampling_rate: int) -> Tuple[np.ndarray, int]:
+    """Decode raw audio bytes into a (waveform, sample_rate) tuple for OmniVoice."""
+    waveform = load_audio_bytes(audio_bytes, sampling_rate)
+    return waveform, sampling_rate
+
+
 def _write_base64_audio(b64_data, out_path):
     """Decode base64 audio data and write to file. Supports data URI prefix.
 
@@ -267,21 +291,33 @@ def _make_voice_prompt_cache_key(audio_bytes: bytes, prompt_text: str, preproces
 
 def _get_cached_voice_clone_prompt(
     model,
-    audio_path: str,
-    audio_bytes: bytes,
+    audio_path: Optional[str],
+    audio_bytes: Optional[bytes],
+    audio_wav: Optional[Tuple[np.ndarray, int]],
     prompt_text: str,
     preprocess_prompt: bool,
 ):
-    """Create a voice-clone prompt, caching by audio content hash."""
+    """Create a voice-clone prompt, caching by audio content hash.
+
+    Either ``audio_path`` (on-disk file) or ``audio_wav`` ((waveform, sr)
+    tuple, e.g. decoded from ``audio_bytes``) must be supplied; the latter
+    avoids disk I/O when the cache will hit.
+    """
+    if audio_bytes is None and audio_path is None:
+        raise ValueError("audio_bytes or audio_path required for voice clone prompt")
+    if audio_bytes is None:
+        audio_bytes = Path(audio_path).read_bytes()
+
     cache_key = _make_voice_prompt_cache_key(audio_bytes, prompt_text, preprocess_prompt)
     cached = _VOICE_PROMPT_CACHE.get(cache_key)
     if cached is not None:
         logger.debug("Voice clone prompt cache hit: %s", cache_key[:16])
         return cached
 
+    ref_input = audio_wav if audio_wav is not None else audio_path
     prompt = _create_voice_clone_prompt(
         model,
-        audio_path,
+        ref_input,
         prompt_audio=None,
         prompt_text=prompt_text,
     )
@@ -321,11 +357,17 @@ def _estimate_natural_duration(
     )
 
 
-def _read_audio_base64(path):
-    """Read audio file and return base64 encoded string with data URI prefix."""
-    data = Path(path).read_bytes()
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:audio/wav;base64,{b64}"
+def _waveform_to_wav_bytes(waveform, sampling_rate: int) -> bytes:
+    """Encode a waveform to WAV bytes without touching disk."""
+    arr = waveform
+    if hasattr(arr, "detach"):
+        arr = arr.detach().cpu()
+    if hasattr(arr, "numpy"):
+        arr = arr.numpy()
+    arr = np.squeeze(np.asarray(arr)).astype(np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, arr, int(sampling_rate), subtype="PCM_16", format="WAV")
+    return buf.getvalue()
 
 
 def _relative_path(path):
@@ -457,16 +499,6 @@ def _resolve_language(value):
     if raw.lower() in _LANG_CODE_ALIASES:
         return _LANG_CODE_ALIASES[raw.lower()]
     return raw
-
-
-def _write_generated_audio(model, waveform, out_path):
-    """Write a generated audio waveform (np.ndarray, shape (T,) or (C, T)) to disk."""
-    if hasattr(waveform, "detach"):
-        waveform = waveform.detach().cpu()
-    if hasattr(waveform, "numpy"):
-        waveform = waveform.numpy()
-    waveform = np.squeeze(waveform).astype(np.float32)
-    sf.write(str(out_path), waveform, int(model.sampling_rate), subtype="PCM_16")
 
 
 def _create_voice_clone_prompt(model, reference_audio, prompt_audio=None, prompt_text=""):
@@ -617,6 +649,8 @@ def _generate_with_duration_refinement(
     duration_tolerance,
     max_attempts,
     voice_clone_prompt=None,
+    max_duration=None,
+    ratio_clamp=(0.5, 2.0),
     **gen_kwargs,
 ):
     """Generate audio, optionally retrying until duration is within tolerance.
@@ -660,15 +694,29 @@ def _generate_with_duration_refinement(
             best_audio = audio
 
         if attempt < max_attempts - 1 and actual_duration > 0:
-            # Scale target duration by the observed ratio.
-            ratio = current_duration / actual_duration
-            next_duration = current_duration * ratio
+            # Scale target duration by the observed ratio, clamped to avoid
+            # divergence when the model output is wildly off (e.g. actual=0.1s
+            # for a 10s target would otherwise try 100s next).
+            raw_ratio = current_duration / actual_duration
+            clamped_ratio = max(ratio_clamp[0], min(ratio_clamp[1], raw_ratio))
+            next_duration = current_duration * clamped_ratio
+            if max_duration is not None and next_duration > max_duration:
+                logger.warning(
+                    "Duration refinement ratio %.3f would push target to %.3fs, "
+                    "exceeding max_duration=%.3fs; clamping to max_duration.",
+                    raw_ratio,
+                    next_duration,
+                    max_duration,
+                )
+                next_duration = float(max_duration)
             logger.info(
-                "Duration refinement attempt %d: target=%.3fs actual=%.3fs; "
-                "retrying with duration=%.3fs",
+                "Duration refinement attempt %d: target=%.3fs actual=%.3fs "
+                "ratio=%.3f (clamped=%.3f); retrying with duration=%.3fs",
                 attempt + 1,
                 current_duration,
                 actual_duration,
+                raw_ratio,
+                clamped_ratio,
                 next_duration,
             )
             current_duration = next_duration
@@ -792,6 +840,7 @@ def _generate_with_quality_retry(
     duration_tolerance,
     voice_clone_prompt=None,
     ref_duration=None,
+    max_duration=None,
     enable_quality_retry=True,
     **gen_kwargs,
 ):
@@ -807,6 +856,7 @@ def _generate_with_quality_retry(
         duration_tolerance=duration_tolerance,
         max_attempts=2,
         voice_clone_prompt=voice_clone_prompt,
+        max_duration=max_duration,
         **gen_kwargs,
     )
     issues = _check_audio_quality(
@@ -957,7 +1007,10 @@ async def synthesize(request):
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Decode reference audio first to measure duration for adaptive params
+    # Decode reference audio to measure duration for adaptive params.
+    # We deliberately skip writing a temp file here — the voice-clone prompt
+    # cache will be probed inside the inference lock and only on cache miss
+    # do we need to materialize a file (or pass an in-memory tuple directly).
     ref_temp_path = None
     prompt_temp_path = None
     resolved_ref = None
@@ -967,37 +1020,28 @@ async def synthesize(request):
     prompt_audio_bytes = None
 
     if reference_audio_base64:
-        ref_temp_path = out_dir / f"ref_{uuid.uuid4().hex}.wav"
-        ref_temp_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             ref_audio_bytes = _decode_base64_audio_bytes(reference_audio_base64)
-            ref_temp_path.write_bytes(ref_audio_bytes)
-            resolved_ref = str(ref_temp_path)
-            ref_duration = _get_ref_audio_duration(ref_temp_path)
-            logger.info(f"[{req_id}] reference audio decoded: {ref_temp_path} ({ref_temp_path.stat().st_size} bytes), duration={ref_duration}s")
+            ref_duration = _bytes_audio_duration(ref_audio_bytes)
+            logger.info(
+                f"[{req_id}] reference audio decoded in-memory: {len(ref_audio_bytes)} bytes, "
+                f"duration={ref_duration}s"
+            )
         except Exception as exc:
             tb = traceback.format_exc()
             logger.error(f"[{req_id}] Failed to decode reference_audio_base64: {exc}\n{tb}")
-            if ref_temp_path and ref_temp_path.exists():
-                ref_temp_path.unlink(missing_ok=True)
             return _error(f"Failed to decode reference_audio_base64: {exc}\n{tb}")
 
     if prompt_wav_base64:
-        out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prompt_temp_path = out_dir / f"prompt_{uuid.uuid4().hex}.wav"
         try:
             prompt_audio_bytes = _decode_base64_audio_bytes(prompt_wav_base64)
-            prompt_temp_path.write_bytes(prompt_audio_bytes)
-            resolved_prompt = str(prompt_temp_path)
-            logger.info(f"[{req_id}] prompt wav decoded: {prompt_temp_path} ({prompt_temp_path.stat().st_size} bytes)")
+            logger.info(
+                f"[{req_id}] prompt wav decoded in-memory: {len(prompt_audio_bytes)} bytes"
+            )
         except Exception as exc:
             tb = traceback.format_exc()
             logger.error(f"[{req_id}] Failed to decode prompt_wav_base64: {exc}\n{tb}")
-            if ref_temp_path and ref_temp_path.exists():
-                ref_temp_path.unlink(missing_ok=True)
-            if prompt_temp_path and prompt_temp_path.exists():
-                prompt_temp_path.unlink(missing_ok=True)
+            _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
             return _error(f"Failed to decode prompt_wav_base64: {exc}\n{tb}")
 
     # Get adaptive parameters based on reference audio duration
@@ -1116,14 +1160,6 @@ async def synthesize(request):
         out_name = f"voxcpm_{key}.wav"
     out_path = out_dir / out_name
 
-    # Move ref_temp_path to out_dir if it was created in WORK_ROOT
-    if ref_temp_path and ref_temp_path.parent != out_dir:
-        new_ref_path = out_dir / ref_temp_path.name
-        if ref_temp_path.exists():
-            ref_temp_path.rename(new_ref_path)
-            ref_temp_path = new_ref_path
-            resolved_ref = str(ref_temp_path)
-
     # Load model (loading is serialized via _MODEL_LOAD_LOCK).
     model = await _ensure_api_model()
 
@@ -1168,27 +1204,44 @@ async def synthesize(request):
         "audio_chunk_threshold": float(data.get("audio_chunk_threshold", 30.0)),
     }
 
-    # Serialize prompt creation + generation to keep deterministic seeding safe
-    # and to avoid concurrent ASR/tokenizer issues. Audio I/O before/after this
-    # block can still overlap across requests.
+    # Cap concurrent inference to keep deterministic seeding safe and avoid
+    # ASR/tokenizer races. Audio I/O before/after this block can still overlap
+    # across requests. Semaphore (not Lock) so OMNIVOICE_MAX_CONCURRENCY > 1
+    # can serve requests in parallel on high-VRAM GPUs.
     start_time = time.time()
     try:
-        async with _API_INFER_LOCK:
+        async with _API_INFER_SEM:
             logger.info(f"[{req_id}] synthesis started -> {out_path}")
 
             # Build voice-clone prompt (cached) inside the lock to avoid concurrent
-            # ASR/tokenizer access; repeated references still benefit from the cache.
+            # ASR/tokenizer access. When the cache hits, we pass an in-memory
+            # (waveform, sr) tuple directly — no temp file I/O needed.
             voice_clone_prompt = None
             if reference_audio_base64 or prompt_wav_base64:
-                clone_audio_path = resolved_ref or resolved_prompt
                 clone_audio_bytes = ref_audio_bytes or prompt_audio_bytes
-                prompt_for_clone = effective_prompt_text if resolved_prompt else ""
-                if clone_audio_path and clone_audio_bytes:
+                prompt_for_clone = effective_prompt_text if prompt_wav_base64 else ""
+                if clone_audio_bytes:
+                    cache_key = _make_voice_prompt_cache_key(
+                        clone_audio_bytes, prompt_for_clone, preprocess_prompt
+                    )
+                    pre_have = cache_key in _VOICE_PROMPT_CACHE
+                    if pre_have:
+                        audio_wav_tuple = _bytes_to_waveform_tuple(
+                            clone_audio_bytes, model.sampling_rate
+                        )
+                        audio_path_or_tuple = audio_wav_tuple
+                    else:
+                        ref_temp_path = out_dir / f"ref_{uuid.uuid4().hex}.wav"
+                        ref_temp_path.parent.mkdir(parents=True, exist_ok=True)
+                        ref_temp_path.write_bytes(clone_audio_bytes)
+                        audio_path_or_tuple = str(ref_temp_path)
+
                     try:
                         voice_clone_prompt = _get_cached_voice_clone_prompt(
                             model,
-                            audio_path=clone_audio_path,
-                            audio_bytes=clone_audio_bytes,
+                            audio_path=audio_path_or_tuple if isinstance(audio_path_or_tuple, str) else None,
+                            audio_bytes=None,
+                            audio_wav=audio_path_or_tuple if not isinstance(audio_path_or_tuple, str) else None,
                             prompt_text=prompt_for_clone,
                             preprocess_prompt=preprocess_prompt,
                         )
@@ -1203,8 +1256,9 @@ async def synthesize(request):
                         gen_kwargs["preprocess_prompt"] = False
                         voice_clone_prompt = _get_cached_voice_clone_prompt(
                             model,
-                            audio_path=clone_audio_path,
-                            audio_bytes=clone_audio_bytes,
+                            audio_path=audio_path_or_tuple if isinstance(audio_path_or_tuple, str) else None,
+                            audio_bytes=None,
+                            audio_wav=audio_path_or_tuple if not isinstance(audio_path_or_tuple, str) else None,
                             prompt_text=prompt_for_clone,
                             preprocess_prompt=False,
                         )
@@ -1223,6 +1277,7 @@ async def synthesize(request):
                 duration_tolerance=duration_tolerance_sec,
                 voice_clone_prompt=voice_clone_prompt,
                 ref_duration=ref_duration,
+                max_duration=max_duration_sec,
                 enable_quality_retry=_bool_option(
                     data.get("quality_retry"), True
                 ),
@@ -1235,34 +1290,31 @@ async def synthesize(request):
         return _error(f"Synthesis failed: {exc}\n{tb}", status=502)
 
     try:
-        _write_generated_audio(model, audio_waveform, out_path)
-    except Exception as exc:
-        tb = traceback.format_exc()
-        logger.error(f"[{req_id}] Failed to write output audio: {exc}\n{tb}")
-        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
-        return _error(f"Failed to write output audio: {exc}\n{tb}", status=502)
-
-    elapsed = round(time.time() - start_time, 3)
-    if not out_path.exists():
-        logger.error(f"[{req_id}] Output file not created: {out_path}")
-        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
-        return _error("Synthesis finished but output file was not created.", status=502)
-
-    audio_duration = _audio_duration_seconds(out_path)
-    logger.info(
-        f"[{req_id}] synthesis finished in {elapsed}s, output: {out_path} "
-        f"({out_path.stat().st_size} bytes), audio_duration={audio_duration}, "
-        f"duration_attempts={attempts_made}, quality_issues={quality_issues}, "
-        f"quality_retried={quality_retried}"
-    )
-
-    try:
-        output_base64 = _read_audio_base64(out_path)
+        wav_bytes = _waveform_to_wav_bytes(audio_waveform, model.sampling_rate)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] Failed to encode output audio: {exc}\n{tb}")
         _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
         return _error(f"Failed to encode output audio: {exc}\n{tb}", status=502)
+
+    output_path_for_response = str(out_path.resolve())
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(wav_bytes)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.warning(f"[{req_id}] Failed to persist output file (continuing): {exc}")
+        output_path_for_response = ""
+
+    elapsed = round(time.time() - start_time, 3)
+    audio_duration = round(audio_waveform.shape[-1] / model.sampling_rate, 3)
+    logger.info(
+        f"[{req_id}] synthesis finished in {elapsed}s, output_size={len(wav_bytes)} bytes, "
+        f"audio_duration={audio_duration}s, duration_attempts={attempts_made}, "
+        f"quality_issues={quality_issues}, quality_retried={quality_retried}"
+    )
+
+    output_base64 = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
 
     _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
 
@@ -1270,8 +1322,8 @@ async def synthesize(request):
     return _json_response({
         "ok": True,
         "audio_base64": output_base64,
-        "output_path": str(out_path.resolve()),
-        "relative_path": _relative_path(out_path),
+        "output_path": output_path_for_response,
+        "relative_path": _relative_path(Path(output_path_for_response)) if output_path_for_response else "",
         "elapsed_seconds": elapsed,
         "audio_duration_seconds": audio_duration,
         "target_duration_ms": target_duration_ms,
