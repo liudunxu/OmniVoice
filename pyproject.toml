@@ -78,9 +78,11 @@ torchaudio = [
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
-# Use PyTorch built for NVIDIA Toolkit version 12.8.
-# Available versions: https://pytorch.org/get-started/locally/
-url = "https://download.pytorch.org/whl/cu128"
+# Use PyTorch built for NVIDIA Toolkit version 12.6.
+# cu126 (not cu128) so the env can also host paddlepaddle-gpu 3.0.0, which
+# ships cu118/cu126 wheels but no cu128 wheel — required to coexist with
+# video-subtitle-remover. Available versions: https://pytorch.org/get-started/locally/
+url = "https://download.pytorch.org/whl/cu126"
 # Only use this index when explicitly requested by `tool.uv.sources`.
 explicit = true
 
