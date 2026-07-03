@@ -1284,6 +1284,11 @@ async def synthesize(request):
                 ),
                 **gen_kwargs,
             )
+            if "empty" in quality_issues:
+                raise RuntimeError(
+                    "Generated audio is empty after quality retry. "
+                    "Use a longer, non-silent reference audio or disable voice cloning."
+                )
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] Synthesis failed: {exc}\n{tb}")
