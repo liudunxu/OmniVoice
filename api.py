@@ -313,6 +313,7 @@ def _get_cached_voice_clone_prompt(
         ref_input,
         prompt_audio=None,
         prompt_text=prompt_text,
+        preprocess_prompt=preprocess_prompt,
     )
 
     # Simple LRU: pop oldest if cache is full.
@@ -494,7 +495,13 @@ def _resolve_language(value):
     return raw
 
 
-def _create_voice_clone_prompt(model, reference_audio, prompt_audio=None, prompt_text=""):
+def _create_voice_clone_prompt(
+    model,
+    reference_audio,
+    prompt_audio=None,
+    prompt_text="",
+    preprocess_prompt=True,
+):
     ref_text_clean = prompt_text.strip() if prompt_text else None
     if prompt_audio and prompt_audio != reference_audio:
         candidates = [
@@ -504,13 +511,17 @@ def _create_voice_clone_prompt(model, reference_audio, prompt_audio=None, prompt
         ]
         for kwargs in candidates:
             try:
-                return model.create_voice_clone_prompt(**kwargs)
+                return model.create_voice_clone_prompt(
+                    **kwargs,
+                    preprocess_prompt=preprocess_prompt,
+                )
             except TypeError as exc:
                 if "unexpected keyword" not in str(exc):
                     raise
     return model.create_voice_clone_prompt(
         ref_audio=reference_audio,
         ref_text=ref_text_clean,
+        preprocess_prompt=preprocess_prompt,
     )
 
 
