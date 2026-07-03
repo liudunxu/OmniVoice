@@ -911,10 +911,25 @@ def _generate_with_quality_retry(
 routes = web.RouteTableDef()
 
 
+@routes.get("/health")
 @routes.get("/api/health")
 async def health(request):
     logger.info(f"[{request.method}] {request.path} from {request.remote}")
     return _json_response({"ok": True, "service": "voxcpm2_api"})
+
+
+@routes.get("/v1/models")
+async def models(request):
+    logger.info(f"[{request.method}] {request.path} from {request.remote}")
+    return _json_response({
+        "ok": True,
+        "data": [{
+            "id": _API_MODEL_ID,
+            "object": "model",
+            "loaded": _API_MODEL is not None,
+            "device": _API_DEVICE,
+        }],
+    })
 
 
 @routes.get("/api/voxcpm/status")

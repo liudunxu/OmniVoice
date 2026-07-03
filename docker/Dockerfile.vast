@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1.7
+FROM ghcr.io/astral-sh/uv:python3.10-bookworm-slim
+
+ARG OMNIVOICE_MODEL_ID=k2-fsa/OmniVoice
+ARG OMNIVOICE_MODEL_DIR=/opt/omnivoice/models/k2-fsa/OmniVoice
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    PATH=/app/.venv/bin:$PATH \
+    PORT=8000 \
+    HOST=0.0.0.0 \
+    HF_HOME=/opt/omnivoice/hf \
+    MODEL_DIR=/workspace/models \
+    OMNIVOICE_MODEL_ID=${OMNIVOICE_MODEL_ID} \
+    OMNIVOICE_PRELOADED_MODEL=${OMNIVOICE_MODEL_DIR}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock README.md /app/
+COPY omnivoice/ /app/omnivoice/
+COPY api.py /app/api.py
+COPY docker/entrypoint.sh /usr/local/bin/omnivoice-api-entrypoint
+
+RUN uv sync --frozen --no-dev \
+    && chmod +x /usr/local/bin/omnivoice-api-entrypoint \
+    && mkdir -p "${HF_HOME}" "${MODEL_DIR}" /app/work
+
+RUN --mount=type=secret,id=hf_token,required=false \
+    python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+token_path = "/run/secrets/hf_token"
+token = None
+if os.path.exists(token_path):
+    token = open(token_path, "r", encoding="utf-8").read().strip() or None
+
+snapshot_download(
+    repo_id=os.environ["OMNIVOICE_MODEL_ID"],
+    local_dir=os.environ["OMNIVOICE_PRELOADED_MODEL"],
+    token=token,
+)
+PY
+
+EXPOSE 8000
+
+ENTRYPOINT ["/usr/local/bin/omnivoice-api-entrypoint"]
