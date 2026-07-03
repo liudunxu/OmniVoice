@@ -60,6 +60,20 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. Vast.ai Instance Operations
+
+- Use label prefix `omnivoice-api` for OmniVoice Vast.ai service instances.
+- When the user says "关闭vast.ai实例" or asks to close/stop Vast.ai instances, destroy all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the remaining instance list afterward.
+- When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, create a new RTX 3090 instance with:
+  - image: `liudunxu/omnivoice-api:vast-gpu` unless the user specifies a fixed tag
+  - label: `omnivoice-api-mvp-<short-tag-or-date>`
+  - disk: `80`
+  - runtype: `args`
+  - env: `{"-p 8000:8000": "1", "PORT": "8000", "HOST": "0.0.0.0", "MODEL_DIR": "/workspace/models"}`
+- Prefer verified, rentable, on-demand, single RTX 3090 offers with at least 24GB GPU RAM, at least one direct port, and at least 80GB disk space. Use US/CA offers first unless the user asks for another region.
+- After creating an instance, wait for the public port, then verify `GET /` returns `ok` and `GET /health` returns `{"ok": true, ...}`. Report the URL, instance id, image tag, label, GPU, and `dph_total`.
+- Do not keep old and new Vast.ai instances running after a redeploy unless the user explicitly asks for overlap. Once the new instance is verified, destroy old `omnivoice-api*` instances.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
