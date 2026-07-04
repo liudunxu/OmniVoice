@@ -87,6 +87,18 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Document any version constraints
 
 ### Vast.ai Instance Operations
+- Use the reusable helper script `scripts/vast.py` for all Vast.ai operations. It reads the API key from the `VAST_API_KEY` environment variable; do not hard-code tokens.
+  - Check balance/credit: `VAST_API_KEY=$KEY python scripts/vast.py balance`
+  - List instances: `VAST_API_KEY=$KEY python scripts/vast.py list`
+  - Search RTX 3090 offers (Asia by default): `VAST_API_KEY=$KEY python scripts/vast.py search`
+  - Search US/CA offers: `VAST_API_KEY=$KEY python scripts/vast.py search --region us`
+  - Create instance: `VAST_API_KEY=$KEY python scripts/vast.py create <offer_id> [--image ... --label ...]`
+  - Wait for ready URL: `VAST_API_KEY=$KEY python scripts/vast.py wait <instance_id>`
+  - Health check: `python scripts/vast.py health <url>`
+  - Smoke test: `python scripts/vast.py smoke <url>`
+  - Fetch logs: `VAST_API_KEY=$KEY python scripts/vast.py logs <instance_id>`
+  - Destroy one instance: `VAST_API_KEY=$KEY python scripts/vast.py destroy <instance_id>`
+  - Destroy all active OmniVoice instances: `VAST_API_KEY=$KEY python scripts/vast.py destroy-all --yes`
 - Use label prefix `omnivoice-api` for OmniVoice Vast.ai service instances.
 - When the user says "关闭vast.ai实例" or asks to close/stop Vast.ai instances, destroy all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the remaining instance list afterward.
 - When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, create a new RTX 3090 instance with:
