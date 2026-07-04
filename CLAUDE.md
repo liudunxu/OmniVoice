@@ -82,7 +82,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
   - disk: `80`
   - runtype: `args`
   - env: `{"-p 8000:8000": "1", "PORT": "8000", "HOST": "0.0.0.0", "MODEL_DIR": "/workspace/models"}`
-- Prefer verified, rentable, on-demand, single RTX 3090 offers with at least 24GB GPU RAM, at least one direct port, and at least 80GB disk space. 选择实例时优先选亚洲地区且能访问 Docker Hub 的实例；若不可用，再选美洲地区（US/CA）。
+- Prefer verified, rentable, on-demand, single RTX 3090 offers with at least 12GB GPU RAM, at least one direct port, and at least 80GB disk space. 选择实例时优先选东南亚地区且能访问 Docker Hub 的实例；若没有合适的，再选东亚、中西亚地区；最后可选美洲地区（US/CA）。
 - After creating an instance, wait for the public port, then verify `GET /` returns `ok` and `GET /health` returns `{"ok": true, ...}`. Report the URL, instance id, image tag, label, GPU, and `dph_total`.
 - Do not keep old and new Vast.ai instances running after a redeploy unless the user explicitly asks for overlap. Once the new instance is verified, destroy old `omnivoice-api*` instances.
 

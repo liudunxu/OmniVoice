@@ -21,7 +21,19 @@ DEFAULT_IMAGE = "liudunxu/omnivoice-api:vast-gpu"
 DEFAULT_LABEL_PREFIX = "omnivoice-api"
 DEFAULT_PORT = 8000
 DEFAULT_GPU_NAME = "RTX 3090"
-ASIA_COUNTRIES = {"CN", "JP", "KR", "SG", "HK", "TW", "IN", "AU"}
+EAST_ASIA = {"CN", "JP", "KR", "HK", "TW", "MO"}
+SOUTHEAST_ASIA = {"SG", "MY", "TH", "VN", "ID", "PH", "BN", "KH", "LA", "MM"}
+CENTRAL_WEST_ASIA = {
+    "IN", "PK", "BD", "LK", "NP", "AF", "IR", "IQ", "IL", "JO", "LB",
+    "OM", "QA", "SA", "AE", "YE", "TR", "KZ", "UZ", "KG", "TJ", "TM",
+    "AZ", "GE", "AM",
+}
+AMERICAS = {
+    "US", "CA", "MX", "BR", "AR", "CL", "CO", "PE", "VE", "EC", "UY",
+    "PY", "BO", "CR", "PA", "GT", "HN", "SV", "NI", "DO", "PR", "JM",
+    "CU", "BS",
+}
+PRIORITY_REGIONS = [SOUTHEAST_ASIA, EAST_ASIA, CENTRAL_WEST_ASIA, AMERICAS]
 
 
 def _api_key() -> str:
@@ -83,19 +95,43 @@ def cmd_list(_args: argparse.Namespace) -> None:
 
 
 def _region_rank(country: str, geo: str, region: str) -> int:
-    """Return sort rank for region preference. Lower is better."""
+    """Return sort rank for region preference. Lower is better.
+
+    Priority order follows AGENTS.md:
+    1. Southeast Asia
+    2. East Asia
+    3. Central & West Asia
+    4. Americas
+    5. Others
+    """
     country = country.upper()
     geo_ends = geo.strip().upper().endswith
+
     if region == "us":
-        return 0 if country in {"US", "CA"} or geo_ends(("US", "CA")) else 1
+        return 0 if country in AMERICAS or geo_ends(tuple(AMERICAS)) else 1
+
     if region == "asia":
-        return 0 if country in ASIA_COUNTRIES else 1
-    # region == "all": prefer Asia, then US/CA, then others.
-    if country in ASIA_COUNTRIES:
-        return 0
-    if country in {"US", "CA"} or geo_ends(("US", "CA")):
-        return 1
-    return 2
+        return 0 if country in SOUTHEAST_ASIA | EAST_ASIA | CENTRAL_WEST_ASIA else 1
+
+    # region == "all": Southeast Asia -> East Asia -> Central & West Asia -> Americas -> Others.
+    for rank, region_set in enumerate(PRIORITY_REGIONS):
+        if country in region_set or geo_ends(tuple(region_set)):
+            return rank
+    return len(PRIORITY_REGIONS)
+
+
+def _country_region_name(country: str) -> str:
+    """Return a human-readable region name for the country code."""
+    country = country.upper()
+    if country in SOUTHEAST_ASIA:
+        return "Southeast Asia"
+    if country in EAST_ASIA:
+        return "East Asia"
+    if country in CENTRAL_WEST_ASIA:
+        return "Central & West Asia"
+    if country in AMERICAS:
+        return "Americas"
+    return "Other"
 
 
 def _gpu_matches(gpu_name: str, wanted: Optional[str]) -> bool:
@@ -108,7 +144,8 @@ def cmd_search(args: argparse.Namespace) -> None:
     """Search for cheap RTX 3090 on-demand offers.
 
     Defaults follow the runbook: verified/rentable/ondemand, 1 GPU,
-    >= 24 GB VRAM, >= 80 GB disk, direct port, <= $0.25/hr, Asia first.
+    >= 12 GB VRAM, >= 80 GB disk, direct port, <= $0.25/hr,
+    East Asia / Southeast Asia / Central & West Asia first, then Americas.
     """
     payload = {
         "limit": 200,
@@ -117,7 +154,7 @@ def cmd_search(args: argparse.Namespace) -> None:
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
-        "gpu_ram": {"gte": 24000},
+        "gpu_ram": {"gte": 12000},
         "disk_space": {"gte": 80},
         "direct_port_count": {"gte": 1},
         "dph_total": {"lte": args.max_price},
