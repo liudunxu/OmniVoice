@@ -43,7 +43,8 @@ dependencies = [
     "librosa",
     "aiohttp",
     "audio-separator>=0.44.1",
-    "onnxruntime>=1.22",
+    "onnxruntime>=1.22; sys_platform != 'linux' and sys_platform != 'win32'",
+    "onnxruntime-gpu>=1.22; sys_platform == 'linux' or sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
