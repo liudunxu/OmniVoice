@@ -37,7 +37,12 @@ COPY docker/entrypoint.sh /usr/local/bin/omnivoice-api-entrypoint
 
 RUN uv sync --frozen --no-dev \
     && chmod +x /usr/local/bin/omnivoice-api-entrypoint \
-    && mkdir -p "${HF_HOME}" "${MODEL_DIR}" /app/work
+    && mkdir -p "${HF_HOME}" "${MODEL_DIR}" "${AUDIO_SEPARATOR_MODEL_DIR}" /app/work
+
+RUN audio-separator \
+    --model_filename "${SEPARATION_MODEL}" \
+    --model_file_dir "${AUDIO_SEPARATOR_MODEL_DIR}" \
+    --download_model_only
 
 RUN --mount=type=secret,id=hf_token,required=false \
     python - <<'PY'

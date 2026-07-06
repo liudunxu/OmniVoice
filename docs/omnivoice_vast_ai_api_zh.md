@@ -7,6 +7,8 @@
 - `POST /api/synthesize` / `POST /api/voxcpm/synthesize`：OmniVoice TTS
 - `POST /api/separate`：人声/背景音分离，使用 Audio Separator / RoFormer 的 `vocals_mel_band_roformer.ckpt`
 
+`docker/Dockerfile.vast` 构建阶段会同时预下载 OmniVoice TTS 权重和默认分离模型。启动后如果 `/workspace/models/audio-separator` 已经有 `vocals_mel_band_roformer.ckpt` 及其 yaml 配置，运行时不会再访问网络下载分离模型。
+
 ## 镜像选择
 
 默认使用内置权重镜像：

@@ -279,6 +279,19 @@ def _safe_filename(name, default="input"):
     return name or default
 
 
+def _audio_separator_config_candidates(model):
+    return {
+        "vocals_mel_band_roformer.ckpt": ["vocals_mel_band_roformer.yaml"],
+        "model_bs_roformer_ep_317_sdr_12.9755.ckpt": ["model_bs_roformer_ep_317_sdr_12.9755.yaml"],
+    }.get(model, [])
+
+
+def _separator_model_files_present(model_dir, model):
+    required = [Path(model_dir) / model]
+    required.extend(Path(model_dir) / name for name in _audio_separator_config_candidates(model))
+    return all(path.exists() for path in required)
+
+
 def _find_audio_stem(root, names, excludes=()):
     root = Path(root)
     wanted = {re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") for name in names}
@@ -344,6 +357,9 @@ def _run_cmd(cmd, *, env=None, check=True):
 
 def _prepare_separator_model(audio_separator_cli, model_dir, model):
     model_dir.mkdir(parents=True, exist_ok=True)
+    if _separator_model_files_present(model_dir, model):
+        logger.info("Audio Separator model files already present for %s in %s", model, model_dir)
+        return
     _run_cmd(
         [
             audio_separator_cli,
