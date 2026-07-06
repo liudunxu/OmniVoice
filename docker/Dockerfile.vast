@@ -2,7 +2,6 @@
 FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 
 ARG OMNIVOICE_MODEL_ID=k2-fsa/OmniVoice
-ARG OMNIVOICE_MODEL_DIR=/opt/omnivoice/models/k2-fsa/OmniVoice
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -10,13 +9,13 @@ ENV PYTHONUNBUFFERED=1 \
     PATH=/app/.venv/bin:$PATH \
     PORT=8000 \
     HOST=0.0.0.0 \
-    HF_HOME=/opt/omnivoice/hf \
+    HF_HOME=/workspace/models/huggingface \
     MODEL_DIR=/workspace/models \
     AUDIO_SEPARATOR_MODEL_DIR=/workspace/models/audio-separator \
+    WHISPER_MODEL_DIR=/workspace/models/whisper \
     OMNIVOICE_MAX_REQUEST_MB=512 \
     SEPARATION_MODEL=vocals_mel_band_roformer.ckpt \
-    OMNIVOICE_MODEL_ID=${OMNIVOICE_MODEL_ID} \
-    OMNIVOICE_PRELOADED_MODEL=${OMNIVOICE_MODEL_DIR}
+    OMNIVOICE_MODEL_ID=${OMNIVOICE_MODEL_ID}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -38,29 +37,7 @@ COPY docker/entrypoint.sh /usr/local/bin/omnivoice-api-entrypoint
 
 RUN uv sync --frozen --no-dev \
     && chmod +x /usr/local/bin/omnivoice-api-entrypoint \
-    && mkdir -p "${HF_HOME}" "${MODEL_DIR}" "${AUDIO_SEPARATOR_MODEL_DIR}" /app/work
-
-RUN audio-separator \
-    --model_filename "${SEPARATION_MODEL}" \
-    --model_file_dir "${AUDIO_SEPARATOR_MODEL_DIR}" \
-    --download_model_only
-
-RUN --mount=type=secret,id=hf_token,required=false \
-    python - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-
-token_path = "/run/secrets/hf_token"
-token = None
-if os.path.exists(token_path):
-    token = open(token_path, "r", encoding="utf-8").read().strip() or None
-
-snapshot_download(
-    repo_id=os.environ["OMNIVOICE_MODEL_ID"],
-    local_dir=os.environ["OMNIVOICE_PRELOADED_MODEL"],
-    token=token,
-)
-PY
+    && mkdir -p "${HF_HOME}" "${MODEL_DIR}" "${AUDIO_SEPARATOR_MODEL_DIR}" "${WHISPER_MODEL_DIR}" /app/work
 
 EXPOSE 8000
 

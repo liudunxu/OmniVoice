@@ -101,17 +101,30 @@ SEPARATION_MODEL_DIR = Path(
         str(Path(os.environ.get("MODEL_DIR", WORK_ROOT / "models")) / "audio-separator"),
     )
 )
+DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
+WHISPER_MODEL_DIR = Path(
+    os.environ.get(
+        "WHISPER_MODEL_DIR",
+        str(Path(os.environ.get("MODEL_DIR", WORK_ROOT / "models")) / "whisper"),
+    )
+)
+WHISPER_MAX_MODELS = int(os.environ.get("WHISPER_MAX_MODELS", "2"))
 
 _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
 _API_DEVICE = None
 _API_LOAD_ASR = False
 _MODEL_LOAD_LOCK = asyncio.Lock()
+_WHISPER_MODELS: OrderedDict[Tuple[str, str, str], Any] = OrderedDict()
+_WHISPER_MODEL_LOCK = asyncio.Lock()
 # Inference concurrency is gated by a semaphore (not a lock) so multi-GPU or
 # high-VRAM GPUs can serve requests in parallel. Default 1 preserves the
 # previous serialized behaviour. Set OMNIVOICE_MAX_CONCURRENCY > 1 to enable.
 _API_INFER_SEM = asyncio.Semaphore(
     int(os.environ.get("OMNIVOICE_MAX_CONCURRENCY", "1"))
+)
+_WHISPER_INFER_SEM = asyncio.Semaphore(
+    int(os.environ.get("WHISPER_MAX_CONCURRENCY", "1"))
 )
 
 _DURATION_ESTIMATOR = RuleDurationEstimator()
@@ -238,6 +251,19 @@ def get_best_device():
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _whisper_device(preferred="auto"):
+    value = str(preferred or "auto").strip().lower()
+    if value == "cuda":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if value == "cpu":
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _default_whisper_compute_type(device):
+    return "float16" if device == "cuda" else "int8"
 
 
 def _json_response(data, status=200):
@@ -1125,6 +1151,104 @@ def _generate_with_quality_retry(
     return audio, attempts, log, issues, False
 
 
+def _serialize_whisper_segments(segments):
+    out = []
+    for segment in segments:
+        words = []
+        for word in segment.words or []:
+            if word.start is None or word.end is None:
+                continue
+            words.append({"start": word.start, "end": word.end, "word": word.word})
+        out.append(
+            {
+                "start": segment.start,
+                "end": segment.end,
+                "text": str(segment.text or "").strip(),
+                "words": words,
+            }
+        )
+    return out
+
+
+def _load_whisper_model_sync(model_name, device, compute_type):
+    from faster_whisper import WhisperModel
+
+    WHISPER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "loading faster-whisper model=%s device=%s compute_type=%s download_root=%s",
+        model_name,
+        device,
+        compute_type,
+        WHISPER_MODEL_DIR,
+    )
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        download_root=str(WHISPER_MODEL_DIR),
+    )
+
+
+async def _ensure_whisper_model(model_name, device, compute_type):
+    key = (model_name, device, compute_type)
+    model = _WHISPER_MODELS.get(key)
+    if model is not None:
+        _WHISPER_MODELS.move_to_end(key)
+        return model
+    async with _WHISPER_MODEL_LOCK:
+        model = _WHISPER_MODELS.get(key)
+        if model is not None:
+            _WHISPER_MODELS.move_to_end(key)
+            return model
+        model = await asyncio.to_thread(
+            _load_whisper_model_sync,
+            model_name,
+            device,
+            compute_type,
+        )
+        _WHISPER_MODELS[key] = model
+        while len(_WHISPER_MODELS) > max(1, WHISPER_MAX_MODELS):
+            _WHISPER_MODELS.popitem(last=False)
+    return model
+
+
+def _transcribe_whisper_sync(model, audio_path, options):
+    language = options.get("language")
+    if language == "tl":
+        language = "fil"
+    if language and "-" in str(language):
+        language = str(language).split("-", 1)[0]
+
+    kwargs = {
+        "language": language or None,
+        "beam_size": int(float(options.get("beam_size") or 5)),
+        "vad_filter": _bool_option(options.get("vad_filter"), True),
+        "word_timestamps": _bool_option(options.get("word_timestamps"), True),
+        "condition_on_previous_text": _bool_option(
+            options.get("condition_on_previous_text"),
+            False,
+        ),
+    }
+    kwargs["vad_parameters"] = {
+        "threshold": float(options.get("vad_threshold") or 0.4),
+        "min_silence_duration_ms": int(float(options.get("vad_min_silence_ms") or 300)),
+        "speech_pad_ms": int(float(options.get("vad_speech_pad_ms") or 200)),
+    }
+    kwargs["no_speech_threshold"] = float(options.get("no_speech_threshold") or 0.6)
+    initial_prompt = str(options.get("initial_prompt") or "").strip()
+    if initial_prompt:
+        kwargs["initial_prompt"] = initial_prompt
+
+    segments_iter, info = model.transcribe(str(audio_path), **kwargs)
+    segments = _serialize_whisper_segments(list(segments_iter))
+    return {
+        "language": info.language,
+        "language_probability": info.language_probability,
+        "duration": info.duration,
+        "segments": segments,
+    }
+
+
 routes = web.RouteTableDef()
 
 
@@ -1165,6 +1289,11 @@ async def status(request):
         "ok": True,
         "models_cached": len(cached_models),
         "cached_models": cached_models,
+        "whisper_models_cached": len(_WHISPER_MODELS),
+        "whisper_cached_models": [
+            {"model": model, "device": device, "compute_type": compute_type}
+            for model, device, compute_type in _WHISPER_MODELS.keys()
+        ],
     })
 
 
@@ -1174,8 +1303,10 @@ async def unload(request):
     logger.info(f"[{request.method}] {request.path} from {request.remote}")
     global _API_MODEL
     count = 1 if _API_MODEL is not None else 0
+    whisper_count = len(_WHISPER_MODELS)
     _API_MODEL = None
     _VOICE_PROMPT_CACHE.clear()
+    _WHISPER_MODELS.clear()
     import gc
     gc.collect()
     if sys.platform != "win32":
@@ -1184,7 +1315,7 @@ async def unload(request):
                 torch.cuda.empty_cache()
         except Exception:
             pass
-    return _json_response({"ok": True, "unloaded": count})
+    return _json_response({"ok": True, "unloaded": count, "whisper_unloaded": whisper_count})
 
 
 @routes.post("/api/voxcpm/synthesize")
@@ -1683,6 +1814,65 @@ async def separate(request):
         "separator_returncode": result["returncode"],
         "separator_stdout": result["stdout"],
         "separator_stderr": result["stderr"],
+    })
+
+
+@routes.post("/api/whisper/transcribe")
+@routes.post("/api/asr/whisper")
+async def whisper_transcribe(request):
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+
+    out_root = Path(os.environ.get("WHISPER_OUTPUT_DIR") or (WORK_ROOT / "whisper_outputs"))
+    request_dir = out_root / req_id
+    input_path = None
+    start_time = time.time()
+    try:
+        input_path, options = await _read_separation_request(request, req_id, request_dir)
+        model_name = str(options.get("model") or DEFAULT_WHISPER_MODEL).strip() or DEFAULT_WHISPER_MODEL
+        device = _whisper_device(options.get("device") or "auto")
+        compute_type = str(options.get("compute_type") or _default_whisper_compute_type(device)).strip()
+        logger.info(
+            "[%s] whisper started: input=%s model=%s device=%s compute_type=%s",
+            req_id,
+            input_path,
+            model_name,
+            device,
+            compute_type,
+        )
+        model = await _ensure_whisper_model(model_name, device, compute_type)
+        async with _WHISPER_INFER_SEM:
+            result = await asyncio.to_thread(
+                _transcribe_whisper_sync,
+                model,
+                input_path,
+                options,
+            )
+    except ValueError as exc:
+        tb = traceback.format_exc()
+        logger.warning(f"[{req_id}] Invalid whisper request: {exc}\n{tb}")
+        return _error(f"Invalid whisper request: {exc}", status=400)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"[{req_id}] Whisper transcription failed: {exc}\n{tb}")
+        return _error(f"Whisper transcription failed: {exc}\n{tb}", status=502)
+    finally:
+        if input_path is not None:
+            _cleanup_temp_paths(input_path)
+
+    elapsed = round(time.time() - start_time, 3)
+    logger.info(
+        "[%s] whisper finished in %.3fs, segments=%d",
+        req_id,
+        elapsed,
+        len(result.get("segments") or []),
+    )
+    return _json_response({
+        "ok": True,
+        "model": model_name,
+        "elapsed_seconds": elapsed,
+        **result,
     })
 
 
