@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM ghcr.io/astral-sh/uv:python3.10-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 
 ARG OMNIVOICE_MODEL_ID=k2-fsa/OmniVoice
 ARG OMNIVOICE_MODEL_DIR=/opt/omnivoice/models/k2-fsa/OmniVoice
