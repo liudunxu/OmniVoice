@@ -370,6 +370,121 @@ def _audio_loudness_profile(path, frame_seconds=0.4):
     return profile
 
 
+def _waveform_loudness_profile(waveform, sampling_rate: int, frame_seconds=0.04):
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    sampling_rate = int(sampling_rate or 0)
+    duration = float(arr.size) / sampling_rate if sampling_rate > 0 else 0.0
+    if arr.size == 0:
+        return {
+            "mean_volume_db": None,
+            "max_volume_db": None,
+            "duration_seconds": _round_float(duration, 3),
+            "analysis_method": "waveform_frame_rms_loudness",
+        }
+    frame_size = max(1, int(max(0.01, float(frame_seconds)) * max(1, sampling_rate)))
+    frame_powers = []
+    frame_dbs = []
+    total_power = float(np.mean(np.square(arr, dtype=np.float64)))
+    peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+    for start in range(0, arr.size, frame_size):
+        block = arr[start : start + frame_size]
+        if block.size == 0:
+            continue
+        power = float(np.mean(np.square(block, dtype=np.float64)))
+        if power > 1e-20:
+            frame_powers.append(power)
+            frame_dbs.append(10.0 * np.log10(power))
+    profile = {
+        "mean_volume_db": _round_float(_db_from_power(total_power), 2),
+        "max_volume_db": _round_float(_db_from_peak(peak), 2),
+        "duration_seconds": _round_float(duration, 3),
+        "analysis_method": "waveform_frame_rms_loudness",
+        "frame_seconds": frame_seconds,
+    }
+    if not frame_dbs:
+        return profile
+    db_values = np.asarray(frame_dbs, dtype=np.float64)
+    power_values = np.asarray(frame_powers, dtype=np.float64)
+    high_db = float(np.percentile(db_values, 90))
+    gate_db = max(-60.0, high_db - 35.0)
+    active_mask = db_values >= gate_db
+    if int(active_mask.sum()) < min(3, len(db_values)):
+        active_mask = db_values >= float(np.percentile(db_values, 65))
+    active_dbs = db_values[active_mask]
+    active_powers = power_values[active_mask]
+    active_mean_db = _db_from_power(float(np.mean(active_powers))) if active_powers.size else None
+    active_p70_db = float(np.percentile(active_dbs, 70)) if active_dbs.size else active_mean_db
+    profile.update(
+        {
+            "active_mean_volume_db": _round_float(active_mean_db, 2),
+            "active_p70_volume_db": _round_float(active_p70_db, 2),
+            "activity_ratio": _round_float(float(active_dbs.size / db_values.size), 3) if db_values.size else None,
+            "active_gate_db": _round_float(gate_db, 2),
+        }
+    )
+    return profile
+
+
+def _waveform_speech_intervals(waveform, sampling_rate: int, frame_seconds=0.04):
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    sampling_rate = int(sampling_rate or 0)
+    if arr.size == 0 or sampling_rate <= 0:
+        return []
+    frame_size = max(1, int(max(0.01, float(frame_seconds)) * sampling_rate))
+    rows = []
+    dbs = []
+    for frame_index, start in enumerate(range(0, arr.size, frame_size)):
+        block = arr[start : start + frame_size]
+        if block.size == 0:
+            continue
+        power = float(np.mean(np.square(block, dtype=np.float64)))
+        db = _db_from_power(power)
+        dbs.append(db if db is not None else -120.0)
+        rows.append((frame_index, start, min(start + block.size, arr.size), db if db is not None else -120.0))
+    if not rows:
+        return []
+    db_values = np.asarray(dbs, dtype=np.float64)
+    high_db = float(np.percentile(db_values, 90))
+    gate_db = max(-52.0, high_db - 32.0)
+    intervals = []
+    current = None
+    for _frame_index, start, end, db in rows:
+        if db >= gate_db:
+            if current is None:
+                current = [start / sampling_rate, end / sampling_rate]
+            else:
+                current[1] = end / sampling_rate
+        elif current is not None:
+            if current[1] - current[0] >= 0.06:
+                intervals.append(tuple(current))
+            current = None
+    if current is not None and current[1] - current[0] >= 0.06:
+        intervals.append(tuple(current))
+    return _merge_time_intervals(intervals, gap=0.12)
+
+
+def _build_synth_audio_qc(waveform, sampling_rate: int, quality_issues=None):
+    duration = _audio_duration(waveform, sampling_rate)
+    speech_intervals = _waveform_speech_intervals(waveform, sampling_rate)
+    speech_total = sum(max(0.0, end - start) for start, end in speech_intervals)
+    loudness = _waveform_loudness_profile(waveform, sampling_rate)
+    return {
+        "version": 1,
+        "source": "omnivoice_cloud_synthesize",
+        "analysis_method": "waveform_frame_energy",
+        "duration_sec": _round_float(duration),
+        "speech_total_sec": _round_float(speech_total),
+        "speech_ratio": _round_float(speech_total / duration) if duration > 0 else None,
+        "speech_interval_count": len(speech_intervals),
+        "speech_intervals": [
+            {"start": _round_float(start), "end": _round_float(end), "duration": _round_float(end - start)}
+            for start, end in speech_intervals[:500]
+        ],
+        "loudness": loudness,
+        "quality_issues": list(quality_issues or []),
+    }
+
+
 def _merge_time_intervals(intervals, gap=0.10):
     cleaned = sorted((max(0.0, float(s)), max(0.0, float(e))) for s, e in intervals if e > s)
     merged = []
@@ -1161,6 +1276,387 @@ def _compute_rms(waveform) -> float:
     return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
 
 
+def _mono_float32(waveform) -> np.ndarray:
+    arr = waveform
+    if hasattr(arr, "detach"):
+        arr = arr.detach().cpu()
+    if hasattr(arr, "numpy"):
+        arr = arr.numpy()
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 0:
+        return np.zeros(0, dtype=np.float32)
+    arr = np.squeeze(arr)
+    if arr.ndim == 2:
+        arr = np.mean(arr, axis=0 if arr.shape[0] <= arr.shape[1] else 1)
+    return np.asarray(arr, dtype=np.float32).reshape(-1)
+
+
+def _decode_audio_bytes_mono(raw: bytes, target_sr: int) -> tuple[np.ndarray, int]:
+    buf = io.BytesIO(raw)
+    try:
+        data, sr = sf.read(buf, dtype="float32", always_2d=True)
+        data = data.T
+    except Exception:
+        import librosa
+
+        buf.seek(0)
+        data, sr = librosa.load(buf, sr=None, mono=False)
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+    if data.shape[0] > 1:
+        data = np.mean(data, axis=0, keepdims=True)
+    if sr != target_sr:
+        data = torchaudio.functional.resample(
+            torch.from_numpy(data), orig_freq=sr, new_freq=target_sr
+        ).numpy()
+        sr = target_sr
+    return _mono_float32(data), int(sr)
+
+
+def _frame_rms_profile(
+    waveform: np.ndarray,
+    sampling_rate: int,
+    frame_seconds: float = 0.08,
+    hop_seconds: float = 0.04,
+) -> list[tuple[float, float, float]]:
+    y = _mono_float32(waveform)
+    if y.size == 0 or sampling_rate <= 0:
+        return []
+    frame = max(1, int(sampling_rate * frame_seconds))
+    hop = max(1, int(sampling_rate * hop_seconds))
+    if y.size < frame:
+        return [(0.0, y.size / sampling_rate, _compute_rms(y))]
+    out = []
+    for start in range(0, y.size - frame + 1, hop):
+        end = start + frame
+        out.append((start / sampling_rate, end / sampling_rate, _compute_rms(y[start:end])))
+    return out
+
+
+def _active_intervals_from_rms(
+    waveform: np.ndarray,
+    sampling_rate: int,
+    min_duration: float = 0.16,
+    merge_gap: float = 0.14,
+) -> list[tuple[float, float]]:
+    frames = _frame_rms_profile(waveform, sampling_rate)
+    if not frames:
+        return []
+    rms_values = np.asarray([r for _, _, r in frames], dtype=np.float64)
+    high = float(np.percentile(rms_values, 90)) if rms_values.size else 0.0
+    floor = max(0.003, high * 0.16)
+    raw = [(s, e) for s, e, r in frames if r >= floor]
+    merged = _merge_time_intervals(raw, gap=merge_gap)
+    return [(s, e) for s, e in merged if e - s >= min_duration]
+
+
+def _concat_intervals(
+    waveform: np.ndarray,
+    sampling_rate: int,
+    intervals: list[tuple[float, float]],
+) -> np.ndarray:
+    y = _mono_float32(waveform)
+    chunks = []
+    for start, end in intervals:
+        s = max(0, int(start * sampling_rate))
+        e = min(y.size, int(end * sampling_rate))
+        if e > s:
+            chunks.append(y[s:e])
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32, copy=False)
+
+
+def _basic_voice_feature(waveform: np.ndarray, sampling_rate: int) -> Optional[np.ndarray]:
+    y = _mono_float32(waveform)
+    if y.size < max(256, int(0.18 * sampling_rate)):
+        return None
+    frame = max(128, int(0.04 * sampling_rate))
+    hop = max(64, int(0.02 * sampling_rate))
+    if y.size < frame:
+        frame = y.size
+    window = np.hanning(frame).astype(np.float32)
+    freqs = np.fft.rfftfreq(frame, d=1.0 / sampling_rate)
+    rows = []
+    rms_values = []
+    for start in range(0, max(1, y.size - frame + 1), hop):
+        chunk = y[start : start + frame]
+        if chunk.size < frame:
+            break
+        rms = _compute_rms(chunk)
+        rms_values.append(rms)
+        spec = np.abs(np.fft.rfft(chunk * window)).astype(np.float64)
+        power = spec**2
+        total = float(np.sum(power)) + 1e-12
+        centroid = float(np.sum(freqs * power) / total)
+        bandwidth = float(np.sqrt(np.sum(((freqs - centroid) ** 2) * power) / total))
+        cumulative = np.cumsum(power)
+        rolloff_idx = int(np.searchsorted(cumulative, total * 0.85, side="left"))
+        rolloff_idx = min(max(0, rolloff_idx), len(freqs) - 1)
+        rolloff = float(freqs[rolloff_idx])
+        zcr = float(np.mean(np.abs(np.diff(np.signbit(chunk)))))
+        low = float(np.sum(power[(freqs >= 80) & (freqs < 400)]) / total)
+        mid = float(np.sum(power[(freqs >= 400) & (freqs < 1600)]) / total)
+        high = float(np.sum(power[(freqs >= 1600) & (freqs < 5000)]) / total)
+        flatness = float(np.exp(np.mean(np.log(power + 1e-12))) / (np.mean(power) + 1e-12))
+        rows.append([rms, centroid, bandwidth, rolloff, zcr, low, mid, high, flatness])
+    if not rows:
+        return None
+    rms_arr = np.asarray(rms_values, dtype=np.float64)
+    active_floor = max(0.003, float(np.percentile(rms_arr, 80)) * 0.18)
+    active_rows = np.asarray(
+        [row for row in rows if row[0] >= active_floor],
+        dtype=np.float64,
+    )
+    if active_rows.size == 0:
+        active_rows = np.asarray(rows, dtype=np.float64)
+    feat = np.concatenate([np.mean(active_rows, axis=0), np.std(active_rows, axis=0)])
+    scale = np.asarray(
+        [0.1, 3000.0, 3000.0, 5000.0, 0.5, 1.0, 1.0, 1.0, 1.0] * 2,
+        dtype=np.float64,
+    )
+    feat = np.nan_to_num(feat / scale, nan=0.0, posinf=0.0, neginf=0.0)
+    norm = float(np.linalg.norm(feat))
+    if norm <= 1e-8:
+        return None
+    return feat / norm
+
+
+def _voice_feature(waveform: np.ndarray, sampling_rate: int) -> Optional[np.ndarray]:
+    y = _mono_float32(waveform)
+    if y.size < max(256, int(0.18 * sampling_rate)):
+        return None
+    try:
+        import librosa
+
+        n_fft = min(1024, 2 ** int(np.floor(np.log2(max(256, y.size)))))
+        hop_length = max(1, int(0.025 * sampling_rate))
+        mfcc = librosa.feature.mfcc(
+            y=y,
+            sr=sampling_rate,
+            n_mfcc=20,
+            n_fft=n_fft,
+            hop_length=hop_length,
+        )
+        spec_centroid = librosa.feature.spectral_centroid(
+            y=y, sr=sampling_rate, n_fft=n_fft, hop_length=hop_length
+        )
+        zcr = librosa.feature.zero_crossing_rate(y, frame_length=n_fft, hop_length=hop_length)
+    except Exception:
+        return _basic_voice_feature(y, sampling_rate)
+
+    stat_parts = [
+        np.mean(mfcc[1:], axis=1),
+        np.std(mfcc[1:], axis=1),
+        np.mean(spec_centroid, axis=1),
+        np.std(spec_centroid, axis=1),
+        np.mean(zcr, axis=1),
+        np.std(zcr, axis=1),
+    ]
+    feat = np.concatenate(stat_parts).astype(np.float64)
+    feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+    norm = float(np.linalg.norm(feat))
+    if norm <= 1e-8:
+        return None
+    return feat / norm
+
+
+def _mean_voice_feature(features: list[np.ndarray]) -> Optional[np.ndarray]:
+    if not features:
+        return None
+    feat = np.mean(np.stack(features, axis=0), axis=0)
+    norm = float(np.linalg.norm(feat))
+    if norm <= 1e-8:
+        return None
+    return feat / norm
+
+
+def _feature_similarity(left: Optional[np.ndarray], right: Optional[np.ndarray]) -> Optional[float]:
+    if left is None or right is None:
+        return None
+    return float(np.dot(left, right))
+
+
+def _edge_trim_min_keep_duration(
+    original_duration: float,
+    text: str,
+    ref_text: Optional[str],
+    ref_duration: Optional[float],
+    target_duration: Optional[float],
+) -> float:
+    floors = [0.6, original_duration * 0.55]
+    if target_duration and target_duration > 0:
+        floors.append(min(original_duration * 0.9, target_duration * 0.65))
+    if text:
+        estimated = _estimate_natural_duration(text, ref_text, ref_duration)
+        floors.append(min(original_duration * 0.9, estimated * 0.6))
+    return min(original_duration, max(floors))
+
+
+def _trim_edge_voice_mismatch(
+    waveform,
+    sampling_rate: int,
+    *,
+    text: str,
+    ref_text: Optional[str],
+    ref_duration: Optional[float],
+    target_duration: Optional[float],
+    ref_audio_bytes: Optional[bytes],
+    max_edge_trim_seconds: float = 2.0,
+    similarity_threshold: float = 0.86,
+    similarity_margin: float = 0.08,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    y = _mono_float32(waveform)
+    duration = y.size / sampling_rate if sampling_rate > 0 else 0.0
+    info: Dict[str, Any] = {
+        "enabled": True,
+        "status": "skipped",
+        "basis": "none",
+        "original_duration_sec": _round_float(duration),
+        "trim_start_sec": 0.0,
+        "trim_end_sec": 0.0,
+        "threshold": similarity_threshold,
+        "margin": similarity_margin,
+        "edge_candidates": [],
+    }
+    if y.size == 0 or duration < 1.0:
+        info["reason"] = "audio_too_short"
+        return y, info
+
+    max_edge = max(0.2, min(float(max_edge_trim_seconds), duration * 0.25))
+    min_keep = _edge_trim_min_keep_duration(
+        duration, text, ref_text, ref_duration, target_duration
+    )
+    active_intervals = _active_intervals_from_rms(y, sampling_rate)
+    if len(active_intervals) < 2:
+        info["reason"] = "no_separate_edge_speech"
+        info["active_interval_count"] = len(active_intervals)
+        return y, info
+
+    ref_feature = None
+    if ref_audio_bytes:
+        try:
+            ref_y, ref_sr = _decode_audio_bytes_mono(ref_audio_bytes, sampling_rate)
+            ref_active = _active_intervals_from_rms(ref_y, ref_sr)
+            ref_samples = _concat_intervals(ref_y, ref_sr, ref_active) if ref_active else ref_y
+            ref_feature = _voice_feature(ref_samples, ref_sr)
+        except Exception as exc:
+            info["ref_feature_error"] = str(exc)[:300]
+
+    edge_first = active_intervals[0] if active_intervals[0][0] <= 0.35 else None
+    edge_last = active_intervals[-1] if active_intervals[-1][1] >= duration - 0.35 else None
+
+    excluded = {edge_first, edge_last}
+    main_intervals = [
+        interval
+        for interval in active_intervals
+        if interval not in excluded
+        and interval[0] >= 0.0
+        and interval[1] <= duration
+    ]
+    if not main_intervals:
+        center_start = duration * 0.25
+        center_end = duration * 0.75
+        main_intervals = [
+            (max(center_start, s), min(center_end, e))
+            for s, e in active_intervals
+            if min(center_end, e) > max(center_start, s)
+        ]
+    main_features = [
+        _voice_feature(_concat_intervals(y, sampling_rate, [interval]), sampling_rate)
+        for interval in main_intervals
+    ]
+    main_feature = _mean_voice_feature([f for f in main_features if f is not None])
+    if main_feature is None:
+        info["reason"] = "main_voice_feature_unavailable"
+        return y, info
+
+    basis = "ref_wav" if ref_feature is not None else "main_voice"
+    info["basis"] = basis
+    main_ref_similarity = _feature_similarity(main_feature, ref_feature)
+    if main_ref_similarity is not None:
+        info["main_ref_similarity"] = _round_float(main_ref_similarity)
+
+    def candidate_is_mismatch(interval: tuple[float, float], side: str) -> tuple[bool, Dict[str, Any]]:
+        samples = _concat_intervals(y, sampling_rate, [interval])
+        feat = _voice_feature(samples, sampling_rate)
+        sim_main = _feature_similarity(feat, main_feature)
+        sim_ref = _feature_similarity(feat, ref_feature)
+        candidate = {
+            "side": side,
+            "start": _round_float(interval[0]),
+            "end": _round_float(interval[1]),
+            "duration": _round_float(interval[1] - interval[0]),
+            "similarity_to_main": _round_float(sim_main),
+            "similarity_to_ref": _round_float(sim_ref),
+        }
+        if feat is None or sim_main is None:
+            candidate["decision"] = "skip_feature_unavailable"
+            return False, candidate
+        if interval[1] - interval[0] > max_edge:
+            candidate["decision"] = "keep_too_long_for_edge"
+            return False, candidate
+        if basis == "ref_wav" and sim_ref is not None and main_ref_similarity is not None:
+            mismatch = (
+                sim_ref < similarity_threshold
+                and sim_ref + similarity_margin < main_ref_similarity
+                and sim_main < 0.96
+            )
+        else:
+            mismatch = sim_main < similarity_threshold
+        candidate["decision"] = "trim" if mismatch else "keep"
+        return mismatch, candidate
+
+    trim_start = 0.0
+    trim_end = 0.0
+    if edge_first is not None:
+        mismatch, candidate = candidate_is_mismatch(edge_first, "start")
+        info["edge_candidates"].append(candidate)
+        if mismatch:
+            trim_start = min(max_edge, edge_first[1])
+    if edge_last is not None:
+        mismatch, candidate = candidate_is_mismatch(edge_last, "end")
+        info["edge_candidates"].append(candidate)
+        if mismatch:
+            trim_end = min(max_edge, duration - edge_last[0])
+
+    if trim_start + trim_end <= 0:
+        info["status"] = "pass"
+        info["reason"] = "edge_voice_matches_main"
+        return y, info
+    if duration - trim_start - trim_end < min_keep:
+        overflow = min_keep - (duration - trim_start - trim_end)
+        if trim_end >= trim_start:
+            trim_end = max(0.0, trim_end - overflow)
+        else:
+            trim_start = max(0.0, trim_start - overflow)
+    if duration - trim_start - trim_end < 0.5:
+        info["status"] = "skipped"
+        info["reason"] = "trim_would_remove_too_much_audio"
+        return y, info
+
+    start_sample = int(trim_start * sampling_rate)
+    end_sample = y.size - int(trim_end * sampling_rate)
+    trimmed = y[start_sample:end_sample].astype(np.float32, copy=False)
+    fade_samples = min(int(0.02 * sampling_rate), trimmed.size // 4)
+    if fade_samples > 1:
+        fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+        fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+        trimmed = trimmed.copy()
+        trimmed[:fade_samples] *= fade_in
+        trimmed[-fade_samples:] *= fade_out
+    info.update(
+        {
+            "status": "trimmed" if (trim_start > 0 or trim_end > 0) else "pass",
+            "trim_start_sec": _round_float(trim_start),
+            "trim_end_sec": _round_float(trim_end),
+            "trimmed_duration_sec": _round_float(trimmed.size / sampling_rate),
+            "min_keep_duration_sec": _round_float(min_keep),
+        }
+    )
+    return trimmed, info
+
+
 def _check_audio_quality(
     waveform,
     sampling_rate: int,
@@ -1663,6 +2159,38 @@ async def synthesize(request):
         f"tolerance_ms={duration_tolerance_ms}, seed={seed if seed is not None else '-'}"
     )
 
+    voice_trim_value = data.get("voice_consistency_trim")
+    if voice_trim_value is None:
+        voice_trim_value = data.get("speaker_consistency_trim")
+    if voice_trim_value is None:
+        voice_trim_value = data.get("trim_voice_mismatch")
+    voice_consistency_trim = _bool_option(
+        voice_trim_value,
+        str(os.environ.get("OMNIVOICE_VOICE_CONSISTENCY_TRIM", "1")).lower()
+        in {"1", "true", "yes", "on"},
+    )
+    voice_consistency_max_edge_trim_sec = (
+        float(
+            data.get(
+                "voice_consistency_max_edge_trim_ms",
+                os.environ.get("OMNIVOICE_VOICE_CONSISTENCY_MAX_EDGE_TRIM_MS", "2000"),
+            )
+        )
+        / 1000.0
+    )
+    voice_consistency_threshold = float(
+        data.get(
+            "voice_consistency_threshold",
+            os.environ.get("OMNIVOICE_VOICE_CONSISTENCY_THRESHOLD", "0.86"),
+        )
+    )
+    voice_consistency_margin = float(
+        data.get(
+            "voice_consistency_margin",
+            os.environ.get("OMNIVOICE_VOICE_CONSISTENCY_MARGIN", "0.08"),
+        )
+    )
+
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_name = data.get("output_name")
@@ -1684,6 +2212,10 @@ async def synthesize(request):
                 "max_duration_ms": max_duration_ms,
                 "duration_tolerance_ms": duration_tolerance_ms,
                 "seed": seed,
+                "voice_consistency_trim": voice_consistency_trim,
+                "voice_consistency_max_edge_trim_sec": voice_consistency_max_edge_trim_sec,
+                "voice_consistency_threshold": voice_consistency_threshold,
+                "voice_consistency_margin": voice_consistency_margin,
             }, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:20]
         out_name = f"voxcpm_{key}.wav"
@@ -1820,6 +2352,37 @@ async def synthesize(request):
         _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
         return _error(f"Synthesis failed: {exc}\n{tb}", status=502)
 
+    voice_consistency_info: Dict[str, Any] = {"enabled": False}
+    if voice_consistency_trim:
+        try:
+            audio_waveform, voice_consistency_info = await asyncio.to_thread(
+                _trim_edge_voice_mismatch,
+                audio_waveform,
+                model.sampling_rate,
+                text=text,
+                ref_text=prompt_text or effective_prompt_text or None,
+                ref_duration=ref_duration,
+                target_duration=effective_duration,
+                ref_audio_bytes=ref_audio_bytes or prompt_audio_bytes,
+                max_edge_trim_seconds=voice_consistency_max_edge_trim_sec,
+                similarity_threshold=voice_consistency_threshold,
+                similarity_margin=voice_consistency_margin,
+            )
+            logger.info(
+                f"[{req_id}] voice consistency trim: "
+                f"status={voice_consistency_info.get('status')}, "
+                f"basis={voice_consistency_info.get('basis')}, "
+                f"trim_start={voice_consistency_info.get('trim_start_sec')}, "
+                f"trim_end={voice_consistency_info.get('trim_end_sec')}"
+            )
+        except Exception as exc:
+            logger.warning(f"[{req_id}] Voice consistency trim failed: {exc}")
+            voice_consistency_info = {
+                "enabled": True,
+                "status": "error",
+                "error": str(exc)[:500],
+            }
+
     try:
         wav_bytes = _waveform_to_wav_bytes(audio_waveform, model.sampling_rate)
     except Exception as exc:
@@ -1839,6 +2402,17 @@ async def synthesize(request):
 
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / model.sampling_rate, 3)
+    audio_qc = None
+    if _bool_option(data.get("include_audio_qc"), True):
+        try:
+            audio_qc = _build_synth_audio_qc(
+                audio_waveform,
+                model.sampling_rate,
+                quality_issues=quality_issues,
+            )
+        except Exception as exc:
+            logger.warning(f"[{req_id}] Failed to build synthesis audio_qc: {exc}")
+            audio_qc = {"version": 1, "status": "error", "error": str(exc)[:500]}
     logger.info(
         f"[{req_id}] synthesis finished in {elapsed}s, output_size={len(wav_bytes)} bytes, "
         f"audio_duration={audio_duration}s, duration_attempts={attempts_made}, "
@@ -1865,6 +2439,8 @@ async def synthesize(request):
         "duration_refinement_log": attempt_log,
         "quality_issues": quality_issues,
         "quality_retried": quality_retried,
+        "audio_qc": audio_qc or {},
+        "voice_consistency_trim": voice_consistency_info,
         "duration_match": {
             "ref_duration": ref_duration,
             "target_duration": effective_duration,
