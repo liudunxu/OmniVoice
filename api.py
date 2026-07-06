@@ -284,6 +284,168 @@ def _audio_duration_seconds(path):
     return None
 
 
+def _round_float(value, digits=3):
+    try:
+        return float(round(float(value), digits))
+    except (TypeError, ValueError):
+        return None
+
+
+def _db_from_power(power):
+    try:
+        power = float(power)
+    except (TypeError, ValueError):
+        return None
+    if power <= 1e-20:
+        return None
+    return 10.0 * np.log10(power)
+
+
+def _db_from_peak(peak):
+    try:
+        peak = float(peak)
+    except (TypeError, ValueError):
+        return None
+    if peak <= 1e-10:
+        return None
+    return 20.0 * np.log10(peak)
+
+
+def _audio_loudness_profile(path, frame_seconds=0.4):
+    frame_powers = []
+    frame_dbs = []
+    total_weighted_power = 0.0
+    total_samples = 0
+    peak = 0.0
+    duration = 0.0
+
+    with sf.SoundFile(str(path)) as audio:
+        sample_rate = audio.samplerate or 48000
+        channels = max(1, audio.channels or 1)
+        frame_size = max(1, int(sample_rate * frame_seconds))
+        duration = (len(audio) / sample_rate) if sample_rate else 0.0
+        for block in audio.blocks(blocksize=frame_size, dtype="float32", always_2d=True):
+            if block.size == 0:
+                continue
+            samples = block.reshape(-1)
+            power = float(np.mean(np.square(samples, dtype=np.float64)))
+            sample_count = int(block.shape[0] * channels)
+            total_weighted_power += power * sample_count
+            total_samples += sample_count
+            if power > 1e-20:
+                frame_powers.append(power)
+                frame_dbs.append(10.0 * np.log10(power))
+            peak = max(peak, float(np.max(np.abs(samples))) if samples.size else 0.0)
+
+    mean_db = _db_from_power(total_weighted_power / total_samples) if total_samples else None
+    profile = {
+        "mean_volume_db": _round_float(mean_db, 2),
+        "max_volume_db": _round_float(_db_from_peak(peak), 2),
+        "duration_seconds": _round_float(duration, 3),
+        "analysis_method": "frame_rms_active_loudness",
+    }
+    if not frame_dbs:
+        return profile
+
+    db_values = np.asarray(frame_dbs, dtype=np.float64)
+    power_values = np.asarray(frame_powers, dtype=np.float64)
+    high_db = float(np.percentile(db_values, 90))
+    gate_db = max(-60.0, high_db - 35.0)
+    active_mask = db_values >= gate_db
+    if int(active_mask.sum()) < min(3, len(db_values)):
+        active_mask = db_values >= float(np.percentile(db_values, 65))
+    active_dbs = db_values[active_mask]
+    active_powers = power_values[active_mask]
+    active_mean_db = _db_from_power(float(np.mean(active_powers))) if active_powers.size else None
+    active_p70_db = float(np.percentile(active_dbs, 70)) if active_dbs.size else active_mean_db
+    profile.update(
+        {
+            "active_mean_volume_db": _round_float(active_mean_db, 2),
+            "active_p70_volume_db": _round_float(active_p70_db, 2),
+            "activity_ratio": _round_float(float(active_dbs.size / db_values.size), 3) if db_values.size else None,
+            "active_gate_db": _round_float(gate_db, 2),
+            "frame_seconds": frame_seconds,
+        }
+    )
+    return profile
+
+
+def _merge_time_intervals(intervals, gap=0.10):
+    cleaned = sorted((max(0.0, float(s)), max(0.0, float(e))) for s, e in intervals if e > s)
+    merged = []
+    for start, end in cleaned:
+        if not merged or start > merged[-1][1] + gap:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _whisper_speech_intervals(segments, duration):
+    intervals = []
+    word_count = 0
+    for segment in segments or []:
+        words = segment.get("words") if isinstance(segment, dict) else None
+        if words:
+            for word in words:
+                try:
+                    start = float(word.get("start"))
+                    end = float(word.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                if end > start:
+                    intervals.append((start, end))
+                    word_count += 1
+            continue
+        try:
+            start = float(segment.get("start"))
+            end = float(segment.get("end"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if end > start:
+            intervals.append((start, end))
+    duration = float(duration or 0.0)
+    merged = _merge_time_intervals(
+        [(max(0.0, min(s, duration)), max(0.0, min(e, duration))) for s, e in intervals],
+        gap=0.16,
+    )
+    return merged, word_count
+
+
+def _build_whisper_audio_qc(audio_path, result):
+    duration = result.get("duration") or _audio_duration_seconds(audio_path) or 0.0
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        duration = 0.0
+    segments = result.get("segments") or []
+    speech_intervals, word_count = _whisper_speech_intervals(segments, duration)
+    speech_total = sum(max(0.0, end - start) for start, end in speech_intervals)
+    loudness = {}
+    try:
+        loudness = _audio_loudness_profile(audio_path)
+    except Exception as exc:
+        loudness = {"error": str(exc)[:300]}
+    return {
+        "version": 1,
+        "source": "whisper_cloud",
+        "analysis_method": "whisper_segments+soundfile_loudness",
+        "duration_sec": _round_float(duration),
+        "speech_total_sec": _round_float(speech_total),
+        "speech_ratio": _round_float(speech_total / duration) if duration > 0 else None,
+        "speech_interval_count": len(speech_intervals),
+        "speech_intervals": [
+            {"start": _round_float(start), "end": _round_float(end), "duration": _round_float(end - start)}
+            for start, end in speech_intervals[:2000]
+        ],
+        "segment_count": len(segments),
+        "word_count": word_count,
+        "language": result.get("language"),
+        "language_probability": result.get("language_probability"),
+        "loudness": loudness,
+    }
+
+
 def _find_cli(name):
     candidates = [ROOT / ".venv" / "bin" / name, shutil.which(name)]
     for candidate in candidates:
@@ -1849,6 +2011,15 @@ async def whisper_transcribe(request):
                 input_path,
                 options,
             )
+        if _bool_option(options.get("include_audio_qc"), True):
+            try:
+                result["audio_qc"] = await asyncio.to_thread(
+                    _build_whisper_audio_qc,
+                    input_path,
+                    result,
+                )
+            except Exception as exc:
+                result["audio_qc"] = {"version": 1, "status": "error", "error": str(exc)[:500]}
     except ValueError as exc:
         tb = traceback.format_exc()
         logger.warning(f"[{req_id}] Invalid whisper request: {exc}\n{tb}")

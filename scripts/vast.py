@@ -144,7 +144,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     """Search for cheap RTX 3090 on-demand offers.
 
     Defaults follow the runbook: verified/rentable/ondemand, 1 GPU,
-    >= 12 GB VRAM, >= 80 GB disk, direct port, <= $0.25/hr,
+    >= 20 GB VRAM, >= 80 GB disk, direct port, <= $0.25/hr,
     East Asia / Southeast Asia / Central & West Asia first, then Americas.
     """
     payload = {
@@ -154,7 +154,7 @@ def cmd_search(args: argparse.Namespace) -> None:
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
-        "gpu_ram": {"gte": 12000},
+        "gpu_ram": {"gte": 20000},
         "disk_space": {"gte": 80},
         "direct_port_count": {"gte": 1},
         "dph_total": {"lte": args.max_price},
