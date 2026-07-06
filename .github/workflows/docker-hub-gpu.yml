@@ -6,7 +6,7 @@ on:
       image_name:
         description: Docker Hub image name, including namespace
         required: true
-        default: your_dockerhub_username/omnivoice-api
+        default: liudunxu/omnivoice-api
       tag:
         description: Image tag
         required: true
@@ -54,5 +54,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          secrets: |
-            hf_token=${{ secrets.HF_TOKEN }}
