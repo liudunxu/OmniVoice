@@ -19,6 +19,7 @@ ENV PYTHONUNBUFFERED=1 \
     OMNIVOICE_PRELOADED_MODEL=${OMNIVOICE_MODEL_DIR}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     curl \
     ffmpeg \
