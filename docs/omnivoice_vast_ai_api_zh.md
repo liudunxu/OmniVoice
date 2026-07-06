@@ -2,6 +2,11 @@
 
 本文是 `docs/vast_ai_gpu_service_runbook_zh.md` 的 OmniVoice 专用落地版。目标是在 Vast.ai 上运行 `api.py`，对外暴露 HTTP API。
 
+同一个 `api.py` 进程同时提供：
+
+- `POST /api/synthesize` / `POST /api/voxcpm/synthesize`：OmniVoice TTS
+- `POST /api/separate`：人声/背景音分离，使用 Audio Separator / RoFormer 的 `vocals_mel_band_roformer.ckpt`
+
 ## 镜像选择
 
 默认使用内置权重镜像：
@@ -75,7 +80,9 @@ runtype=args
   "-p 8000:8000": "1",
   "PORT": "8000",
   "HOST": "0.0.0.0",
-  "MODEL_DIR": "/workspace/models"
+  "MODEL_DIR": "/workspace/models",
+  "AUDIO_SEPARATOR_MODEL_DIR": "/workspace/models/audio-separator",
+  "OMNIVOICE_MAX_REQUEST_MB": "512"
 }
 ```
 

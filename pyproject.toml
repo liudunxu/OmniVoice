@@ -42,6 +42,7 @@ dependencies = [
     "soundfile",
     "librosa",
     "aiohttp",
+    "audio-separator>=0.44.1",
 ]
 
 [project.optional-dependencies]

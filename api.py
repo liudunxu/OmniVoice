@@ -18,6 +18,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -92,6 +94,13 @@ MAX_TEXT_LEN = int(os.environ.get("VOXCPM_MAX_TEXT_LEN", "2000"))
 MAX_REQUEST_MB = int(os.environ.get("VOXCPM_MAX_REQUEST_MB", os.environ.get("OMNIVOICE_MAX_REQUEST_MB", "64")))
 MAX_REQUEST_SIZE = MAX_REQUEST_MB * 1024 * 1024
 OMNIVOICE_SEED_MOD = 2**31 - 1
+DEFAULT_SEPARATOR_MODEL = os.environ.get("SEPARATION_MODEL", "vocals_mel_band_roformer.ckpt")
+SEPARATION_MODEL_DIR = Path(
+    os.environ.get(
+        "AUDIO_SEPARATOR_MODEL_DIR",
+        str(Path(os.environ.get("MODEL_DIR", WORK_ROOT / "models")) / "audio-separator"),
+    )
+)
 
 _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
@@ -247,6 +256,198 @@ def _audio_duration_seconds(path):
     except Exception:
         return None
     return None
+
+
+def _find_cli(name):
+    candidates = [ROOT / ".venv" / "bin" / name, shutil.which(name)]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists():
+            return str(path)
+    return None
+
+
+def _ffmpeg_binary():
+    return os.environ.get("FFMPEG_BINARY") or shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _safe_filename(name, default="input"):
+    name = Path(str(name or default)).name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name or default
+
+
+def _find_audio_stem(root, names, excludes=()):
+    root = Path(root)
+    wanted = {re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") for name in names}
+    blocked = {re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") for name in excludes}
+    audio_exts = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
+    files = [p for p in root.glob("**/*") if p.is_file() and p.suffix.lower() in audio_exts]
+
+    def normalized(path):
+        return re.sub(r"[^a-z0-9]+", "_", path.stem.lower()).strip("_")
+
+    for path in files:
+        stem = normalized(path)
+        if stem in wanted and stem not in blocked:
+            return path
+    for path in files:
+        stem = normalized(path)
+        if any(block in stem for block in blocked):
+            continue
+        if any(name in stem for name in wanted):
+            return path
+    return None
+
+
+def _locate_separator_stems(output_dir):
+    output_dir = Path(output_dir)
+    vocals = output_dir / "vocals.wav"
+    background = output_dir / "no_vocals.wav"
+    if not vocals.exists():
+        vocals = _find_audio_stem(output_dir, {"vocals", "vocal"}, excludes={"no_vocals", "instrumental", "other"})
+    if not background.exists():
+        background = _find_audio_stem(output_dir, {"no_vocals", "instrumental", "instrumentals", "other"})
+    return vocals, background
+
+
+def _clean_separator_outputs(output_dir, keep=()):
+    keep_paths = {Path(path).resolve() for path in keep}
+    audio_exts = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
+    for path in Path(output_dir).glob("*"):
+        if not path.is_file() or path.suffix.lower() not in audio_exts:
+            continue
+        try:
+            if path.resolve() in keep_paths:
+                continue
+        except FileNotFoundError:
+            continue
+        path.unlink(missing_ok=True)
+
+
+def _run_cmd(cmd, *, env=None, check=True):
+    result = subprocess.run(
+        [str(part) for part in cmd],
+        text=True,
+        capture_output=True,
+        env={**os.environ, **(env or {})},
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({result.returncode}): {' '.join(map(str, cmd))}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result
+
+
+def _prepare_separator_model(audio_separator_cli, model_dir, model):
+    model_dir.mkdir(parents=True, exist_ok=True)
+    _run_cmd(
+        [
+            audio_separator_cli,
+            "--model_filename",
+            model,
+            "--model_file_dir",
+            model_dir,
+            "--download_model_only",
+        ],
+    )
+
+
+def _separate_audio_sync(input_path, output_dir, options):
+    audio_separator_cli = _find_cli("audio-separator")
+    if not audio_separator_cli:
+        raise RuntimeError("audio-separator CLI not found. Install the audio-separator dependency.")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_audio = output_dir / "input_audio.wav"
+    _run_cmd(
+        [
+            _ffmpeg_binary(),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            input_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            input_audio,
+        ],
+    )
+    _clean_separator_outputs(output_dir, keep={input_audio})
+
+    model = str(options.get("model") or DEFAULT_SEPARATOR_MODEL).strip() or DEFAULT_SEPARATOR_MODEL
+    model_dir = Path(options.get("model_dir") or SEPARATION_MODEL_DIR)
+    _prepare_separator_model(audio_separator_cli, model_dir, model)
+
+    normalization = float(options.get("normalization", 0.9))
+    chunk_duration = options.get("chunk_duration")
+    use_autocast = _bool_option(options.get("use_autocast"), False)
+    batch_size = int(float(options.get("batch_size", 1) or 1))
+    segment_size = int(float(options.get("segment_size", 1) or 1))
+    output_names = json.dumps({"Vocals": "vocals", "Instrumental": "no_vocals", "Other": "no_vocals"})
+
+    cmd = [
+        audio_separator_cli,
+        input_audio,
+        "--model_filename",
+        model,
+        "--output_dir",
+        output_dir,
+        "--model_file_dir",
+        model_dir,
+        "--output_format",
+        "WAV",
+        "--normalization",
+        str(max(0.1, min(1.0, normalization))),
+        "--custom_output_names",
+        output_names,
+    ]
+    if chunk_duration not in (None, ""):
+        cmd.extend(["--chunk_duration", str(max(30.0, min(3600.0, float(chunk_duration))))])
+    if use_autocast:
+        cmd.append("--use_autocast")
+
+    is_mdx = model.lower().endswith(".onnx")
+    if is_mdx:
+        if batch_size > 1:
+            cmd.extend(["--mdx_batch_size", str(max(1, min(64, batch_size)))])
+        if segment_size >= 32:
+            cmd.extend(["--mdx_segment_size", str(max(32, min(4096, segment_size)))])
+    else:
+        if batch_size > 1:
+            cmd.extend(["--mdxc_batch_size", str(max(1, min(64, batch_size)))])
+        if segment_size >= 32:
+            cmd.extend(["--mdxc_segment_size", str(max(32, min(4096, segment_size)))])
+
+    result = _run_cmd(cmd, check=False)
+    vocals, background = _locate_separator_stems(output_dir)
+    if (not vocals or not background or not vocals.exists() or not background.exists()) and model.lower().endswith(".ckpt"):
+        _clean_separator_outputs(output_dir, keep={input_audio})
+        result = _run_cmd([*cmd, "--mdxc_override_model_segment_size"], check=False)
+        vocals, background = _locate_separator_stems(output_dir)
+
+    if not vocals or not background or not vocals.exists() or not background.exists():
+        raise RuntimeError(
+            "Audio Separator did not write vocals/no_vocals stems.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    return {
+        "vocals": vocals,
+        "background": background,
+        "model": model,
+        "returncode": result.returncode,
+        "stdout": result.stdout[-4000:],
+        "stderr": result.stderr[-4000:],
+    }
 
 
 def _decode_base64_audio_bytes(b64_data):
@@ -1368,6 +1569,104 @@ async def synthesize(request):
             "guidance_scale": cfg_value,
             "t_shift": t_shift,
         },
+    })
+
+
+async def _read_separation_request(request, req_id, out_dir):
+    options: Dict[str, Any] = {}
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if request.content_type.startswith("multipart/"):
+        reader = await request.multipart()
+        input_path = None
+        async for field in reader:
+            if field.name in {"audio", "file", "video", "input"}:
+                filename = _safe_filename(field.filename, "input.wav")
+                input_path = out_dir / f"{req_id}_{filename}"
+                with input_path.open("wb") as f:
+                    while True:
+                        chunk = await field.read_chunk()
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            else:
+                value = await field.text()
+                if field.name:
+                    options[field.name] = value
+        if input_path is None:
+            raise ValueError("multipart request must include an audio/file/video field")
+        return input_path, options
+
+    data = await request.json()
+    options.update(data)
+    audio_b64 = data.get("audio_base64") or data.get("file_base64") or data.get("video_base64")
+    if not audio_b64:
+        raise ValueError("audio_base64, file_base64, or video_base64 is required")
+    filename = _safe_filename(data.get("filename") or data.get("audio_filename") or "input.wav")
+    input_path = out_dir / f"{req_id}_{filename}"
+    _write_base64_audio(audio_b64, input_path)
+    return input_path, options
+
+
+@routes.post("/api/separate")
+@routes.post("/api/separation/separate")
+async def separate(request):
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+
+    out_root = Path(os.environ.get("SEPARATION_OUTPUT_DIR") or (WORK_ROOT / "separation_outputs"))
+    request_dir = out_root / req_id
+    input_path = None
+    start_time = time.time()
+    try:
+        input_path, options = await _read_separation_request(request, req_id, request_dir)
+        logger.info(
+            f"[{req_id}] separation started: input={input_path}, "
+            f"model={options.get('model') or DEFAULT_SEPARATOR_MODEL}"
+        )
+        result = await asyncio.to_thread(
+            _separate_audio_sync,
+            input_path,
+            request_dir / "stems",
+            options,
+        )
+    except ValueError as exc:
+        tb = traceback.format_exc()
+        logger.warning(f"[{req_id}] Invalid separation request: {exc}\n{tb}")
+        return _error(f"Invalid separation request: {exc}", status=400)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"[{req_id}] Separation failed: {exc}\n{tb}")
+        return _error(f"Separation failed: {exc}\n{tb}", status=502)
+    finally:
+        if input_path is not None:
+            _cleanup_temp_paths(input_path)
+
+    vocals_path = Path(result["vocals"])
+    background_path = Path(result["background"])
+    vocals_bytes = vocals_path.read_bytes()
+    background_bytes = background_path.read_bytes()
+    elapsed = round(time.time() - start_time, 3)
+    logger.info(
+        f"[{req_id}] separation finished in {elapsed}s, "
+        f"vocals={len(vocals_bytes)} bytes, background={len(background_bytes)} bytes"
+    )
+
+    return _json_response({
+        "ok": True,
+        "model": result["model"],
+        "elapsed_seconds": elapsed,
+        "vocals_base64": "data:audio/wav;base64," + base64.b64encode(vocals_bytes).decode("ascii"),
+        "background_base64": "data:audio/wav;base64," + base64.b64encode(background_bytes).decode("ascii"),
+        "vocals_path": str(vocals_path.resolve()),
+        "background_path": str(background_path.resolve()),
+        "relative_vocals_path": _relative_path(vocals_path),
+        "relative_background_path": _relative_path(background_path),
+        "separator_returncode": result["returncode"],
+        "separator_stdout": result["stdout"],
+        "separator_stderr": result["stderr"],
     })
 
 
