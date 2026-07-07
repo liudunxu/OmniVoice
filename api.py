@@ -1269,6 +1269,16 @@ def _measure_silence_ratio(waveform, threshold: float = 0.01) -> float:
     return float(np.mean(np.abs(arr) < threshold))
 
 
+def _measure_active_speech_ratio(waveform, sampling_rate: int) -> float:
+    """Estimate speech activity using frame RMS instead of per-sample zeros."""
+    duration = _audio_duration(waveform, sampling_rate)
+    if duration <= 0:
+        return 0.0
+    intervals = _active_intervals_from_rms(waveform, sampling_rate)
+    speech_total = sum(max(0.0, end - start) for start, end in intervals)
+    return max(0.0, min(1.0, speech_total / duration))
+
+
 def _compute_rms(waveform) -> float:
     arr = np.asarray(waveform)
     if arr.size == 0:
@@ -1674,10 +1684,11 @@ def _check_audio_quality(
     peak = float(np.abs(arr).max()) if arr.size > 0 else 0.0
     rms = _compute_rms(arr)
     silence_ratio = _measure_silence_ratio(arr)
+    active_speech_ratio = _measure_active_speech_ratio(arr, sampling_rate)
 
     if arr.size == 0 or duration < 0.05:
         issues.append("empty")
-    if silence_ratio > 0.5:
+    if duration >= 0.5 and active_speech_ratio < 0.35 and silence_ratio > 0.65:
         issues.append("too_much_silence")
     if peak > 0.99:
         issues.append("clipping")
@@ -2001,7 +2012,9 @@ async def synthesize(request):
     reference_audio_base64 = data.get("reference_audio_base64")
     prompt_wav_base64 = data.get("prompt_wav_base64") or data.get("prompt_audio_base64") or data.get("prompt_wav")
     prompt_text = re.sub(r"\s+", " ", (data.get("prompt_text") or "").strip())
-    effective_prompt_text = prompt_text if prompt_wav_base64 else ""
+    effective_prompt_text = (
+        prompt_text if (reference_audio_base64 or prompt_wav_base64) else ""
+    )
 
     # Get user-specified values (None means use adaptive defaults)
     user_cfg = data.get("cfg_value")
@@ -2120,13 +2133,33 @@ async def synthesize(request):
             f"as target duration={effective_duration:.3f}s"
         )
     elif user_duration is None and ref_duration is not None and user_speed == 1.0:
-        # If ref_duration can accommodate the text without rushing (>=70% of natural duration)
-        if ref_duration >= estimated_natural_duration * 0.7:
+        # Only borrow reference duration when it is close to the target text's
+        # natural duration. A long reference with short target text otherwise
+        # tends to produce long silence and quality retries.
+        min_match_duration = estimated_natural_duration * 0.7
+        max_match_duration = max(
+            estimated_natural_duration * 1.6,
+            estimated_natural_duration + 1.0,
+        )
+        if min_match_duration <= ref_duration <= max_match_duration:
             effective_duration = ref_duration
-            logger.info(f"[{req_id}] Using ref_duration={ref_duration}s as target (text_len={len(text)}, est_natural={estimated_natural_duration:.1f}s)")
+            logger.info(
+                f"[{req_id}] Using ref_duration={ref_duration}s as target "
+                f"(text_len={len(text)}, est_natural={estimated_natural_duration:.1f}s)"
+            )
+        elif ref_duration > max_match_duration:
+            logger.info(
+                f"[{req_id}] Skipping ref_duration={ref_duration}s "
+                f"(too long for text, est_natural={estimated_natural_duration:.1f}s), "
+                f"using model estimation"
+            )
         else:
             # Text is too long for ref_duration, use natural estimation to avoid badcase
-            logger.info(f"[{req_id}] Skipping ref_duration={ref_duration}s (text too long, est_natural={estimated_natural_duration:.1f}s), using model estimation")
+            logger.info(
+                f"[{req_id}] Skipping ref_duration={ref_duration}s "
+                f"(text too long, est_natural={estimated_natural_duration:.1f}s), "
+                f"using model estimation"
+            )
     elif user_duration is None and ref_duration is not None and user_speed != 1.0:
         # User specified speed, respect it but log for debugging
         logger.info(f"[{req_id}] User specified speed={user_speed}, skipping ref_duration matching")
@@ -2280,7 +2313,7 @@ async def synthesize(request):
             voice_clone_prompt = None
             if reference_audio_base64 or prompt_wav_base64:
                 clone_audio_bytes = ref_audio_bytes or prompt_audio_bytes
-                prompt_for_clone = effective_prompt_text if prompt_wav_base64 else ""
+                prompt_for_clone = effective_prompt_text
                 if clone_audio_bytes:
                     cache_key = _make_voice_prompt_cache_key(
                         clone_audio_bytes, prompt_for_clone, preprocess_prompt

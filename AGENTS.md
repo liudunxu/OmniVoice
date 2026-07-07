@@ -111,6 +111,16 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - After creating an instance, wait for the public port, then verify `GET /` returns `ok` and `GET /health` returns `{"ok": true, ...}`. Report the URL, instance id, image tag, label, GPU, and `dph_total`.
 - Do not keep old and new Vast.ai instances running after a redeploy unless the user explicitly asks for overlap. Once the new instance is verified, destroy old `omnivoice-api*` instances.
 
+### Known Working Vast.ai Instances
+
+Track instances that have successfully launched and run the OmniVoice API. When launching a new instance, prefer offers whose `machine_id` matches one of these proven hosts, as the Docker image is more likely to be cached locally and startup will be faster.
+
+| Machine ID | GPU        | Region        | Country | Image used                        | Commits / Notes                              |
+|------------|------------|---------------|---------|-----------------------------------|----------------------------------------------|
+| 140986     | RTX 3090   | East Asia     | TW      | `liudunxu/omnivoice-api:vast-gpu` | `5648d6c` (Return audio QC for synthesis)    |
+
+Use this list to choose a preferred offer during `scripts/vast.py search`, but fall back to the next best offer if none of these machines are available.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

@@ -249,6 +249,46 @@ def fade_and_pad_audio(
     return processed
 
 
+def suppress_spikes_and_limit(
+    audio: np.ndarray,
+    peak_limit: float = 0.92,
+    spike_threshold: float = 0.45,
+    spike_ratio: float = 3.0,
+) -> np.ndarray:
+    """Suppress isolated impulse spikes and leave headroom before WAV export."""
+    if audio.size == 0:
+        return audio
+
+    processed = np.asarray(audio, dtype=np.float32).copy()
+    processed = np.nan_to_num(processed, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if processed.ndim == 1:
+        view = processed[np.newaxis, :]
+    else:
+        view = processed.reshape((-1, processed.shape[-1]))
+
+    for channel in view:
+        if channel.size < 3:
+            continue
+        prev = channel[:-2]
+        center = channel[1:-1]
+        next_ = channel[2:]
+        neighbor_peak = np.maximum(np.abs(prev), np.abs(next_))
+        is_spike = (
+            (np.abs(center - prev) >= spike_threshold)
+            & (np.abs(center - next_) >= spike_threshold)
+            & (np.abs(center) >= neighbor_peak * spike_ratio + 0.05)
+        )
+        if np.any(is_spike):
+            center[is_spike] = (prev[is_spike] + next_[is_spike]) * 0.5
+
+    peak = float(np.max(np.abs(processed))) if processed.size else 0.0
+    if peak > peak_limit > 0:
+        processed *= peak_limit / peak
+
+    return processed.astype(np.float32, copy=False)
+
+
 def trim_long_audio(
     audio: np.ndarray,
     sampling_rate: int,

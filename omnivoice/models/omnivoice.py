@@ -64,6 +64,7 @@ from omnivoice.utils.audio import (
     fade_and_pad_audio,
     load_audio,
     remove_silence,
+    suppress_spikes_and_limit,
     trim_long_audio,
 )
 from omnivoice.utils.duration import RuleDurationEstimator
@@ -782,6 +783,7 @@ class OmniVoice(PreTrainedModel):
             generated_audio,
             sample_rate=self.sampling_rate,
         )
+        generated_audio = suppress_spikes_and_limit(generated_audio)
         return generated_audio
 
     def _generate_chunked(
