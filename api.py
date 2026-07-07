@@ -124,7 +124,7 @@ OUTPUT_TEXT_QC_LANGS = {
     if code.strip()
 }
 OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "small")
-OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "4"))
+OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "3"))
 OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
 
 _API_MODEL = None
@@ -2679,11 +2679,7 @@ async def _ensure_whisper_model(model_name, device, compute_type):
 
 
 def _transcribe_whisper_sync(model, audio_path, options):
-    language = options.get("language")
-    if language == "tl":
-        language = "fil"
-    if language and "-" in str(language):
-        language = str(language).split("-", 1)[0]
+    language = _whisper_language_code(options.get("language"))
 
     kwargs = {
         "language": language or None,
@@ -2724,6 +2720,13 @@ def _normalize_language_code(value) -> str:
     return code
 
 
+def _whisper_language_code(value) -> str:
+    code = _normalize_language_code(value)
+    if code == "fil":
+        return "tl"
+    return code
+
+
 def _text_qc_tokens(text: str) -> list[str]:
     normalized = re.sub(r"[^\w\s]+", " ", str(text or "").lower(), flags=re.UNICODE)
     return [token for token in normalized.split() if token]
@@ -2758,6 +2761,7 @@ def _should_run_output_text_qc(data: Dict[str, Any], language, text: str) -> boo
 
 async def _build_output_text_qc(audio_path: str, expected_text: str, language, data: Dict[str, Any]) -> Dict[str, Any]:
     code = _normalize_language_code(language)
+    whisper_code = _whisper_language_code(language)
     model_name = str(data.get("output_text_qc_model") or OUTPUT_TEXT_QC_MODEL).strip()
     device = _whisper_device(data.get("output_text_qc_device") or "auto")
     compute_type = str(
@@ -2770,7 +2774,7 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
         model,
         audio_path,
         {
-            "language": code or None,
+            "language": whisper_code or None,
             "beam_size": data.get("output_text_qc_beam_size") or 3,
             "vad_filter": data.get("output_text_qc_vad_filter", True),
             "word_timestamps": False,
@@ -2795,6 +2799,7 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
         "version": 1,
         "status": status,
         "language": code,
+        "whisper_requested_language": whisper_code,
         "model": model_name,
         "coverage": _round_float(coverage, 3),
         "min_coverage": OUTPUT_TEXT_QC_MIN_COVERAGE,
@@ -3299,7 +3304,19 @@ async def synthesize(request):
             estimated_natural_duration * 1.6,
             estimated_natural_duration + 1.0,
         )
-        if min_match_duration <= ref_duration <= max_match_duration:
+        ref_quality_issues = set((ref_quality or {}).get("issues") or [])
+        weak_ref_too_short_for_text = (
+            "low_snr" in ref_quality_issues
+            and estimated_natural_duration > ref_duration + max(0.12, estimated_natural_duration * 0.05)
+        )
+        if weak_ref_too_short_for_text:
+            effective_duration = estimated_natural_duration
+            logger.info(
+                f"[{req_id}] Skipping ref_duration={ref_duration}s "
+                f"(low_snr ref and text needs est_natural={estimated_natural_duration:.1f}s), "
+                f"using estimated natural duration={effective_duration:.3f}s"
+            )
+        elif min_match_duration <= ref_duration <= max_match_duration:
             effective_duration = ref_duration
             logger.info(
                 f"[{req_id}] Using ref_duration={ref_duration}s as target "
