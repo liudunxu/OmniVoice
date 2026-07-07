@@ -118,6 +118,14 @@ WHISPER_MAX_MODELS = int(os.environ.get("WHISPER_MAX_MODELS", "2"))
 MIN_REFERENCE_DURATION_FOR_DURATION_RATIO = float(
     os.environ.get("OMNIVOICE_MIN_REFERENCE_DURATION_FOR_DURATION_RATIO", "1.5")
 )
+OUTPUT_TEXT_QC_LANGS = {
+    code.strip().lower()
+    for code in os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_LANGS", "fil,tl").split(",")
+    if code.strip()
+}
+OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "small")
+OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "4"))
+OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
 
 _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
@@ -1298,16 +1306,47 @@ def _write_base64_audio(b64_data, out_path):
     return out_path
 
 
+def _reference_quality_score(quality: Optional[Dict[str, Any]]) -> float:
+    if not quality or not quality.get("has_ref"):
+        return -1000.0
+    duration = quality.get("duration") or 0.0
+    active_ratio = quality.get("active_ratio") or 0.0
+    peak = quality.get("peak") or 0.0
+    rms = quality.get("rms") or 0.0
+
+    # Prefer ~4s active references with healthy level. Poor references are
+    # still ranked against each other so a noisy primary can be replaced by a
+    # materially better alternate instead of being kept only because every
+    # candidate has some issue.
+    duration_score = -abs(duration - 4.0)
+    active_score = (active_ratio - 0.5) * 4.0
+    level_score = min(1.0, peak * 2.0) + min(1.0, rms * 20.0)
+    snr = quality.get("snr_db")
+    snr_score = 0.0 if snr is None else max(-5.0, min(5.0, (snr - 15.0) / 5.0))
+    issue_penalties = {
+        "mostly_silence": 8.0,
+        "low_activity": 4.0,
+        "too_quiet": 4.0,
+        "clipping": 3.0,
+        "low_rms": 2.5,
+        "short_reference": 1.5,
+        "low_snr": 1.0,
+    }
+    penalty = sum(issue_penalties.get(issue, 1.0) for issue in quality.get("issues") or [])
+    return duration_score + active_score + level_score + snr_score - penalty
+
+
 def _select_best_reference(primary_bytes, primary_quality, alternate_refs, alternate_texts):
-    """Score the primary reference and alternates; return (best_bytes, best_quality, best_text).
+    """Score references; return best bytes/quality/text plus best and primary scores.
 
     Falls back to the primary reference when alternates are worse or un-decodable.
     """
     best_bytes = primary_bytes
     best_quality = primary_quality
     best_text = ""
+    primary_score = _reference_quality_score(primary_quality)
     if not alternate_refs:
-        return best_bytes, best_quality, best_text
+        return best_bytes, best_quality, best_text, primary_score, primary_score
     candidates = [(primary_bytes, primary_quality, "")]
     for ref_b64, text in zip_longest(alternate_refs, alternate_texts, fillvalue=""):
         try:
@@ -1317,24 +1356,9 @@ def _select_best_reference(primary_bytes, primary_quality, alternate_refs, alter
         except Exception:
             continue
 
-    def _score(item):
-        _bytes, quality, _text = item
-        if not quality or not quality.get("has_ref"):
-            return -1000.0
-        if quality.get("is_poor"):
-            return -100.0
-        duration = quality.get("duration") or 0.0
-        active_ratio = quality.get("active_ratio") or 0.0
-        # Prefer ~4s active references; penalise very short or very long.
-        duration_score = -abs(duration - 4.0)
-        active_score = (active_ratio - 0.5) * 4.0
-        snr = quality.get("snr_db")
-        snr_score = 0.0 if snr is None else max(-5.0, min(5.0, (snr - 15.0) / 5.0))
-        return duration_score + active_score + snr_score
-
-    candidates.sort(key=_score, reverse=True)
+    candidates.sort(key=lambda item: _reference_quality_score(item[1]), reverse=True)
     best = candidates[0]
-    return best[0], best[1], best[2]
+    return best[0], best[1], best[2], _reference_quality_score(best[1]), primary_score
 
 
 # ---------------------------------------------------------------------------
@@ -2337,6 +2361,92 @@ def _detect_plosive_spikes(
     return issues, spike_locations
 
 
+def _detect_periodic_pulse_artifact(
+    waveform,
+    sampling_rate: int,
+    frame_seconds: float = 0.04,
+    hop_seconds: float = 0.01,
+) -> tuple[list[str], list[dict]]:
+    """Detect rhythmic mechanical/chugging artifacts in generated speech.
+
+    The failure mode sounds like a steady train-like pulse: the waveform is not
+    clipped and may have normal duration, but its short-time energy envelope is
+    dominated by a strong low-frequency rhythm. Normal speech also has syllabic
+    rhythm, so thresholds are intentionally conservative and this detector only
+    acts as a retry signal.
+    """
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if arr.size == 0 or sampling_rate <= 0:
+        return [], []
+    duration = arr.size / float(sampling_rate)
+    if duration < 1.2:
+        return [], []
+
+    peak = float(np.max(np.abs(arr)))
+    rms = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
+    if peak < 0.08 or rms < 0.008:
+        return [], []
+
+    frame_size = max(1, int(frame_seconds * sampling_rate))
+    hop_size = max(1, int(hop_seconds * sampling_rate))
+    if arr.size < frame_size * 8:
+        return [], []
+
+    envelope = []
+    for start in range(0, arr.size - frame_size + 1, hop_size):
+        block = arr[start : start + frame_size]
+        envelope.append(float(np.sqrt(np.mean(np.square(block)))))
+    env = np.asarray(envelope, dtype=np.float32)
+    if env.size < 40:
+        return [], []
+
+    env_mean = float(np.mean(env))
+    if env_mean <= 1e-6:
+        return [], []
+    modulation = float(np.std(env) / env_mean)
+    if modulation < 0.55:
+        return [], []
+
+    centered = env - env_mean
+    energy = float(np.dot(centered, centered))
+    if energy <= 1e-9:
+        return [], []
+
+    autocorr = np.correlate(centered, centered, mode="full")[env.size - 1 :] / energy
+    min_lag = max(1, int(0.06 / hop_seconds))  # ~16.7 Hz upper bound
+    max_lag = min(len(autocorr) - 1, int(0.25 / hop_seconds))  # ~4 Hz lower bound
+    if max_lag <= min_lag:
+        return [], []
+    band = autocorr[min_lag : max_lag + 1]
+    best_offset = int(np.argmax(band))
+    periodicity = float(band[best_offset])
+    lag = min_lag + best_offset
+    pulse_rate_hz = 1.0 / max(lag * hop_seconds, 1e-6)
+
+    spectrum = np.abs(np.fft.rfft(centered))
+    freqs = np.fft.rfftfreq(centered.size, d=hop_seconds)
+    valid = freqs > 0.5
+    pulse_band = (freqs >= 4.0) & (freqs <= 16.7)
+    total_spec = float(np.sum(spectrum[valid])) if np.any(valid) else 0.0
+    pulse_spec = float(np.max(spectrum[pulse_band])) if np.any(pulse_band) else 0.0
+    pulse_ratio = pulse_spec / max(total_spec, 1e-9)
+
+    if periodicity < 0.68 or pulse_ratio < 0.32:
+        return [], []
+
+    return [
+        "periodic_pulse",
+    ], [
+        {
+            "type": "periodic_pulse",
+            "rate_hz": _round_float(pulse_rate_hz, 2),
+            "score": _round_float(periodicity, 3),
+            "modulation": _round_float(modulation, 3),
+            "spectral_ratio": _round_float(pulse_ratio, 3),
+        }
+    ]
+
+
 def _check_audio_quality(
     waveform,
     sampling_rate: int,
@@ -2379,6 +2489,9 @@ def _check_audio_quality(
 
     plosive_issues, spike_locations = _detect_plosive_spikes(arr, sampling_rate)
     issues.extend(plosive_issues)
+    pulse_issues, pulse_locations = _detect_periodic_pulse_artifact(arr, sampling_rate)
+    issues.extend(pulse_issues)
+    spike_locations.extend(pulse_locations)
     return issues, spike_locations
 
 
@@ -2394,13 +2507,16 @@ def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dic
         float(fallback.get("cfg_value", 2.0)) + 0.2, 3.0
     )
 
-    if "too_much_silence" in issues or "empty" in issues:
+    if "too_much_silence" in issues or "empty" in issues or "periodic_pulse" in issues:
         # Tighter position sampling to reduce random unmasking of silences.
         fallback["position_temperature"] = max(
             float(fallback.get("position_temperature", 5.0)) * 0.6, 1.0
         )
 
-    if "clipping" in issues or "plosive" in issues or "impulsive_spike" in issues:
+    if "periodic_pulse" in issues:
+        fallback["t_shift"] = max(float(fallback.get("t_shift", 0.1)) * 0.6, 0.03)
+
+    if "clipping" in issues or "plosive" in issues or "impulsive_spike" in issues or "periodic_pulse" in issues:
         # Disable post-processing in case aggressive trimming/leveling/spike limiting
         # caused the artifact; let the raw diffusion output through.
         fallback["postprocess_output"] = False
@@ -2596,6 +2712,97 @@ def _transcribe_whisper_sync(model, audio_path, options):
         "language_probability": info.language_probability,
         "duration": info.duration,
         "segments": segments,
+    }
+
+
+def _normalize_language_code(value) -> str:
+    code = str(value or "").strip().lower()
+    if code == "tl":
+        return "fil"
+    if "-" in code:
+        code = code.split("-", 1)[0]
+    return code
+
+
+def _text_qc_tokens(text: str) -> list[str]:
+    normalized = re.sub(r"[^\w\s]+", " ", str(text or "").lower(), flags=re.UNICODE)
+    return [token for token in normalized.split() if token]
+
+
+def _lcs_coverage(expected_tokens: list[str], actual_tokens: list[str]) -> float:
+    if not expected_tokens:
+        return 1.0
+    if not actual_tokens:
+        return 0.0
+    previous = [0] * (len(actual_tokens) + 1)
+    for expected in expected_tokens:
+        current = [0]
+        for j, actual in enumerate(actual_tokens, start=1):
+            if expected == actual:
+                current.append(previous[j - 1] + 1)
+            else:
+                current.append(max(previous[j], current[-1]))
+        previous = current
+    return previous[-1] / max(1, len(expected_tokens))
+
+
+def _should_run_output_text_qc(data: Dict[str, Any], language, text: str) -> bool:
+    override = data.get("output_text_qc")
+    if override is not None:
+        return _bool_option(override, False)
+    code = _normalize_language_code(language)
+    if code not in OUTPUT_TEXT_QC_LANGS:
+        return False
+    return len(_text_qc_tokens(text)) >= OUTPUT_TEXT_QC_MIN_TOKENS
+
+
+async def _build_output_text_qc(audio_path: str, expected_text: str, language, data: Dict[str, Any]) -> Dict[str, Any]:
+    code = _normalize_language_code(language)
+    model_name = str(data.get("output_text_qc_model") or OUTPUT_TEXT_QC_MODEL).strip()
+    device = _whisper_device(data.get("output_text_qc_device") or "auto")
+    compute_type = str(
+        data.get("output_text_qc_compute_type")
+        or _default_whisper_compute_type(device)
+    ).strip()
+    model = await _ensure_whisper_model(model_name, device, compute_type)
+    result = await asyncio.to_thread(
+        _transcribe_whisper_sync,
+        model,
+        audio_path,
+        {
+            "language": code or None,
+            "beam_size": data.get("output_text_qc_beam_size") or 3,
+            "vad_filter": data.get("output_text_qc_vad_filter", True),
+            "word_timestamps": False,
+            "condition_on_previous_text": False,
+            "vad_threshold": 0.35,
+            "vad_min_silence_ms": 250,
+            "vad_speech_pad_ms": 120,
+            "no_speech_threshold": 0.5,
+            "initial_prompt": expected_text[:200],
+        },
+    )
+    actual_text = " ".join(
+        str(segment.get("text") or "").strip()
+        for segment in result.get("segments") or []
+        if isinstance(segment, dict)
+    ).strip()
+    expected_tokens = _text_qc_tokens(expected_text)
+    actual_tokens = _text_qc_tokens(actual_text)
+    coverage = _lcs_coverage(expected_tokens, actual_tokens)
+    status = "pass" if coverage >= OUTPUT_TEXT_QC_MIN_COVERAGE else "incomplete"
+    return {
+        "version": 1,
+        "status": status,
+        "language": code,
+        "model": model_name,
+        "coverage": _round_float(coverage, 3),
+        "min_coverage": OUTPUT_TEXT_QC_MIN_COVERAGE,
+        "expected_token_count": len(expected_tokens),
+        "actual_token_count": len(actual_tokens),
+        "actual_text": actual_text[:500],
+        "whisper_language": result.get("language"),
+        "whisper_language_probability": result.get("language_probability"),
     }
 
 
@@ -2996,22 +3203,37 @@ async def synthesize(request):
 
     # If alternate references are provided, score them and use the best one.
     if alternate_refs:
-        best_alt, best_quality, best_text = _select_best_reference(
-            ref_audio_bytes or prompt_audio_bytes,
+        current_ref_bytes = ref_audio_bytes or prompt_audio_bytes
+        best_alt, best_quality, best_text, best_score, primary_score = _select_best_reference(
+            current_ref_bytes,
             ref_quality,
             alternate_refs,
             alternate_texts,
         )
-        if best_alt is not None and (best_quality is None or not best_quality.get("is_poor", True)):
-            if best_alt is not (ref_audio_bytes or prompt_audio_bytes):
+        if best_alt is not None and best_alt is not current_ref_bytes:
+            best_issues = set((best_quality or {}).get("issues") or [])
+            fatal_alt_issues = {"mostly_silence", "low_activity", "too_quiet", "clipping"}
+            clean_alt = best_quality is None or not best_quality.get("is_poor", True)
+            materially_better_alt = (
+                best_score >= primary_score + 0.75
+                and not (best_issues & fatal_alt_issues)
+            )
+            if clean_alt or materially_better_alt:
                 logger.info(
                     f"[{req_id}] Selected alternate reference: "
-                    f"duration={best_quality.get('duration')}, issues={best_quality.get('issues')}"
+                    f"duration={best_quality.get('duration')}, issues={best_quality.get('issues')}, "
+                    f"score={best_score:.2f}, primary_score={primary_score:.2f}"
                 )
                 ref_audio_bytes = best_alt
                 ref_duration = _bytes_audio_duration(best_alt)
                 effective_prompt_text = best_text or effective_prompt_text
                 ref_quality = best_quality or ref_quality
+            else:
+                logger.info(
+                    f"[{req_id}] Keeping primary reference: "
+                    f"best_alt_issues={(best_quality or {}).get('issues')}, "
+                    f"best_score={best_score:.2f}, primary_score={primary_score:.2f}"
+                )
 
     # Get adaptive parameters based on reference audio duration and quality
     adaptive_params = _get_adaptive_params(
@@ -3408,10 +3630,37 @@ async def synthesize(request):
         logger.warning(f"[{req_id}] Failed to persist output file (continuing): {exc}")
         output_path_for_response = ""
 
+    text_completeness_qc = None
+    if output_path_for_response and _should_run_output_text_qc(data, language, text):
+        try:
+            text_completeness_qc = await _build_output_text_qc(
+                output_path_for_response,
+                text,
+                language,
+                data,
+            )
+            if text_completeness_qc.get("status") == "incomplete":
+                quality_issues = list(quality_issues)
+                if "text_incomplete" not in quality_issues:
+                    quality_issues.append("text_incomplete")
+                logger.warning(
+                    f"[{req_id}] Output text completeness issue: "
+                    f"coverage={text_completeness_qc.get('coverage')}, "
+                    f"expected_tokens={text_completeness_qc.get('expected_token_count')}, "
+                    f"actual_tokens={text_completeness_qc.get('actual_token_count')}"
+                )
+        except Exception as exc:
+            logger.warning(f"[{req_id}] Output text completeness QC failed: {exc}")
+            text_completeness_qc = {
+                "version": 1,
+                "status": "error",
+                "error": str(exc)[:500],
+            }
+
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / model.sampling_rate, 3)
     audio_qc = None
-    severe_issue_labels = {"empty", "clipping", "impulsive_spike", "plosive", "duration_off_target", "duration_off_reference"}
+    severe_issue_labels = {"empty", "clipping", "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete", "duration_off_target", "duration_off_reference"}
     severe_issues = sorted({i for i in (quality_issues or []) if i in severe_issue_labels})
     if _bool_option(data.get("include_audio_qc"), True):
         try:
@@ -3421,6 +3670,8 @@ async def synthesize(request):
                 quality_issues=quality_issues,
                 spike_locations=spike_locations,
             )
+            if text_completeness_qc is not None:
+                audio_qc["text_completeness"] = text_completeness_qc
             audio_qc["severe_issues"] = severe_issues
         except Exception as exc:
             logger.warning(f"[{req_id}] Failed to build synthesis audio_qc: {exc}")
