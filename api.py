@@ -463,7 +463,7 @@ def _waveform_speech_intervals(waveform, sampling_rate: int, frame_seconds=0.04)
     return _merge_time_intervals(intervals, gap=0.12)
 
 
-def _build_synth_audio_qc(waveform, sampling_rate: int, quality_issues=None):
+def _build_synth_audio_qc(waveform, sampling_rate: int, quality_issues=None, spike_locations=None):
     duration = _audio_duration(waveform, sampling_rate)
     speech_intervals = _waveform_speech_intervals(waveform, sampling_rate)
     speech_total = sum(max(0.0, end - start) for start, end in speech_intervals)
@@ -482,6 +482,7 @@ def _build_synth_audio_qc(waveform, sampling_rate: int, quality_issues=None):
         ],
         "loudness": loudness,
         "quality_issues": list(quality_issues or []),
+        "spike_locations": list(spike_locations or []),
     }
 
 
@@ -1198,7 +1199,7 @@ def _generate_with_duration_refinement(
     max_attempts,
     voice_clone_prompt=None,
     max_duration=None,
-    ratio_clamp=(0.5, 2.0),
+    ratio_clamp=None,
     **gen_kwargs,
 ):
     """Generate audio, optionally retrying until duration is within tolerance.
@@ -1212,7 +1213,17 @@ def _generate_with_duration_refinement(
         )
         return audio, 1, []
 
-    current_duration = float(target_duration)
+    target_duration = float(target_duration)
+    # Default tolerance: 5% of target or 50ms, whichever is larger, so that
+    # callers who only pass target_duration still get refinement.
+    if duration_tolerance is None or duration_tolerance <= 0:
+        duration_tolerance = max(0.05, target_duration * 0.05)
+
+    # Use a wider correction range when the first attempt is far off; tighten
+    # afterwards to avoid oscillation.
+    ratio_clamp = ratio_clamp or (0.33, 3.0)
+
+    current_duration = target_duration
     best_audio = None
     best_error = float("inf")
     attempt_log = []
@@ -1224,7 +1235,7 @@ def _generate_with_duration_refinement(
             model, text, voice_clone_prompt=voice_clone_prompt, **kwargs
         )
         actual_duration = audio.shape[-1] / model.sampling_rate
-        error = abs(actual_duration - current_duration)
+        error = abs(actual_duration - target_duration)
         attempt_log.append(
             {
                 "attempt": attempt + 1,
@@ -1234,7 +1245,7 @@ def _generate_with_duration_refinement(
             }
         )
 
-        if duration_tolerance is None or error <= duration_tolerance:
+        if error <= duration_tolerance:
             return audio, attempt + 1, attempt_log
 
         if error < best_error:
@@ -1245,9 +1256,14 @@ def _generate_with_duration_refinement(
             # Scale target duration by the observed ratio, clamped to avoid
             # divergence when the model output is wildly off (e.g. actual=0.1s
             # for a 10s target would otherwise try 100s next).
-            raw_ratio = current_duration / actual_duration
-            clamped_ratio = max(ratio_clamp[0], min(ratio_clamp[1], raw_ratio))
-            next_duration = current_duration * clamped_ratio
+            raw_ratio = target_duration / actual_duration
+            # Tighten clamp after first attempt.
+            if attempt == 0:
+                low, high = 0.25, 4.0
+            else:
+                low, high = ratio_clamp
+            clamped_ratio = max(low, min(high, raw_ratio))
+            next_duration = target_duration * clamped_ratio
             if max_duration is not None and next_duration > max_duration:
                 logger.warning(
                     "Duration refinement ratio %.3f would push target to %.3fs, "
@@ -1272,7 +1288,7 @@ def _generate_with_duration_refinement(
     logger.warning(
         "Duration refinement did not converge within tolerance %.3fs after %d attempts; "
         "returning closest result (error=%.3fs)",
-        duration_tolerance if duration_tolerance is not None else 0.0,
+        duration_tolerance,
         max_attempts,
         best_error,
     )
@@ -1696,11 +1712,8 @@ def _detect_plosive_spikes(
     sampling_rate: int,
     window_seconds: float = 0.005,
     hop_seconds: float = 0.0025,
-    spike_peak_threshold: float = 0.25,
-    spike_crest_threshold: float = 12.0,
-    extreme_crest_threshold: float = 20.0,
-    min_spike_ratio: float = 0.005,
-) -> list[str]:
+    min_spike_ratio: float = 0.003,
+) -> tuple[list[str], list[dict]]:
     """Detect isolated impulse spikes / plosive artifacts in generated audio.
 
     OmniVoice sometimes emits short, sharp pops (especially on short words or
@@ -1708,15 +1721,34 @@ def _detect_plosive_spikes(
     bad. We flag these by looking for very short windows where the local peak is
     much larger than the local RMS (high crest factor) and the absolute peak is
     significant.
+
+    Thresholds are adaptive to the global signal level so that quiet but clean
+    plosives are not mis-flagged.
+
+    Returns:
+        (issue_labels, spike_locations) where spike_locations is a list of
+        dicts with 'time_sec' and 'crest' for any extreme spike found.
     """
     arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
     if arr.size == 0 or sampling_rate <= 0:
-        return []
+        return [], []
+
+    global_peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+    global_rms = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
+
+    # Adaptive thresholds: require a spike to be both relatively loud compared
+    # to the global signal and locally imbalanced.
+    spike_peak_threshold = max(0.18, global_rms * 3.0, global_peak * 0.35)
+    spike_crest_threshold = max(10.0, 12.0)
+    extreme_crest_threshold = max(16.0, 20.0)
+
     window_size = max(1, int(window_seconds * sampling_rate))
     hop_size = max(1, int(hop_seconds * sampling_rate))
     total_windows = 0
     spike_windows = 0
     extreme_windows = 0
+    spike_locations = []
+
     for start in range(0, arr.size, hop_size):
         block = arr[start : start + window_size]
         if block.size == 0:
@@ -1729,6 +1761,13 @@ def _detect_plosive_spikes(
         crest = local_peak / max(local_rms, 1e-6)
         if crest > extreme_crest_threshold:
             extreme_windows += 1
+            spike_locations.append(
+                {
+                    "time_sec": _round_float(start / sampling_rate),
+                    "crest": _round_float(crest),
+                    "peak": _round_float(local_peak),
+                }
+            )
         elif crest > spike_crest_threshold:
             spike_windows += 1
 
@@ -1740,12 +1779,10 @@ def _detect_plosive_spikes(
             issues.append("plosive")
 
     # Also flag globally imbalanced crest factor when the overall level is high enough.
-    global_peak = float(np.max(np.abs(arr))) if arr.size else 0.0
-    global_rms = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
     if global_peak > 0.3 and global_rms > 1e-6 and (global_peak / global_rms) > 15.0 and "plosive" not in issues:
         issues.append("plosive")
 
-    return issues
+    return issues, spike_locations
 
 
 def _check_audio_quality(
@@ -1754,10 +1791,11 @@ def _check_audio_quality(
     target_duration: Optional[float] = None,
     duration_tolerance: Optional[float] = None,
     ref_duration: Optional[float] = None,
-) -> list[str]:
+) -> tuple[list[str], list[dict]]:
     """Check generated audio for common badcase patterns.
 
-    Returns a list of issue labels; empty list means no detected issue.
+    Returns:
+        (issue_labels, spike_locations); empty lists mean no detected issue.
     """
     issues = []
     arr = np.asarray(waveform)
@@ -1787,8 +1825,9 @@ def _check_audio_quality(
         if ratio > 3.0 or ratio < 0.33:
             issues.append("duration_off_reference")
 
-    issues.extend(_detect_plosive_spikes(arr, sampling_rate))
-    return issues
+    plosive_issues, spike_locations = _detect_plosive_spikes(arr, sampling_rate)
+    issues.extend(plosive_issues)
+    return issues, spike_locations
 
 
 def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dict[str, Any]:
@@ -1858,7 +1897,7 @@ def _generate_with_quality_retry(
         max_duration=max_duration,
         **gen_kwargs,
     )
-    issues = _check_audio_quality(
+    issues, _spike_locs = _check_audio_quality(
         audio,
         model.sampling_rate,
         target_duration=target_duration,
@@ -1874,17 +1913,24 @@ def _generate_with_quality_retry(
         issues,
     )
     fallback_kwargs = _apply_fallback_params(gen_kwargs, issues)
-    # For retry, use the original target without refinement to keep latency bounded.
+    # Retry with duration refinement when the issue is duration-related or when
+    # a target_duration was supplied. For other quality issues we still allow one
+    # refinement attempt so the result doesn't drift.
+    retry_tolerance = duration_tolerance
+    retry_attempts = 2
+    if any(i in issues for i in ("duration_off_target", "duration_off_reference")):
+        retry_attempts = 3
     audio2, attempts2, log2 = _generate_with_duration_refinement(
         model,
         text,
         target_duration=target_duration,
-        duration_tolerance=None,
-        max_attempts=1,
+        duration_tolerance=retry_tolerance,
+        max_attempts=retry_attempts,
         voice_clone_prompt=voice_clone_prompt,
+        max_duration=max_duration,
         **fallback_kwargs,
     )
-    issues2 = _check_audio_quality(
+    issues2, _spike_locs2 = _check_audio_quality(
         audio2,
         model.sampling_rate,
         target_duration=target_duration,
@@ -2462,6 +2508,17 @@ async def synthesize(request):
                     "Generated audio is empty after quality retry. "
                     "Use a longer, non-silent reference audio or disable voice cloning."
                 )
+            # Re-run QC on the final waveform to capture spike locations after any
+            # model-side trimming (voice_consistency_trim / max_duration clamp).
+            _final_issues, spike_locations = _check_audio_quality(
+                audio_waveform,
+                model.sampling_rate,
+                target_duration=effective_duration,
+                duration_tolerance=duration_tolerance_sec,
+                ref_duration=ref_duration,
+            )
+            # Preserve any issues already flagged by quality retry.
+            quality_issues = sorted(set(quality_issues) | set(_final_issues))
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] Synthesis failed: {exc}\n{tb}")
@@ -2541,6 +2598,7 @@ async def synthesize(request):
                 audio_waveform,
                 model.sampling_rate,
                 quality_issues=quality_issues,
+                spike_locations=spike_locations,
             )
         except Exception as exc:
             logger.warning(f"[{req_id}] Failed to build synthesis audio_qc: {exc}")

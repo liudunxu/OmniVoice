@@ -658,12 +658,16 @@ class OmniVoice(PreTrainedModel):
                 ref_wav = trim_long_audio(
                     ref_wav, self.sampling_rate, trim_threshold=20.0
                 )
+            # When the user provides ref_text, only trim edges and compress (don't
+            # delete) internal pauses so the text-audio alignment is preserved.
+            # Auto-transcribed references can tolerate more aggressive cleanup.
             ref_wav = remove_silence(
                 ref_wav,
                 self.sampling_rate,
-                mid_sil=200,
+                mid_sil=200 if ref_text is None else 400,
                 lead_sil=100,
                 trail_sil=200,
+                mode="remove" if ref_text is None else "compress",
             )
             if ref_wav.shape[-1] == 0:
                 raise ValueError(
@@ -770,10 +774,17 @@ class OmniVoice(PreTrainedModel):
                 mid_sil=500,
                 lead_sil=100,
                 trail_sil=100,
+                mode="compress",
             )
 
-        if ref_rms is not None and ref_rms < 0.1:
-            generated_audio = generated_audio * ref_rms / 0.1
+        # Volume normalisation: use a floor so quiet references don't drag the
+        # output down to inaudible levels. We normalise to a target RMS of 0.1
+        # (roughly -20 dBFS) unless the reference was already louder, in which
+        # case we preserve its relative level.
+        if ref_rms is not None and ref_rms > 0:
+            target_rms = max(ref_rms, 0.1)
+            current_rms = max(float(np.sqrt(np.mean(generated_audio**2))), 1e-6)
+            generated_audio = generated_audio * (target_rms / current_rms)
         elif ref_rms is None:
             peak = np.abs(generated_audio).max()
             if peak > 1e-6:

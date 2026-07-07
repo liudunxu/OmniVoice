@@ -147,14 +147,71 @@ def audiosegment_to_numpy(aseg: AudioSegment) -> np.ndarray:
     return data.reshape(-1, aseg.channels).T
 
 
+def compress_silence(
+    audio: np.ndarray,
+    sampling_rate: int,
+    min_silence_len: int = 300,
+    silence_thresh: float = -50,
+    target_silence_len: int = 200,
+    seek_step: int = 10,
+) -> np.ndarray:
+    """Compress middle silences longer than *min_silence_len* ms down to *target_silence_len* ms.
+
+    Unlike remove_silence(), this preserves natural phrasing and breath pauses,
+    only shortening excessively long gaps that would otherwise make the output
+    sound disjointed or too short.
+
+    Parameters:
+        audio: numpy array with shape (C, T).
+        sampling_rate: sampling rate of the audio.
+        min_silence_len: gaps longer than this (ms) are compressed.
+        silence_thresh: dBFS threshold for silence.
+        target_silence_len: duration (ms) to compress each long gap to.
+        seek_step: pydub detection step in ms.
+
+    Returns:
+        Numpy array with shape (C, T').
+    """
+    wave = numpy_to_audiosegment(audio, sampling_rate)
+    nonsilent = detect_nonsilent(
+        wave, min_silence_len=min_silence_len, silence_thresh=silence_thresh, seek_step=seek_step
+    )
+    if not nonsilent:
+        return audio
+
+    target_ms = max(0, int(target_silence_len))
+    parts = []
+    prev_end = 0
+    for start, end in nonsilent:
+        gap = start - prev_end
+        if gap > target_ms:
+            parts.append(wave[prev_end : prev_end + target_ms // 2])
+            parts.append(AudioSegment.silent(duration=target_ms))
+            parts.append(wave[start - target_ms // 2 : start])
+        else:
+            if prev_end < start:
+                parts.append(wave[prev_end:start])
+        parts.append(wave[start:end])
+        prev_end = end
+
+    if prev_end < len(wave):
+        parts.append(wave[prev_end:])
+
+    out = AudioSegment.silent(duration=0)
+    for p in parts:
+        out += p
+    return audiosegment_to_numpy(out)
+
+
 def remove_silence(
     audio: np.ndarray,
     sampling_rate: int,
     mid_sil: int = 300,
     lead_sil: int = 100,
     trail_sil: int = 300,
+    mode: str = "compress",
 ) -> np.ndarray:
-    """Remove middle silences longer than *mid_sil* ms and trim edge silences.
+    """Remove or compress middle silences and trim edge silences.
 
     Parameters:
         audio: numpy array with shape (C, T).
@@ -162,6 +219,7 @@ def remove_silence(
         mid_sil: middle-silence threshold in ms (0 to skip).
         lead_sil: kept leading silence in ms.
         trail_sil: kept trailing silence in ms.
+        mode: "compress" keeps pauses but caps them; "remove" deletes them.
 
     Returns:
         Numpy array with shape (C, T').
@@ -169,6 +227,13 @@ def remove_silence(
     wave = numpy_to_audiosegment(audio, sampling_rate)
 
     if mid_sil > 0:
+        if mode == "compress":
+            return compress_silence(
+                audio,
+                sampling_rate,
+                min_silence_len=mid_sil,
+                target_silence_len=min(200, mid_sil),
+            )
         non_silent_segs = split_on_silence(
             wave,
             min_silence_len=mid_sil,
