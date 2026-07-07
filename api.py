@@ -2710,6 +2710,110 @@ async def audio_qc_speech_intervals(request):
     return _json_response({"ok": True, **result})
 
 
+@routes.post("/api/audio_qc/stem_levels")
+async def audio_qc_stem_levels(request):
+    """Measure active-gated loudness of separated vocal and background stems.
+
+    The dubbing host uses these levels to align dubbed voice and background to
+    the original mix instead of relying on fixed volume factors.
+    """
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return _error(f"Invalid JSON body: {exc}", status=400)
+
+    def _stem_levels(b64_data):
+        if not b64_data:
+            return None
+        try:
+            audio_bytes = _decode_base64_audio_to_bytes(b64_data)
+        except Exception:
+            return None
+        return _build_loudness_profile_from_bytes(audio_bytes)
+
+    vocal_levels = _stem_levels(data.get("vocal_base64") or data.get("vocal_audio_base64"))
+    background_levels = _stem_levels(data.get("background_base64") or data.get("background_audio_base64"))
+    if vocal_levels is None and background_levels is None:
+        return _error("At least one of vocal_base64 / background_base64 is required", status=400)
+    voice_target_db = -19.0
+    voice_gain = _recommend_gain(vocal_levels, voice_target_db)
+    background_gain, gap_basis = _recommend_background_gain_preserve_gap(
+        vocal_levels, background_levels, voice_target_db
+    )
+    return _json_response({
+        "ok": True,
+        "vocal_levels": vocal_levels,
+        "background_levels": background_levels,
+        "target_integrated_loudness_db": voice_target_db,
+        "recommended_voice_gain": voice_gain,
+        "recommended_background_gain": background_gain,
+        "mix_basis": gap_basis,
+    })
+
+
+def _active_loudness_db(levels):
+    if not isinstance(levels, dict):
+        return None
+    return levels.get("active_p70_volume_db") or levels.get("active_mean_volume_db") or levels.get("mean_volume_db")
+
+
+def _recommend_background_gain_preserve_gap(vocal_levels, background_levels, voice_target_db):
+    """Suggest a background gain that preserves the original voice-background gap."""
+    fallback_background_under_voice_db = 10.0
+    minimum_background_under_voice_db = 6.0
+    maximum_background_under_voice_db = 14.0
+    minimum_background_loudness_db = -32.0
+    voice_db = _active_loudness_db(vocal_levels)
+    background_db = _active_loudness_db(background_levels)
+    basis = {
+        "voice_target_db": voice_target_db,
+        "voice_active_db": voice_db,
+        "background_active_db": background_db,
+    }
+    if background_db is None:
+        basis["fallback_reason"] = "missing_background_levels"
+        return _recommend_gain(background_levels, voice_target_db - fallback_background_under_voice_db), basis
+    source_gap_db = None
+    if voice_db is not None:
+        try:
+            source_gap_db = float(voice_db) - float(background_db)
+        except (TypeError, ValueError):
+            pass
+    if source_gap_db is None:
+        desired_gap_db = fallback_background_under_voice_db
+    else:
+        desired_gap_db = max(
+            minimum_background_under_voice_db,
+            min(maximum_background_under_voice_db, source_gap_db),
+        )
+    target_background_db = max(minimum_background_loudness_db, voice_target_db - desired_gap_db)
+    basis["source_voice_background_gap_db"] = source_gap_db
+    basis["desired_background_under_voice_db"] = desired_gap_db
+    basis["target_background_db"] = target_background_db
+    return _recommend_gain(background_levels, target_background_db), basis
+
+
+def _recommend_gain(levels, target_db):
+    """Suggest a linear gain so the stem lands near target_db integrated loudness."""
+    if not isinstance(levels, dict):
+        return None
+    mean_db = levels.get("mean_volume_db")
+    active_db = levels.get("active_p70_volume_db") or levels.get("active_mean_volume_db") or levels.get("mean_volume_db")
+    if active_db is None:
+        return None
+    try:
+        active_db = float(active_db)
+    except (TypeError, ValueError):
+        return None
+    # Use active loudness as the perceptual anchor; 1 LU ≈ 1 dB.
+    db_change = target_db - active_db
+    # Clamp to a safe range to avoid extreme boosts/cuts.
+    return round(max(0.2, min(5.0, 10 ** (db_change / 20.0))), 4)
+
+
 @routes.post("/api/voxcpm/synthesize")
 @routes.post("/api/synthesize")
 async def synthesize(request):
