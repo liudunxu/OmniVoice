@@ -28,6 +28,7 @@ import traceback
 import uuid
 import wave
 from collections import OrderedDict
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -1293,7 +1294,7 @@ def _select_best_reference(primary_bytes, primary_quality, alternate_refs, alter
     if not alternate_refs:
         return best_bytes, best_quality, best_text
     candidates = [(primary_bytes, primary_quality, "")]
-    for ref_b64, text in zip(alternate_refs, alternate_texts):
+    for ref_b64, text in zip_longest(alternate_refs, alternate_texts, fillvalue=""):
         try:
             raw = _decode_base64_audio_bytes(ref_b64)
             quality = _assess_reference_quality(raw)
