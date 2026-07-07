@@ -1282,6 +1282,50 @@ def _write_base64_audio(b64_data, out_path):
     return out_path
 
 
+def _select_best_reference(primary_bytes, primary_quality, alternate_refs, alternate_texts):
+    """Score the primary reference and alternates; return (best_bytes, best_quality, best_text).
+
+    Falls back to the primary reference when alternates are worse or un-decodable.
+    """
+    best_bytes = primary_bytes
+    best_quality = primary_quality
+    best_text = ""
+    if not alternate_refs:
+        return best_bytes, best_quality, best_text
+    candidates = [(primary_bytes, primary_quality, "")]
+    for ref_b64, text in zip(alternate_refs, alternate_texts):
+        try:
+            raw = _decode_base64_audio_bytes(ref_b64)
+            quality = _assess_reference_quality(raw)
+            candidates.append((raw, quality, text or ""))
+        except Exception:
+            continue
+
+    def _score(item):
+        _bytes, quality, _text = item
+        if not quality or not quality.get("has_ref"):
+            return -1000.0
+        if quality.get("is_poor"):
+            return -100.0
+        duration = quality.get("duration") or 0.0
+        active_ratio = quality.get("active_ratio") or 0.0
+        # Prefer ~4s active references; penalise very short or very long.
+        duration_score = -abs(duration - 4.0)
+        active_score = (active_ratio - 0.5) * 4.0
+        snr = quality.get("snr_db")
+        snr_score = 0.0 if snr is None else max(-5.0, min(5.0, (snr - 15.0) / 5.0))
+        return duration_score + active_score + snr_score
+
+    candidates.sort(key=_score, reverse=True)
+    best = candidates[0]
+    return best[0], best[1], best[2]
+
+
+# ---------------------------------------------------------------------------
+# Voice clone prompt cache
+# ---------------------------------------------------------------------------
+
+
 def _make_voice_prompt_cache_key(audio_bytes: bytes, prompt_text: str, preprocess_prompt: bool) -> str:
     """Hash reference audio bytes + prompt metadata for prompt caching."""
     payload = {
@@ -2843,6 +2887,14 @@ async def synthesize(request):
         prompt_text if (reference_audio_base64 or prompt_wav_base64) else ""
     )
 
+    # Optional same-speaker alternate references: server can select strongest.
+    alternate_refs = data.get("alternate_reference_audio_base64") or []
+    alternate_texts = data.get("alternate_prompt_texts") or []
+    if isinstance(alternate_refs, str):
+        alternate_refs = [alternate_refs]
+    if isinstance(alternate_texts, str):
+        alternate_texts = [alternate_texts]
+
     # Get user-specified values (None means use adaptive defaults)
     user_cfg = data.get("cfg_value")
     user_steps = data.get("inference_timesteps")
@@ -2867,6 +2919,12 @@ async def synthesize(request):
         if duration_tolerance_ms is not None
         else None
     )
+
+    # Tighten tolerance for short cues so that sub-second utterances do not drift
+    # by a large fraction of their window.
+    if duration_tolerance_sec is not None and duration_tolerance_sec > 0:
+        if target_duration_sec is not None and target_duration_sec > 0 and target_duration_sec < 2.0:
+            duration_tolerance_sec = min(duration_tolerance_sec, max(0.03, target_duration_sec * 0.05))
 
     # Prepare output directory
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
@@ -2917,6 +2975,25 @@ async def synthesize(request):
             f"duration={ref_quality.get('duration')}, active_ratio={ref_quality.get('active_ratio')}, "
             f"peak={ref_quality.get('peak')}, snr={ref_quality.get('snr_db')}"
         )
+
+    # If alternate references are provided, score them and use the best one.
+    if alternate_refs:
+        best_alt, best_quality, best_text = _select_best_reference(
+            ref_audio_bytes or prompt_audio_bytes,
+            ref_quality,
+            alternate_refs,
+            alternate_texts,
+        )
+        if best_alt is not None and (best_quality is None or not best_quality.get("is_poor", True)):
+            if best_alt is not (ref_audio_bytes or prompt_audio_bytes):
+                logger.info(
+                    f"[{req_id}] Selected alternate reference: "
+                    f"duration={best_quality.get('duration')}, issues={best_quality.get('issues')}"
+                )
+                ref_audio_bytes = best_alt
+                ref_duration = _bytes_audio_duration(best_alt)
+                effective_prompt_text = best_text or effective_prompt_text
+                ref_quality = best_quality or ref_quality
 
     # Get adaptive parameters based on reference audio duration and quality
     adaptive_params = _get_adaptive_params(
@@ -3019,6 +3096,7 @@ async def synthesize(request):
 
     logger.info(
         f"[{req_id}] params: text_len={len(text)}, has_ref={bool(reference_audio_base64)}, "
+        f"alt_refs={len(alternate_refs)}, "
         f"ref_duration={ref_duration}s, has_prompt_wav={bool(prompt_wav_base64)}, "
         f"prompt_len={len(effective_prompt_text)}, requested_model={data.get('model_id') or ''}, "
         f"loaded_model={_API_MODEL_ID}, device={_API_DEVICE}, cfg={cfg_value}, "
@@ -3300,6 +3378,8 @@ async def synthesize(request):
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / model.sampling_rate, 3)
     audio_qc = None
+    severe_issue_labels = {"empty", "clipping", "impulsive_spike", "plosive", "duration_off_target", "duration_off_reference"}
+    severe_issues = sorted({i for i in (quality_issues or []) if i in severe_issue_labels})
     if _bool_option(data.get("include_audio_qc"), True):
         try:
             audio_qc = _build_synth_audio_qc(
@@ -3308,13 +3388,19 @@ async def synthesize(request):
                 quality_issues=quality_issues,
                 spike_locations=spike_locations,
             )
+            audio_qc["severe_issues"] = severe_issues
         except Exception as exc:
             logger.warning(f"[{req_id}] Failed to build synthesis audio_qc: {exc}")
-            audio_qc = {"version": 1, "status": "error", "error": str(exc)[:500]}
+            audio_qc = {
+                "version": 1,
+                "status": "error",
+                "error": str(exc)[:500],
+                "severe_issues": severe_issues,
+            }
     logger.info(
         f"[{req_id}] synthesis finished in {elapsed}s, output_size={len(wav_bytes)} bytes, "
         f"audio_duration={audio_duration}s, duration_attempts={attempts_made}, "
-        f"quality_issues={quality_issues}, quality_retried={quality_retried}"
+        f"quality_issues={quality_issues}, quality_retried={quality_retried}, severe_issues={severe_issues}"
     )
 
     output_base64 = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
@@ -3337,6 +3423,7 @@ async def synthesize(request):
         "duration_refinement_log": attempt_log,
         "quality_issues": quality_issues,
         "quality_retried": quality_retried,
+        "severe_issues": severe_issues,
         "audio_qc": audio_qc or {},
         "voice_consistency_trim": voice_consistency_info,
         "duration_match": {
