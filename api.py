@@ -871,6 +871,30 @@ def _estimate_natural_duration(
     )
 
 
+def _clamp_waveform_to_max_duration(
+    waveform,
+    sampling_rate: int,
+    max_duration_sec: Optional[float],
+    fade_out_ms: float = 20.0,
+):
+    """Hard-trim generated audio to max_duration_sec with a short fade-out.
+
+    Returns (trimmed_waveform, was_trimmed).
+    """
+    if max_duration_sec is None or max_duration_sec <= 0:
+        return waveform, False
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    max_samples = int(max_duration_sec * sampling_rate)
+    if arr.size <= max_samples:
+        return waveform, False
+    trimmed = arr[:max_samples].copy()
+    fade_samples = min(int(fade_out_ms / 1000.0 * sampling_rate), trimmed.size // 4)
+    if fade_samples > 1:
+        fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+        trimmed[-fade_samples:] *= fade_out
+    return trimmed, True
+
+
 def _waveform_to_wav_bytes(waveform, sampling_rate: int) -> bytes:
     """Encode a waveform to WAV bytes without touching disk."""
     arr = waveform
@@ -1667,6 +1691,63 @@ def _trim_edge_voice_mismatch(
     return trimmed, info
 
 
+def _detect_plosive_spikes(
+    waveform,
+    sampling_rate: int,
+    window_seconds: float = 0.005,
+    hop_seconds: float = 0.0025,
+    spike_peak_threshold: float = 0.25,
+    spike_crest_threshold: float = 12.0,
+    extreme_crest_threshold: float = 20.0,
+    min_spike_ratio: float = 0.005,
+) -> list[str]:
+    """Detect isolated impulse spikes / plosive artifacts in generated audio.
+
+    OmniVoice sometimes emits short, sharp pops (especially on short words or
+    after post-processing limiting) that are not full clipping but still sound
+    bad. We flag these by looking for very short windows where the local peak is
+    much larger than the local RMS (high crest factor) and the absolute peak is
+    significant.
+    """
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if arr.size == 0 or sampling_rate <= 0:
+        return []
+    window_size = max(1, int(window_seconds * sampling_rate))
+    hop_size = max(1, int(hop_seconds * sampling_rate))
+    total_windows = 0
+    spike_windows = 0
+    extreme_windows = 0
+    for start in range(0, arr.size, hop_size):
+        block = arr[start : start + window_size]
+        if block.size == 0:
+            continue
+        total_windows += 1
+        local_peak = float(np.max(np.abs(block)))
+        local_rms = float(np.sqrt(np.mean(np.square(block))))
+        if local_peak < spike_peak_threshold:
+            continue
+        crest = local_peak / max(local_rms, 1e-6)
+        if crest > extreme_crest_threshold:
+            extreme_windows += 1
+        elif crest > spike_crest_threshold:
+            spike_windows += 1
+
+    issues = []
+    if total_windows > 0:
+        if extreme_windows > 0:
+            issues.append("impulsive_spike")
+        elif spike_windows / total_windows > min_spike_ratio:
+            issues.append("plosive")
+
+    # Also flag globally imbalanced crest factor when the overall level is high enough.
+    global_peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+    global_rms = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
+    if global_peak > 0.3 and global_rms > 1e-6 and (global_peak / global_rms) > 15.0 and "plosive" not in issues:
+        issues.append("plosive")
+
+    return issues
+
+
 def _check_audio_quality(
     waveform,
     sampling_rate: int,
@@ -1706,6 +1787,7 @@ def _check_audio_quality(
         if ratio > 3.0 or ratio < 0.33:
             issues.append("duration_off_reference")
 
+    issues.extend(_detect_plosive_spikes(arr, sampling_rate))
     return issues
 
 
@@ -1727,8 +1809,9 @@ def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dic
             float(fallback.get("position_temperature", 5.0)) * 0.6, 1.0
         )
 
-    if "clipping" in issues:
-        # Disable post-processing in case aggressive trimming/leveling caused clipping.
+    if "clipping" in issues or "plosive" in issues or "impulsive_spike" in issues:
+        # Disable post-processing in case aggressive trimming/leveling/spike limiting
+        # caused the artifact; let the raw diffusion output through.
         fallback["postprocess_output"] = False
 
     if "too_quiet" in issues:
@@ -2415,6 +2498,22 @@ async def synthesize(request):
                 "status": "error",
                 "error": str(exc)[:500],
             }
+
+    # Hard-trim to max_duration_ms as a last-resort guard against overlapping
+    # subsequent cues in the downstream dubbing pipeline. This runs after all
+    # model-side refinement and voice-consistency trimming so it only clips
+    # genuinely over-long outputs, not model artifacts.
+    audio_waveform, was_trimmed = _clamp_waveform_to_max_duration(
+        audio_waveform, model.sampling_rate, max_duration_sec
+    )
+    if was_trimmed:
+        logger.warning(
+            f"[{req_id}] Output trimmed to max_duration_ms={max_duration_ms} "
+            f"({max_duration_sec:.3f}s) to prevent downstream overlap"
+        )
+        quality_issues = list(quality_issues)
+        if "duration_off_target" not in quality_issues:
+            quality_issues.append("duration_off_target")
 
     try:
         wav_bytes = _waveform_to_wav_bytes(audio_waveform, model.sampling_rate)
