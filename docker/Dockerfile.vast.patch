@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1.7
+FROM liudunxu/omnivoice-api:vast-gpu-5648d6c
+
+WORKDIR /app
+
+COPY api.py /app/api.py
+COPY omnivoice/ /app/omnivoice/
+COPY docker/entrypoint.sh /usr/local/bin/omnivoice-api-entrypoint
+
+RUN chmod +x /usr/local/bin/omnivoice-api-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/omnivoice-api-entrypoint"]
