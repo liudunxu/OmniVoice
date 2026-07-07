@@ -1,6 +1,9 @@
 name: Build and Push GPU Image to Docker Hub
 
 on:
+  push:
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       image_name:
@@ -25,6 +28,19 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Resolve build parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "image_name=${{ inputs.image_name }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "dockerfile=${{ inputs.dockerfile }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_name=liudunxu/omnivoice-api" >> "$GITHUB_OUTPUT"
+            echo "tag=vast-gpu" >> "$GITHUB_OUTPUT"
+            echo "dockerfile=docker/Dockerfile.vast" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -38,16 +54,17 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ inputs.image_name }}
+          images: ${{ steps.params.outputs.image_name }}
           tags: |
-            type=raw,value=${{ inputs.tag }}
-            type=sha,prefix=${{ inputs.tag }}-
+            type=raw,value=${{ steps.params.outputs.tag }}
+            type=sha,prefix=${{ steps.params.outputs.tag }}-
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
       - name: Build and push GPU image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ inputs.dockerfile }}
+          file: ${{ steps.params.outputs.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
