@@ -10,11 +10,13 @@ Endpoints:
 
 import argparse
 import asyncio
+import array
 import base64
 import hashlib
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -24,6 +26,7 @@ import sys
 import time
 import traceback
 import uuid
+import wave
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -32,6 +35,8 @@ import numpy as np
 import soundfile as sf
 import torch
 from aiohttp import web
+from pydub import AudioSegment
+from pydub.silence import detect_leading_silence
 from tqdm.auto import tqdm
 
 # Fix torchaudio 2.11+ torchcodec fallback issues on machines without FFmpeg DLLs.
@@ -596,6 +601,380 @@ def _build_synth_audio_qc(waveform, sampling_rate: int, quality_issues=None, spi
         "loudness": loudness,
         "quality_issues": list(quality_issues or []),
         "spike_locations": list(spike_locations or []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Audio QC endpoints: offload CPU-heavy signal analysis from the dubbing host.
+# ---------------------------------------------------------------------------
+
+# Reference endpoint guard constants (mirrored from dubbing reference_guard.py).
+_QC_REF_GUARD_ENABLED = str(os.environ.get("OMNIVOICE_REF_GUARD_ENABLED", "1")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_QC_REF_GUARD_SECONDS = 0.35
+_QC_REF_TRIM_SECONDS = 0.25
+_QC_REF_MIN_DURATION = 1.40
+_QC_REF_MIN_FINAL_DURATION = 1.00
+_QC_REF_FADE_SECONDS = 0.025
+
+
+def _rms(values):
+    if not values:
+        return 0.0
+    return math.sqrt(sum(float(v) * float(v) for v in values) / len(values))
+
+
+def _median(values):
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
+
+
+def _dbfs(amplitude):
+    if amplitude <= 0:
+        return -120.0
+    return 20.0 * math.log10(min(1.0, float(amplitude) / 32768.0))
+
+
+def _downsample_int16(samples, sample_rate, target_rate=8000):
+    if sample_rate <= target_rate:
+        return samples, sample_rate
+    step = max(1, int(round(sample_rate / target_rate)))
+    return samples[::step], int(round(sample_rate / step))
+
+
+def _estimate_frame_f0(frame, sample_rate):
+    """Autocorrelation F0 estimator ported from dubbing reference_guard.py."""
+    if not frame:
+        return None
+    mean = sum(frame) / len(frame)
+    centered = [float(sample) - mean for sample in frame]
+    energy = sum(sample * sample for sample in centered)
+    if energy <= 0:
+        return None
+    min_lag = max(1, int(sample_rate / 320.0))
+    max_lag = min(len(centered) - 2, int(sample_rate / 70.0))
+    if max_lag <= min_lag:
+        return None
+    best_lag = None
+    best_corr = 0.0
+    for lag in range(min_lag, max_lag + 1):
+        left = centered[:-lag]
+        right = centered[lag:]
+        numerator = sum(a * b for a, b in zip(left, right))
+        left_energy = sum(a * a for a in left)
+        right_energy = sum(b * b for b in right)
+        if left_energy <= 0 or right_energy <= 0:
+            continue
+        corr = numerator / math.sqrt(left_energy * right_energy)
+        if corr > best_corr:
+            best_corr = corr
+            best_lag = lag
+    if best_lag is None or best_corr < 0.45:
+        return None
+    return sample_rate / best_lag, best_corr
+
+
+def _segment_profile(samples, sample_rate, start, end):
+    """Return gender/f0 profile for a reference-clip segment."""
+    start_index = max(0, int(start * sample_rate))
+    end_index = min(len(samples), int(end * sample_rate))
+    if end_index <= start_index:
+        return {"gender": "unknown", "confidence": 0.0, "f0": None}
+    segment = samples[start_index:end_index]
+    frame_size = max(1, int(0.080 * sample_rate))
+    if len(segment) < frame_size:
+        return {"gender": "unknown", "confidence": 0.0, "f0": None}
+    frame_count = min(7, max(1, int((len(segment) - frame_size) / max(1, frame_size)) + 1))
+    offsets = []
+    if frame_count == 1:
+        offsets = [(len(segment) - frame_size) // 2]
+    else:
+        span = len(segment) - frame_size
+        offsets = [int(round(span * i / (frame_count - 1))) for i in range(frame_count)]
+    frame_rms = [_rms(segment[offset : offset + frame_size]) for offset in offsets]
+    active_floor = max(120.0, max(frame_rms or [0.0]) * 0.20)
+    f0_values = []
+    corr_values = []
+    for offset, rms_value in zip(offsets, frame_rms):
+        if rms_value < active_floor:
+            continue
+        estimate = _estimate_frame_f0(segment[offset : offset + frame_size], sample_rate)
+        if not estimate:
+            continue
+        f0, corr = estimate
+        f0_values.append(f0)
+        corr_values.append(corr)
+    median_f0 = _median(f0_values)
+    median_corr = _median(corr_values) or 0.0
+    voiced_ratio = len(f0_values) / max(1, len(offsets))
+    if median_f0 is None or voiced_ratio < 0.35:
+        return {"gender": "unknown", "confidence": 0.0, "f0": median_f0}
+    if median_f0 <= 155.0:
+        distance = min(1.0, max(0.0, (165.0 - median_f0) / 55.0))
+        gender = "male"
+    elif median_f0 >= 190.0:
+        distance = min(1.0, max(0.0, (median_f0 - 180.0) / 80.0))
+        gender = "female"
+    else:
+        return {"gender": "unknown", "confidence": 0.0, "f0": median_f0}
+    confidence = max(0.0, min(1.0, median_corr * 0.70 + voiced_ratio * 0.20 + distance * 0.10))
+    if confidence < 0.55:
+        gender = "unknown"
+    return {"gender": gender, "confidence": confidence, "f0": median_f0}
+
+
+def _opposite_gender(left, right):
+    return {left, right} == {"male", "female"}
+
+
+def _decode_base64_audio_to_bytes(b64_data):
+    b64_data = str(b64_data or "").strip()
+    if b64_data.startswith("data:"):
+        b64_data = b64_data.split(",", 1)[1] if "," in b64_data else b64_data
+    return base64.b64decode(b64_data)
+
+
+def _reference_quality_legacy(audio_bytes):
+    """Return dubbing-compatible reference quality dict from raw WAV bytes."""
+    try:
+        buf = io.BytesIO(audio_bytes)
+        with wave.open(buf, "rb") as wav:
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            sample_rate = wav.getframerate()
+            raw = wav.readframes(wav.getnframes())
+    except Exception as exc:
+        return {"ok": False, "error": f"read_failed:{exc}"}
+    if sample_width != 2 or channels <= 0:
+        return {"ok": False, "error": "unsupported_wav"}
+    data = array.array("h")
+    data.frombytes(raw)
+    if channels == 1:
+        samples = list(data)
+    else:
+        samples = [
+            int(sum(data[index : index + channels]) / channels)
+            for index in range(0, len(data) - channels + 1, channels)
+        ]
+    if not samples or sample_rate <= 0:
+        return {"ok": False, "error": "empty_reference"}
+    samples, sample_rate = _downsample_int16(samples, sample_rate)
+    duration = len(samples) / float(sample_rate)
+    peak = max(abs(int(sample)) for sample in samples) if samples else 0
+    rms_value = _rms(samples)
+    frame_size = max(1, int(0.050 * sample_rate))
+    frame_rms = [
+        _rms(samples[offset : offset + frame_size])
+        for offset in range(0, max(0, len(samples) - frame_size + 1), frame_size)
+    ]
+    if not frame_rms and samples:
+        frame_rms = [rms_value]
+    sorted_rms = sorted(frame_rms)
+    floor_count = max(1, int(len(sorted_rms) * 0.20)) if sorted_rms else 1
+    noise_floor = sum(sorted_rms[:floor_count]) / floor_count if sorted_rms else 0.0
+    max_frame = max(frame_rms or [0.0])
+    noise_threshold = min(noise_floor * 2.8, max_frame * 0.35) if max_frame > 0 else 0.0
+    active_threshold = max(120.0, noise_threshold, max_frame * 0.12)
+    active_frames = sum(1 for value in frame_rms if value >= active_threshold)
+    active_ratio = active_frames / max(1, len(frame_rms))
+    return {
+        "ok": True,
+        "duration": round(duration, 3),
+        "peak_db": round(_dbfs(peak), 1),
+        "rms_db": round(_dbfs(rms_value), 1),
+        "active_ratio": round(active_ratio, 3),
+    }
+
+
+def _reference_endpoint_guard(audio_bytes):
+    """Run F0-based endpoint guard on raw WAV bytes; return guard result dict.
+
+    If the clip edges contain opposite-gender speech compared to the body,
+    return trim amounts. The caller can apply them locally or request trimmed
+    audio bytes via ``trim_on_guard``.
+    """
+    if not _QC_REF_GUARD_ENABLED:
+        return {"trimmed": False, "reason": "disabled"}
+    try:
+        buf = io.BytesIO(audio_bytes)
+        with wave.open(buf, "rb") as wav:
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            sample_rate = wav.getframerate()
+            raw = wav.readframes(wav.getnframes())
+    except Exception as exc:
+        return {"trimmed": False, "reason": f"read_failed:{exc}"}
+    if sample_width != 2 or channels <= 0:
+        return {"trimmed": False, "reason": "unsupported_wav"}
+    data = array.array("h")
+    data.frombytes(raw)
+    if channels == 1:
+        samples = list(data)
+    else:
+        samples = [
+            int(sum(data[index : index + channels]) / channels)
+            for index in range(0, len(data) - channels + 1, channels)
+        ]
+    if not samples or sample_rate <= 0:
+        return {"trimmed": False, "reason": "empty_reference"}
+    samples, sample_rate = _downsample_int16(samples, sample_rate)
+    duration = len(samples) / float(sample_rate)
+    edge = min(_QC_REF_GUARD_SECONDS, max(0.0, (duration - 0.50) / 3.0))
+    if duration < _QC_REF_MIN_DURATION or edge < 0.18:
+        return {"trimmed": False, "reason": "too_short", "duration": duration}
+    body_start = edge
+    body_end = duration - edge
+    if body_end - body_start < 0.45:
+        return {"trimmed": False, "reason": "body_too_short", "duration": duration}
+    body = _segment_profile(samples, sample_rate, body_start, body_end)
+    if body["gender"] == "unknown":
+        return {"trimmed": False, "reason": "body_uncertain", "duration": duration, "body": body}
+    start_profile = _segment_profile(samples, sample_rate, 0.0, edge)
+    end_profile = _segment_profile(samples, sample_rate, duration - edge, duration)
+    start_polluted = (
+        start_profile["confidence"] >= 0.60 and _opposite_gender(body["gender"], start_profile["gender"])
+    )
+    end_polluted = end_profile["confidence"] >= 0.60 and _opposite_gender(body["gender"], end_profile["gender"])
+    if not start_polluted and not end_polluted:
+        return {
+            "trimmed": False,
+            "reason": "clean",
+            "duration": duration,
+            "body": body,
+            "start": start_profile,
+            "end": end_profile,
+        }
+    trim_unit = min(_QC_REF_TRIM_SECONDS, edge)
+    allowed_trim = max(0.0, duration - _QC_REF_MIN_FINAL_DURATION)
+    end_trim = min(trim_unit if end_polluted else 0.0, allowed_trim)
+    allowed_trim -= end_trim
+    start_trim = min(trim_unit if start_polluted else 0.0, allowed_trim)
+    if start_trim <= 0.0 and end_trim <= 0.0:
+        return {"trimmed": False, "reason": "min_duration_guard", "duration": duration}
+    return {
+        "trimmed": True,
+        "start_trim": start_trim,
+        "end_trim": end_trim,
+        "duration": duration,
+        "body": body,
+        "start": start_profile,
+        "end": end_profile,
+    }
+
+
+def _trim_audio_bytes(audio_bytes, start_trim, end_trim):
+    """Apply start/end trim with short fades and return WAV bytes."""
+    buf = io.BytesIO(audio_bytes)
+    audio = AudioSegment.from_wav(buf)
+    duration_sec = len(audio) / 1000.0
+    final_duration = max(0.05, duration_sec - start_trim - end_trim)
+    fade = min(_QC_REF_FADE_SECONDS, final_duration / 4.0)
+    start_ms = int(start_trim * 1000)
+    end_ms = int((duration_sec - end_trim) * 1000)
+    trimmed = audio[start_ms:end_ms]
+    if fade > 0:
+        trimmed = trimmed.fade_in(int(fade * 1000)).fade_out(int(fade * 1000))
+    out = io.BytesIO()
+    trimmed.export(out, format="wav")
+    return out.getvalue()
+
+
+def _build_loudness_profile_from_bytes(audio_bytes, frame_seconds=0.4):
+    """Return active-gated loudness profile from raw audio bytes."""
+    try:
+        buf = io.BytesIO(audio_bytes)
+        data, sr = sf.read(buf, dtype="float32", always_2d=True)
+        data = data.T
+    except Exception as exc:
+        return {"error": str(exc)}
+    if data.shape[0] > 1:
+        data = np.mean(data, axis=0, keepdims=True)
+    arr = data.reshape(-1)
+    if arr.size == 0 or sr <= 0:
+        return {"error": "empty_audio"}
+    frame_size = max(1, int(sr * frame_seconds))
+    frame_powers = []
+    frame_dbs = []
+    total_weighted_power = 0.0
+    total_samples = 0
+    peak = 0.0
+    for start in range(0, arr.size, frame_size):
+        block = arr[start : start + frame_size]
+        if block.size == 0:
+            continue
+        power = float(np.mean(np.square(block, dtype=np.float64)))
+        sample_count = block.size
+        total_weighted_power += power * sample_count
+        total_samples += sample_count
+        if power > 1e-20:
+            frame_powers.append(power)
+            frame_dbs.append(10.0 * np.log10(power))
+        peak = max(peak, float(np.max(np.abs(block))) if block.size else 0.0)
+    duration = arr.size / sr
+    mean_db = _db_from_power(total_weighted_power / total_samples) if total_samples else None
+    profile = {
+        "mean_volume_db": _round_float(mean_db, 2),
+        "max_volume_db": _round_float(_db_from_peak(peak), 2),
+        "duration_seconds": _round_float(duration, 3),
+        "analysis_method": "frame_rms_active_loudness",
+    }
+    if not frame_dbs:
+        return profile
+    db_values = np.asarray(frame_dbs, dtype=np.float64)
+    power_values = np.asarray(frame_powers, dtype=np.float64)
+    high_db = float(np.percentile(db_values, 90))
+    gate_db = max(-60.0, high_db - 35.0)
+    active_mask = db_values >= gate_db
+    if int(active_mask.sum()) < min(3, len(db_values)):
+        active_mask = db_values >= float(np.percentile(db_values, 65))
+    active_dbs = db_values[active_mask]
+    active_powers = power_values[active_mask]
+    active_mean_db = _db_from_power(float(np.mean(active_powers))) if active_powers.size else None
+    active_p70_db = float(np.percentile(active_dbs, 70)) if active_dbs.size else active_mean_db
+    profile.update(
+        {
+            "active_mean_volume_db": _round_float(active_mean_db, 2),
+            "active_p70_volume_db": _round_float(active_p70_db, 2),
+            "activity_ratio": _round_float(float(active_dbs.size / db_values.size), 3) if db_values.size else None,
+            "active_gate_db": _round_float(gate_db, 2),
+            "frame_seconds": frame_seconds,
+        }
+    )
+    return profile
+
+
+def _build_speech_intervals_from_bytes(audio_bytes, frame_seconds=0.04):
+    """Return speech intervals from raw audio bytes."""
+    try:
+        buf = io.BytesIO(audio_bytes)
+        data, sr = sf.read(buf, dtype="float32", always_2d=True)
+        data = data.T
+    except Exception as exc:
+        return {"error": str(exc)}
+    if data.shape[0] > 1:
+        data = np.mean(data, axis=0, keepdims=True)
+    arr = data.reshape(-1)
+    if arr.size == 0 or sr <= 0:
+        return {"error": "empty_audio"}
+    intervals = _waveform_speech_intervals(arr, sr)
+    duration = arr.size / sr
+    speech_total = sum(max(0.0, end - start) for start, end in intervals)
+    return {
+        "duration_sec": _round_float(duration),
+        "speech_total_sec": _round_float(speech_total),
+        "speech_ratio": _round_float(speech_total / duration) if duration > 0 else None,
+        "speech_interval_count": len(intervals),
+        "speech_intervals": [
+            {"start": _round_float(start), "end": _round_float(end), "duration": _round_float(end - start)}
+            for start, end in intervals[:500]
+        ],
+        "analysis_method": "waveform_frame_energy",
     }
 
 
@@ -2227,6 +2606,108 @@ async def unload(request):
         except Exception:
             pass
     return _json_response({"ok": True, "unloaded": count, "whisper_unloaded": whisper_count})
+
+
+@routes.post("/api/audio_qc/reference")
+@routes.post("/api/reference/qc")
+async def audio_qc_reference(request):
+    """Assess reference-audio quality and optionally run endpoint guard.
+
+    Offloads the CPU-heavy F0/gender endpoint-guard work from the dubbing host.
+    """
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return _error(f"Invalid JSON body: {exc}", status=400)
+
+    b64_data = data.get("reference_audio_base64") or data.get("prompt_wav_base64") or data.get("audio_base64")
+    if not b64_data:
+        return _error("reference_audio_base64 or audio_base64 is required")
+    try:
+        audio_bytes = _decode_base64_audio_to_bytes(b64_data)
+    except Exception as exc:
+        return _error(f"Failed to decode audio: {exc}")
+    if not audio_bytes:
+        return _error("Decoded audio is empty")
+
+    run_guard = str(data.get("run_endpoint_guard", "true")).strip().lower() not in {"0", "false", "no", "off"}
+    trim_on_guard = str(data.get("trim_on_guard", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+    quality = _reference_quality_legacy(audio_bytes)
+    guard = {}
+    trimmed_b64 = None
+    if run_guard and quality.get("ok"):
+        guard = _reference_endpoint_guard(audio_bytes)
+        if trim_on_guard and guard.get("trimmed"):
+            try:
+                trimmed_bytes = _trim_audio_bytes(
+                    audio_bytes, guard.get("start_trim", 0.0), guard.get("end_trim", 0.0)
+                )
+                trimmed_b64 = base64.b64encode(trimmed_bytes).decode("ascii")
+                quality_after = _reference_quality_legacy(trimmed_bytes)
+                if quality_after.get("ok"):
+                    quality = quality_after
+            except Exception as exc:
+                guard["trim_error"] = str(exc)[:200]
+
+    payload = {"ok": True, "quality": quality, "guard": guard}
+    if trimmed_b64:
+        payload["trimmed_audio_base64"] = f"data:audio/wav;base64,{trimmed_b64}"
+    return _json_response(payload)
+
+
+@routes.post("/api/audio_qc/loudness")
+async def audio_qc_loudness(request):
+    """Return active-gated loudness profile for a small audio clip."""
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return _error(f"Invalid JSON body: {exc}", status=400)
+    b64_data = data.get("audio_base64")
+    if not b64_data:
+        return _error("audio_base64 is required")
+    try:
+        audio_bytes = _decode_base64_audio_to_bytes(b64_data)
+    except Exception as exc:
+        return _error(f"Failed to decode audio: {exc}")
+    frame_seconds = 0.4
+    try:
+        frame_seconds = max(0.01, float(data.get("frame_seconds", frame_seconds)))
+    except (TypeError, ValueError):
+        pass
+    profile = _build_loudness_profile_from_bytes(audio_bytes, frame_seconds=frame_seconds)
+    if profile.get("error"):
+        return _error(f"Loudness analysis failed: {profile['error']}", status=502)
+    return _json_response({"ok": True, "profile": profile})
+
+
+@routes.post("/api/audio_qc/speech_intervals")
+async def audio_qc_speech_intervals(request):
+    """Return speech intervals and ratios for a small audio clip."""
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return _error(f"Invalid JSON body: {exc}", status=400)
+    b64_data = data.get("audio_base64")
+    if not b64_data:
+        return _error("audio_base64 is required")
+    try:
+        audio_bytes = _decode_base64_audio_to_bytes(b64_data)
+    except Exception as exc:
+        return _error(f"Failed to decode audio: {exc}")
+    result = _build_speech_intervals_from_bytes(audio_bytes)
+    if result.get("error"):
+        return _error(f"Speech interval analysis failed: {result['error']}", status=502)
+    return _json_response({"ok": True, **result})
 
 
 @routes.post("/api/voxcpm/synthesize")
