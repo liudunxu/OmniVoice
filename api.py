@@ -753,6 +753,7 @@ def _decode_base64_audio_to_bytes(b64_data):
 
 def _reference_quality_legacy(audio_bytes):
     """Return dubbing-compatible reference quality dict from raw WAV bytes."""
+    enhanced = _assess_reference_quality(audio_bytes)
     try:
         buf = io.BytesIO(audio_bytes)
         with wave.open(buf, "rb") as wav:
@@ -794,13 +795,17 @@ def _reference_quality_legacy(audio_bytes):
     active_threshold = max(120.0, noise_threshold, max_frame * 0.12)
     active_frames = sum(1 for value in frame_rms if value >= active_threshold)
     active_ratio = active_frames / max(1, len(frame_rms))
-    return {
+    result = {
         "ok": True,
         "duration": round(duration, 3),
         "peak_db": round(_dbfs(peak), 1),
         "rms_db": round(_dbfs(rms_value), 1),
         "active_ratio": round(active_ratio, 3),
     }
+    for key in ("issues", "snr_db", "snr_reliable", "active_speech_ratio"):
+        if key in enhanced:
+            result[key] = enhanced[key]
+    return result
 
 
 def _reference_endpoint_guard(audio_bytes):
