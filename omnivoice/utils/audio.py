@@ -406,14 +406,18 @@ def trim_long_audio(
 def cross_fade_chunks(
     chunks: list[np.ndarray],
     sample_rate: int,
-    silence_duration: float = 0.3,
+    crossfade_duration: float = 0.04,
 ) -> np.ndarray:
-    """Concatenate audio chunks with silence gaps and cross-fade at boundaries.
+    """Concatenate audio chunks with a short true-overlap cross-fade.
+
+    Unlike the previous implementation, this overlaps the tail of the previous
+    chunk with the head of the next one and linearly cross-fades them.  This
+    removes the audible 0.3 s silence gap while still smoothing chunk seams.
 
     Args:
         chunks: list of numpy arrays, each (C, T).
         sample_rate: audio sample rate.
-        silence_duration: total silence gap duration in seconds.
+        crossfade_duration: overlap region in seconds (default 40 ms).
 
     Returns:
         Merged numpy array (C, T_total).
@@ -421,28 +425,24 @@ def cross_fade_chunks(
     if len(chunks) == 1:
         return chunks[0]
 
-    total_n = int(silence_duration * sample_rate)
-    fade_n = total_n // 3
-    silence_n = fade_n
+    overlap_n = max(1, int(crossfade_duration * sample_rate))
     merged = chunks[0].copy()
 
     for chunk in chunks[1:]:
-        parts = [merged]
+        # Guard against very short chunks; overlap cannot be longer than either
+        # the tail of the previous chunk or the head of the next chunk.
+        avail = min(overlap_n, merged.shape[-1], chunk.shape[-1])
+        if avail <= 0:
+            merged = np.concatenate([merged, chunk], axis=-1)
+            continue
 
-        fout_n = min(fade_n, merged.shape[-1])
-        if fout_n > 0:
-            w_out = np.linspace(1, 0, fout_n, dtype=np.float32)[np.newaxis, :]
-            parts[-1][..., -fout_n:] *= w_out
+        # Linear cross-fade weights: previous fades out, next fades in.
+        w = np.linspace(0, 1, avail, dtype=np.float32)[np.newaxis, :]
+        cross = merged[..., -avail:] * (1.0 - w) + chunk[..., :avail] * w
 
-        parts.append(np.zeros((chunks[0].shape[0], silence_n), dtype=np.float32))
-
-        fade_in = chunk.copy()
-        fin_n = min(fade_n, fade_in.shape[-1])
-        if fin_n > 0:
-            w_in = np.linspace(0, 1, fin_n, dtype=np.float32)[np.newaxis, :]
-            fade_in[..., :fin_n] *= w_in
-
-        parts.append(fade_in)
-        merged = np.concatenate(parts, axis=-1)
+        merged = np.concatenate(
+            [merged[..., :-avail], cross, chunk[..., avail:]],
+            axis=-1,
+        )
 
     return merged

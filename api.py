@@ -205,31 +205,143 @@ def _bytes_audio_duration(audio_bytes: bytes) -> Optional[float]:
     return None
 
 
-def _select_quality_profile(ref_duration: Optional[float]) -> str:
-    """Select quality profile based on reference audio duration."""
+def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
+    """Compute lightweight quality metrics for a reference audio clip.
+
+    Returns a dict with duration/activity/peak/RMS/SNR and a list of issue
+    flags.  ``is_poor`` is True when any issue is detected; downstream code
+    uses this to fall back to a more conservative generation profile.
+    """
+    if not audio_bytes:
+        return {"has_ref": False, "is_poor": False, "issues": []}
+
+    try:
+        y, sr = _decode_audio_bytes_mono(audio_bytes, 24000)
+    except Exception as exc:
+        return {
+            "has_ref": True,
+            "is_poor": True,
+            "issues": ["decode_error"],
+            "error": str(exc)[:200],
+        }
+
+    if y.size == 0:
+        return {"has_ref": True, "is_poor": True, "issues": ["empty_reference"]}
+
+    duration = float(y.size) / sr
+    profile = _waveform_loudness_profile(y, sr)
+    active_ratio = profile.get("activity_ratio")
+    peak = float(np.max(np.abs(y)))
+    rms = _compute_rms(y)
+
+    intervals = _active_intervals_from_rms(y, sr)
+    active_speech = sum(max(0.0, end - start) for start, end in intervals)
+    active_speech_ratio = active_speech / duration if duration > 0 else 0.0
+
+    mean_db = profile.get("mean_volume_db")
+    active_mean_db = profile.get("active_mean_volume_db")
+    snr = (
+        (active_mean_db - mean_db)
+        if mean_db is not None and active_mean_db is not None
+        else None
+    )
+
+    issues = []
+    if active_ratio is not None and active_ratio < 0.30:
+        issues.append("low_activity")
+    if active_speech_ratio < 0.20:
+        issues.append("mostly_silence")
+    if duration < 1.0:
+        issues.append("short_reference")
+    if peak < 0.03:
+        issues.append("too_quiet")
+    if peak > 0.99:
+        issues.append("clipping")
+    if rms < 0.005:
+        issues.append("low_rms")
+    if snr is not None and snr < 10.0:
+        issues.append("low_snr")
+
+    return {
+        "has_ref": True,
+        "duration": _round_float(duration, 3),
+        "active_ratio": active_ratio,
+        "active_speech_ratio": _round_float(active_speech_ratio, 3),
+        "peak": _round_float(peak, 4),
+        "rms": _round_float(rms, 5),
+        "snr_db": _round_float(snr, 2) if snr is not None else None,
+        "is_poor": bool(issues),
+        "issues": issues,
+    }
+
+
+def _select_quality_profile(
+    ref_duration: Optional[float],
+    ref_quality: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Select quality profile based on reference audio duration and quality.
+
+    Poor-quality references are downgraded to a more conservative profile so
+    the model uses more steps / lower temperature and is less likely to emit
+    pops, silence, or overshoot the requested duration.
+    """
     if ref_duration is None:
-        return "medium"
-    if ref_duration < 2.0:
-        return "short"
+        base = "medium"
+    elif ref_duration < 2.0:
+        base = "short"
     elif ref_duration < 4.0:
-        return "medium"
+        base = "medium"
     elif ref_duration <= 5.0:
-        return "optimal"
+        base = "optimal"
     else:
-        return "long"
+        base = "long"
+
+    if not ref_quality or not ref_quality.get("is_poor"):
+        return base
+
+    # Downgrade one tier toward "short" (the most conservative built-in profile).
+    downgrade = {
+        "long": "optimal",
+        "optimal": "medium",
+        "medium": "short",
+        "short": "short",
+    }
+    return downgrade.get(base, base)
+
+
+def _apply_quality_conservative_overrides(
+    profile: Dict[str, Any], ref_quality: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Apply conservative overrides when reference audio quality is poor."""
+    if not ref_quality or not ref_quality.get("is_poor"):
+        return profile
+
+    result = dict(profile)
+    # More diffusion steps -> stabler output for noisy/short references.
+    result["num_step"] = min(int(result.get("num_step", 32)) + 8, 64)
+    # Slightly lower guidance reduces artifacts on weak references.
+    result["guidance_scale"] = max(float(result.get("guidance_scale", 2.0)) - 0.2, 1.4)
+    # Lower sampling temperatures for less randomness.
+    result["position_temperature"] = max(
+        float(result.get("position_temperature", 4.0)) - 1.0, 1.5
+    )
+    result["t_shift"] = max(float(result.get("t_shift", 0.08)) - 0.02, 0.03)
+    return result
 
 
 def _get_adaptive_params(
     ref_duration: Optional[float],
     user_cfg: Optional[float] = None,
     user_steps: Optional[int] = None,
+    ref_quality: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Get adaptive parameters based on reference audio duration.
+    """Get adaptive parameters based on reference audio duration and quality.
 
     User-specified values take precedence over adaptive defaults.
     """
-    profile_name = _select_quality_profile(ref_duration)
+    profile_name = _select_quality_profile(ref_duration, ref_quality)
     profile = _QUALITY_PROFILES[profile_name].copy()
+    profile = _apply_quality_conservative_overrides(profile, ref_quality)
 
     # User values override adaptive defaults
     if user_cfg is not None:
@@ -238,7 +350,8 @@ def _get_adaptive_params(
         profile["num_step"] = user_steps
 
     logger.info(
-        f"Adaptive profile: {profile_name} (ref_duration={ref_duration}s), "
+        f"Adaptive profile: {profile_name} (ref_duration={ref_duration}s, "
+        f"ref_quality_issues={ref_quality.get('issues') if ref_quality else None}), "
         f"num_step={profile['num_step']}, guidance_scale={profile['guidance_scale']}, "
         f"t_shift={profile['t_shift']}"
     )
@@ -2211,11 +2324,21 @@ async def synthesize(request):
             _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
             return _error(f"Failed to decode prompt_wav_base64: {exc}\n{tb}")
 
-    # Get adaptive parameters based on reference audio duration
+    # Assess reference audio quality before choosing generation profile.
+    ref_quality = _assess_reference_quality(ref_audio_bytes or prompt_audio_bytes)
+    if ref_quality.get("is_poor"):
+        logger.warning(
+            f"[{req_id}] Reference quality issues: {ref_quality.get('issues')}, "
+            f"duration={ref_quality.get('duration')}, active_ratio={ref_quality.get('active_ratio')}, "
+            f"peak={ref_quality.get('peak')}, snr={ref_quality.get('snr_db')}"
+        )
+
+    # Get adaptive parameters based on reference audio duration and quality
     adaptive_params = _get_adaptive_params(
         ref_duration=ref_duration,
         user_cfg=float(user_cfg) if user_cfg is not None else None,
         user_steps=int(user_steps) if user_steps is not None else None,
+        ref_quality=ref_quality,
     )
 
     cfg_value = adaptive_params["guidance_scale"]

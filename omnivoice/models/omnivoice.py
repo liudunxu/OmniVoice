@@ -1046,14 +1046,20 @@ class OmniVoice(PreTrainedModel):
         )
 
     def _estimate_target_tokens(self, text, ref_text, num_ref_audio_tokens, speed=1.0):
-        """Estimate number of target audio tokens."""
+        """Estimate number of target audio tokens.
+
+        Short texts/cues are easy to over-estimate because the default duration
+        estimator boosts very small values.  Use a low token threshold so that
+        single words / short phrases don't get inflated into long trailing
+        silences that exceed the downstream max_duration_ms.
+        """
         if num_ref_audio_tokens is None or ref_text is None or len(ref_text) == 0:
             # Fall back to a simple heuristic
             ref_text = "Nice to meet you."
             num_ref_audio_tokens = 25
 
         est = self.duration_estimator.estimate_duration(
-            text, ref_text, num_ref_audio_tokens
+            text, ref_text, num_ref_audio_tokens, low_threshold=10, boost_strength=2.0
         )
         if speed > 0 and speed != 1.0:
             est = est / speed
