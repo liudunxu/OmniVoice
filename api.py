@@ -115,6 +115,9 @@ WHISPER_MODEL_DIR = Path(
     )
 )
 WHISPER_MAX_MODELS = int(os.environ.get("WHISPER_MAX_MODELS", "2"))
+MIN_REFERENCE_DURATION_FOR_DURATION_RATIO = float(
+    os.environ.get("OMNIVOICE_MIN_REFERENCE_DURATION_FOR_DURATION_RATIO", "1.5")
+)
 
 _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
@@ -2357,7 +2360,7 @@ def _check_audio_quality(
         if abs(duration - target_duration) > max(tol * 2, 0.5):
             issues.append("duration_off_target")
 
-    if ref_duration is not None and ref_duration > 0:
+    if ref_duration is not None and ref_duration >= MIN_REFERENCE_DURATION_FOR_DURATION_RATIO:
         ratio = duration / ref_duration
         if ratio > 3.0 or ratio < 0.33:
             issues.append("duration_off_reference")
@@ -2904,6 +2907,8 @@ async def synthesize(request):
     target_duration_ms = data.get("target_duration_ms")
     max_duration_ms = data.get("max_duration_ms")
     duration_tolerance_ms = data.get("duration_tolerance_ms")
+    requested_max_duration_ms = max_duration_ms
+    duration_cap_relaxed = False
     user_duration = data.get("duration")
     user_speed = float(data.get("speed", 1.0))
     seed = _stable_seed_from_request(data, text, effective_prompt_text, reference_audio_base64, prompt_wav_base64)
@@ -3033,8 +3038,12 @@ async def synthesize(request):
             )
         logger.warning(
             f"[{req_id}] {msg} Allowing request because "
-            f"OMNIVOICE_ENFORCE_MAX_DURATION is not set."
+            f"OMNIVOICE_ENFORCE_MAX_DURATION is not set; relaxing max_duration_ms "
+            f"for synthesis and returning full audio."
         )
+        max_duration_sec = None
+        max_duration_ms = None
+        duration_cap_relaxed = True
 
     # Adaptive duration: try to match ref audio length when user doesn't specify duration
     # Strategy: use ref audio duration as target, but avoid badcases by checking text length
@@ -3051,7 +3060,7 @@ async def synthesize(request):
         # Only borrow reference duration when it is close to the target text's
         # natural duration. A long reference with short target text otherwise
         # tends to produce long silence and quality retries.
-        min_match_duration = estimated_natural_duration * 0.7
+        min_match_duration = max(estimated_natural_duration * 0.85, estimated_natural_duration - 0.35)
         max_match_duration = max(
             estimated_natural_duration * 1.6,
             estimated_natural_duration + 1.0,
@@ -3063,21 +3072,29 @@ async def synthesize(request):
                 f"(text_len={len(text)}, est_natural={estimated_natural_duration:.1f}s)"
             )
         elif ref_duration > max_match_duration:
+            effective_duration = estimated_natural_duration
             logger.info(
                 f"[{req_id}] Skipping ref_duration={ref_duration}s "
                 f"(too long for text, est_natural={estimated_natural_duration:.1f}s), "
-                f"using model estimation"
+                f"using estimated natural duration={effective_duration:.3f}s"
             )
         else:
             # Text is too long for ref_duration, use natural estimation to avoid badcase
+            effective_duration = estimated_natural_duration
             logger.info(
                 f"[{req_id}] Skipping ref_duration={ref_duration}s "
                 f"(text too long, est_natural={estimated_natural_duration:.1f}s), "
-                f"using model estimation"
+                f"using estimated natural duration={effective_duration:.3f}s"
             )
     elif user_duration is None and ref_duration is not None and user_speed != 1.0:
         # User specified speed, respect it but log for debugging
         logger.info(f"[{req_id}] User specified speed={user_speed}, skipping ref_duration matching")
+    elif user_duration is None and target_duration_sec is None:
+        effective_duration = estimated_natural_duration
+        logger.info(
+            f"[{req_id}] Using estimated natural duration={effective_duration:.3f}s "
+            f"as target because no target_duration_ms was provided"
+        )
 
     # Final validation: requested/fallback duration must not exceed max_duration_ms.
     if (
@@ -3105,6 +3122,7 @@ async def synthesize(request):
         f"layer_penalty={layer_penalty_factor}, pos_temp={position_temperature}, "
         f"class_temp={class_temperature}, duration={effective_duration}, speed={effective_speed}, "
         f"target_ms={target_duration_ms}, max_ms={max_duration_ms}, "
+        f"requested_max_ms={requested_max_duration_ms}, cap_relaxed={duration_cap_relaxed}, "
         f"tolerance_ms={duration_tolerance_ms}, seed={seed if seed is not None else '-'}"
     )
 
@@ -3159,6 +3177,8 @@ async def synthesize(request):
                 "optimize": optimize,
                 "target_duration_ms": target_duration_ms,
                 "max_duration_ms": max_duration_ms,
+                "requested_max_duration_ms": requested_max_duration_ms,
+                "duration_cap_relaxed": duration_cap_relaxed,
                 "duration_tolerance_ms": duration_tolerance_ms,
                 "seed": seed,
                 "voice_consistency_trim": voice_consistency_trim,
@@ -3418,6 +3438,8 @@ async def synthesize(request):
         "audio_duration_seconds": audio_duration,
         "target_duration_ms": target_duration_ms,
         "max_duration_ms": max_duration_ms,
+        "requested_max_duration_ms": requested_max_duration_ms,
+        "duration_cap_relaxed": duration_cap_relaxed,
         "duration_tolerance_ms": duration_tolerance_ms,
         "seed": seed,
         "duration_attempts": attempts_made,
