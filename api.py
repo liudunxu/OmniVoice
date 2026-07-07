@@ -126,6 +126,7 @@ OUTPUT_TEXT_QC_LANGS = {
 OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "small")
 OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "3"))
 OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
+OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.94"))
 
 _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
@@ -2447,6 +2448,59 @@ def _detect_periodic_pulse_artifact(
     ]
 
 
+def _detect_harsh_high_frequency_artifact(
+    waveform,
+    sampling_rate: int,
+) -> list[str]:
+    """Detect overly bright/harsh outputs that tend to sound sharp or cracked."""
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if arr.size == 0 or sampling_rate <= 0:
+        return []
+    duration = arr.size / float(sampling_rate)
+    if duration < 0.4:
+        return []
+
+    peak = float(np.max(np.abs(arr)))
+    rms = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
+    issues = []
+    if peak > 0.965:
+        issues.append("near_clipping")
+    if rms < 0.012 or sampling_rate < 12000:
+        return issues
+
+    windowed = arr * np.hanning(arr.size)
+    spectrum = np.abs(np.fft.rfft(windowed)) ** 2
+    freqs = np.fft.rfftfreq(arr.size, d=1.0 / sampling_rate)
+    speech_band = (freqs >= 80.0) & (freqs <= min(sampling_rate / 2.0, 12000.0))
+    high_band = (freqs >= 4800.0) & (freqs <= min(sampling_rate / 2.0, 12000.0))
+    if not np.any(speech_band) or not np.any(high_band):
+        return issues
+    total = float(np.sum(spectrum[speech_band]))
+    if total <= 1e-12:
+        return issues
+    high = float(np.sum(spectrum[high_band]))
+    centroid = float(np.sum(freqs[speech_band] * spectrum[speech_band]) / total)
+    high_ratio = high / total
+
+    # Conservative threshold: normal speech has some sibilance, but a sustained
+    # high ratio plus high centroid usually corresponds to brittle/over-bright
+    # generated audio or post-processing edge artifacts.
+    if high_ratio > 0.34 and centroid > 3600.0 and peak > 0.18:
+        issues.append("harsh_high_freq")
+    return issues
+
+
+def _apply_peak_ceiling(waveform, ceiling: float = OUTPUT_PEAK_CEILING):
+    arr = np.asarray(waveform, dtype=np.float32)
+    if arr.size == 0 or ceiling <= 0:
+        return waveform, False
+    peak = float(np.max(np.abs(arr)))
+    if peak <= ceiling:
+        return waveform, False
+    scaled = arr * (ceiling / max(peak, 1e-9))
+    return scaled.astype(np.float32), True
+
+
 def _check_audio_quality(
     waveform,
     sampling_rate: int,
@@ -2492,6 +2546,7 @@ def _check_audio_quality(
     pulse_issues, pulse_locations = _detect_periodic_pulse_artifact(arr, sampling_rate)
     issues.extend(pulse_issues)
     spike_locations.extend(pulse_locations)
+    issues.extend(_detect_harsh_high_frequency_artifact(arr, sampling_rate))
     return issues, spike_locations
 
 
@@ -2507,16 +2562,26 @@ def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dic
         float(fallback.get("cfg_value", 2.0)) + 0.2, 3.0
     )
 
-    if "too_much_silence" in issues or "empty" in issues or "periodic_pulse" in issues:
+    if "too_much_silence" in issues or "empty" in issues or "periodic_pulse" in issues or "harsh_high_freq" in issues:
         # Tighter position sampling to reduce random unmasking of silences.
         fallback["position_temperature"] = max(
             float(fallback.get("position_temperature", 5.0)) * 0.6, 1.0
         )
 
-    if "periodic_pulse" in issues:
+    if "harsh_high_freq" in issues or "near_clipping" in issues:
+        fallback["cfg_value"] = max(float(fallback.get("cfg_value", 2.0)) * 0.85, 1.2)
+
+    if "periodic_pulse" in issues or "harsh_high_freq" in issues:
         fallback["t_shift"] = max(float(fallback.get("t_shift", 0.1)) * 0.6, 0.03)
 
-    if "clipping" in issues or "plosive" in issues or "impulsive_spike" in issues or "periodic_pulse" in issues:
+    if (
+        "clipping" in issues
+        or "near_clipping" in issues
+        or "plosive" in issues
+        or "impulsive_spike" in issues
+        or "periodic_pulse" in issues
+        or "harsh_high_freq" in issues
+    ):
         # Disable post-processing in case aggressive trimming/leveling/spike limiting
         # caused the artifact; let the raw diffusion output through.
         fallback["postprocess_output"] = False
@@ -3630,6 +3695,12 @@ async def synthesize(request):
         if "duration_off_target" not in quality_issues:
             quality_issues.append("duration_off_target")
 
+    audio_waveform, peak_limited = _apply_peak_ceiling(audio_waveform, OUTPUT_PEAK_CEILING)
+    if peak_limited:
+        logger.info(
+            f"[{req_id}] output peak ceiling applied: ceiling={OUTPUT_PEAK_CEILING:.3f}"
+        )
+
     try:
         wav_bytes = _waveform_to_wav_bytes(audio_waveform, model.sampling_rate)
     except Exception as exc:
@@ -3677,7 +3748,7 @@ async def synthesize(request):
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / model.sampling_rate, 3)
     audio_qc = None
-    severe_issue_labels = {"empty", "clipping", "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete", "duration_off_target", "duration_off_reference"}
+    severe_issue_labels = {"empty", "clipping", "near_clipping", "harsh_high_freq", "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete", "duration_off_target", "duration_off_reference"}
     severe_issues = sorted({i for i in (quality_issues or []) if i in severe_issue_labels})
     if _bool_option(data.get("include_audio_qc"), True):
         try:
@@ -3689,6 +3760,8 @@ async def synthesize(request):
             )
             if text_completeness_qc is not None:
                 audio_qc["text_completeness"] = text_completeness_qc
+            audio_qc["peak_limited"] = peak_limited
+            audio_qc["peak_ceiling"] = OUTPUT_PEAK_CEILING
             audio_qc["severe_issues"] = severe_issues
         except Exception as exc:
             logger.warning(f"[{req_id}] Failed to build synthesis audio_qc: {exc}")
