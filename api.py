@@ -254,6 +254,12 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         if mean_db is not None and active_mean_db is not None
         else None
     )
+    snr_reliable = bool(
+        snr is not None
+        and active_ratio is not None
+        and active_ratio < 0.90
+        and active_speech_ratio < 0.90
+    )
 
     issues = []
     if active_ratio is not None and active_ratio < 0.30:
@@ -268,7 +274,7 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         issues.append("clipping")
     if rms < 0.005:
         issues.append("low_rms")
-    if snr is not None and snr < 10.0:
+    if snr_reliable and snr < 10.0:
         issues.append("low_snr")
 
     return {
@@ -279,6 +285,7 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         "peak": _round_float(peak, 4),
         "rms": _round_float(rms, 5),
         "snr_db": _round_float(snr, 2) if snr is not None else None,
+        "snr_reliable": snr_reliable,
         "is_poor": bool(issues),
         "issues": issues,
     }
