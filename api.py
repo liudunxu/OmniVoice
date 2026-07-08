@@ -4084,21 +4084,26 @@ def _detect_prompt_leak(
     generated_waveform,
     sample_rate: int,
     prompt_audio_bytes: bytes,
-    min_leak_sec: float = 0.12,
+    min_leak_sec: float = 0.15,
     check_sec: float = 2.5,
-    sim_threshold: float = 0.6,
+    max_leak_sec: float = 0.6,
     drop_sustain_sec: float = 0.15,
 ):
     """Detect whether the start of generated audio echoes the prompt (source) tail.
 
     In VoxCPM continuation mode the model sometimes re-produces the prompt
     audio's tail in the first generated patches; the built-in 3-patch context
-    trim does not remove this echo. This helper compares the generated head
-    against the prompt tail frame-by-frame on a mel-spectrogram and returns the
-    length of the leading high-similarity region.
+    trim does not remove this echo.
 
-    Returns ``(leak_detected, leak_samples)``. ``leak_samples`` is the number of
-    leading samples to trim when a leak is detected.
+    Cloned output naturally shares the prompt's timbre, so an *absolute*
+    similarity threshold would flag the whole clip (false positives that trim
+    real speech). Instead we use a *relative* test: a real echo makes the
+    leading frames stand out well above the clip's own baseline similarity.
+    Uniform timbre similarity (the common case) produces no such peak, so the
+    detector stays silent and adds no overhead.
+
+    Returns ``(leak_detected, leak_samples)``. ``leak_samples`` is capped at
+    ``max_leak_sec`` so a misfire can never remove more than a short prefix.
     """
     try:
         gen = np.asarray(generated_waveform, dtype=np.float32).reshape(-1)
@@ -4140,7 +4145,13 @@ def _detect_prompt_leak(
     sim = gen_frames @ prompt_frames.T
     max_sim = sim.max(axis=1)  # [gen_frames]
 
-    # Leading run of high similarity; a sustained drop ends the echo region.
+    # Baseline = median similarity of the clip's second half (the echo, if any,
+    # is at the start, so the tail is clean). A frame counts as echo only when
+    # it clearly exceeds this baseline — uniform timbre similarity never does.
+    half = max_sim.shape[0] // 2
+    baseline = float(np.median(max_sim[half:])) if half > 0 else float(np.median(max_sim))
+    sim_threshold = max(0.82, baseline + 0.20)
+
     high = max_sim > sim_threshold
     drop_sustain_frames = max(1, int(drop_sustain_sec * sample_rate / hop_length))
     leak_frames = 0
@@ -4151,6 +4162,7 @@ def _detect_prompt_leak(
             break
 
     leak_samples = int(leak_frames * hop_length)
+    leak_samples = min(leak_samples, int(max_leak_sec * sample_rate))
     leak_detected = leak_samples > int(min_leak_sec * sample_rate)
     return leak_detected, leak_samples
 
@@ -4429,47 +4441,49 @@ async def synthesize_voxcpm(request):
             # Continuation-mode prompt-echo mitigation: the model sometimes
             # re-produces the prompt (source) audio tail in the first generated
             # patches, which the built-in 3-patch context trim cannot remove.
-            # Detect the echo and retry with a new seed; fall back to trimming
-            # the residual echo so the output never starts with source audio.
+            # The detector uses a relative threshold (see _detect_prompt_leak),
+            # so uniform timbre similarity does not trigger it — only a clear
+            # echo peak does. One seed retry, then a short capped trim fallback.
             if prompt_path is not None and prompt_audio_bytes is not None:
-                max_leak_retries = max(1, quality_retry_max)
-                for attempt in range(max_leak_retries):
-                    leak_detected, leak_samples = _detect_prompt_leak(
-                        audio_waveform, sample_rate, prompt_audio_bytes
-                    )
-                    if not leak_detected:
-                        break
-                    leak_args = list(gen_args)
-                    leak_args[-1] = (seed + attempt + 1) % (2**31 - 1)  # bump seed
-                    logger.info(
-                        f"[{req_id}] voxcpm prompt-leak retry attempt {attempt + 1} "
-                        f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_args[-1]})"
-                    )
-                    leak_wav = await asyncio.to_thread(_generate_voxcpm_sync, *leak_args)
-                    _, retry_leak = _detect_prompt_leak(
-                        leak_wav, sample_rate, prompt_audio_bytes
-                    )
-                    attempts += 1
-                    if retry_leak < leak_samples:
-                        audio_waveform = leak_wav
-                        leak_samples = retry_leak
-                    if retry_leak == 0:
-                        break
-                # Fallback: trim any residual echo with a short fade-in.
                 leak_detected, leak_samples = _detect_prompt_leak(
                     audio_waveform, sample_rate, prompt_audio_bytes
                 )
-                if leak_detected and leak_samples > 0:
+                if leak_detected:
+                    leak_args = list(gen_args)
+                    leak_args[-1] = (seed + 1) % (2**31 - 1)  # bump seed
+                    logger.info(
+                        f"[{req_id}] voxcpm prompt-leak retry "
+                        f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_args[-1]})"
+                    )
+                    leak_wav = await asyncio.to_thread(_generate_voxcpm_sync, *leak_args)
+                    attempts += 1
+                    _, retry_leak = _detect_prompt_leak(
+                        leak_wav, sample_rate, prompt_audio_bytes
+                    )
+                    if retry_leak < leak_samples:
+                        audio_waveform = leak_wav
+                        leak_samples = retry_leak
+                # Fallback: trim any residual echo with a short fade-in.
+                # Guard against over-trim (leak >= audio length) so we never
+                # produce an empty clip.
+                leak_detected, leak_samples = _detect_prompt_leak(
+                    audio_waveform, sample_rate, prompt_audio_bytes
+                )
+                audio_arr = np.asarray(audio_waveform, dtype=np.float32).reshape(-1)
+                if (
+                    leak_detected
+                    and 0 < leak_samples < audio_arr.size - int(0.1 * sample_rate)
+                ):
                     fade = min(int(0.02 * sample_rate), leak_samples // 2)
-                    audio_waveform = np.asarray(audio_waveform, dtype=np.float32).reshape(-1)
-                    audio_waveform = audio_waveform[leak_samples:].copy()
-                    if fade > 1:
-                        audio_waveform[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                    audio_arr = audio_arr[leak_samples:].copy()
+                    if 1 < fade < audio_arr.size:
+                        audio_arr[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                    audio_waveform = audio_arr
                     if "prompt_leak" not in quality_issues:
                         quality_issues.append("prompt_leak")
                     logger.warning(
                         f"[{req_id}] voxcpm prompt-leak trimmed {leak_samples} samples "
-                        f"({leak_samples / sample_rate:.2f}s) after retries"
+                        f"({leak_samples / sample_rate:.2f}s) after retry"
                     )
     except Exception as exc:
         tb = traceback.format_exc()
