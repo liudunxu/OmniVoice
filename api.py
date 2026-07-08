@@ -2697,6 +2697,17 @@ def _check_audio_quality(
         issues.append("empty")
     if duration >= 0.5 and active_speech_ratio < 0.35 and silence_ratio > 0.65:
         issues.append("too_much_silence")
+    # Cross-check with the same frame-energy intervals used in audio_qc; some
+    # very short utterances fill the window with near-silent padding and only
+    # briefly pop, which the per-sample silence ratio can miss.
+    if duration >= 0.5:
+        speech_intervals = _waveform_speech_intervals(arr, sampling_rate)
+        speech_total = sum(max(0.0, end - start) for start, end in speech_intervals)
+        frame_speech_ratio = speech_total / duration
+        if frame_speech_ratio < 0.30:
+            if "too_much_silence" not in issues:
+                issues.append("too_much_silence")
+
     if peak > 0.99:
         issues.append("clipping")
     if 0 < rms < 0.005:
