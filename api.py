@@ -127,6 +127,14 @@ OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "small")
 OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "3"))
 OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
 OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.94"))
+
+# Quality-issue labels considered severe enough to drive retry / report.
+# Shared by the OmniVoice and VoxCPM synth paths so the set stays in sync.
+_SEVERE_ISSUE_LABELS = frozenset({
+    "empty", "clipping", "near_clipping", "harsh_high_freq",
+    "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete",
+    "duration_off_target", "duration_off_reference",
+})
 VOXCPM_MODEL_ID = os.environ.get("VOXCPM_MODEL_ID", "openbmb/VoxCPM2")
 VOXCPM_LOAD_DENOISER = str(
     os.environ.get("VOXCPM_LOAD_DENOISER", "0")
@@ -2699,14 +2707,15 @@ def _check_audio_quality(
         issues.append("too_much_silence")
     # Cross-check with the same frame-energy intervals used in audio_qc; some
     # very short utterances fill the window with near-silent padding and only
-    # briefly pop, which the per-sample silence ratio can miss.
-    if duration >= 0.5:
+    # briefly pop, which the per-sample silence ratio can miss. Only run when
+    # the per-sample check did not already flag it — the frame sweep is the
+    # expensive part here and normal audio almost never needs it.
+    if duration >= 0.5 and "too_much_silence" not in issues:
         speech_intervals = _waveform_speech_intervals(arr, sampling_rate)
         speech_total = sum(max(0.0, end - start) for start, end in speech_intervals)
         frame_speech_ratio = speech_total / duration
         if frame_speech_ratio < 0.30:
-            if "too_much_silence" not in issues:
-                issues.append("too_much_silence")
+            issues.append("too_much_silence")
 
     if peak > 0.99:
         issues.append("clipping")
@@ -3928,8 +3937,7 @@ async def synthesize(request):
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / model.sampling_rate, 3)
     audio_qc = None
-    severe_issue_labels = {"empty", "clipping", "near_clipping", "harsh_high_freq", "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete", "duration_off_target", "duration_off_reference"}
-    severe_issues = sorted({i for i in (quality_issues or []) if i in severe_issue_labels})
+    severe_issues = sorted({i for i in (quality_issues or []) if i in _SEVERE_ISSUE_LABELS})
     if _bool_option(data.get("include_audio_qc"), True):
         try:
             audio_qc = _build_synth_audio_qc(
@@ -4500,9 +4508,10 @@ async def synthesize_voxcpm(request):
             )
             quality_issues = list(_issues)
 
-            severe_labels = {"empty", "clipping", "near_clipping", "harsh_high_freq",
-                             "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete"}
-            severe = [i for i in quality_issues if i in severe_labels]
+            # Retry trigger set: at this stage quality_issues comes only from
+            # _check_audio_quality, so duration_off_* (added later by the
+            # max_duration clamp) cannot appear — _SEVERE_ISSUE_LABELS is safe.
+            severe = [i for i in quality_issues if i in _SEVERE_ISSUE_LABELS]
 
             # One OmniVoice-style quality retry: bump cfg/steps and regenerate.
             if quality_retry and severe and quality_retry_max >= 1 and "empty" not in severe:
@@ -4519,7 +4528,7 @@ async def synthesize_voxcpm(request):
                 retry_issues, retry_spikes = _check_audio_quality(
                     retry_wav, sample_rate, ref_duration=ref_duration
                 )
-                retry_severe = [i for i in retry_issues if i in severe_labels]
+                retry_severe = [i for i in retry_issues if i in _SEVERE_ISSUE_LABELS]
                 quality_retried = True
                 attempts = 2
                 # Keep whichever output has fewer severe issues.
@@ -4550,18 +4559,19 @@ async def synthesize_voxcpm(request):
                     )
                     leak_wav = await asyncio.to_thread(_generate_voxcpm_sync, *leak_args)
                     attempts += 1
-                    _, retry_leak = _detect_prompt_leak(
+                    retry_detected, retry_leak = _detect_prompt_leak(
                         leak_wav, sample_rate, prompt_audio_bytes
                     )
+                    # Keep the retry only if it reduced the echo. leak_detected /
+                    # leak_samples now describe the chosen audio_waveform, so the
+                    # trim fallback below reuses them instead of re-detecting.
                     if retry_leak < leak_samples:
                         audio_waveform = leak_wav
+                        leak_detected = retry_detected
                         leak_samples = retry_leak
                 # Fallback: trim any residual echo with a short fade-in.
                 # Guard against over-trim (leak >= audio length) so we never
                 # produce an empty clip.
-                leak_detected, leak_samples = _detect_prompt_leak(
-                    audio_waveform, sample_rate, prompt_audio_bytes
-                )
                 audio_arr = np.asarray(audio_waveform, dtype=np.float32).reshape(-1)
                 if (
                     leak_detected
@@ -4642,10 +4652,7 @@ async def synthesize_voxcpm(request):
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / sample_rate, 3)
 
-    severe_issue_labels = {"empty", "clipping", "near_clipping", "harsh_high_freq",
-                           "impulsive_spike", "plosive", "periodic_pulse",
-                           "text_incomplete", "duration_off_target", "duration_off_reference"}
-    severe_issues = sorted({i for i in quality_issues if i in severe_issue_labels})
+    severe_issues = sorted({i for i in quality_issues if i in _SEVERE_ISSUE_LABELS})
 
     audio_qc = None
     if _bool_option(data.get("include_audio_qc"), True):
