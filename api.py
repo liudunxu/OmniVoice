@@ -3068,6 +3068,34 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
     }
 
 
+def _qc_language_mismatch_triggers_retry(
+    text_qc: Optional[Dict[str, Any]],
+    expected_language,
+) -> bool:
+    """Decide whether a text-completeness QC result warrants a regenerate.
+
+    Whisper may transcribe a correct TTS output in the wrong language when the
+    text is dominated by proper nouns (names, places) that sound like another
+    language. Regenerating on a lone language mismatch would misfire on those
+    cases and, with the same seed, produce identical audio. So we only trigger
+    when the mismatch coincides with low coverage — i.e. the output is both
+    incomplete *and* the detected language drifted, which together make a real
+    synthesis error far more likely than a transcription quirk.
+    """
+    if not text_qc or text_qc.get("status") != "incomplete":
+        return False
+    coverage = text_qc.get("coverage")
+    if coverage is None or coverage >= OUTPUT_TEXT_QC_MIN_COVERAGE:
+        return False
+    detected = text_qc.get("whisper_language")
+    if not detected:
+        return False
+    expected = _whisper_language_code(expected_language)
+    if not expected:
+        return False
+    return str(detected).lower() != expected.lower()
+
+
 routes = web.RouteTableDef()
 
 
@@ -4539,13 +4567,23 @@ async def synthesize_voxcpm(request):
                     quality_issues = list(retry_issues)
                     spike_locations = retry_spikes
                     severe = retry_severe
+                # Track the cfg/steps that produced the chosen audio, so the
+                # prompt-leak retry below regenerates from the same (possibly
+                # raised) parameters instead of the original gen_args.
+                leak_base_cfg = retry_cfg
+                leak_base_steps = retry_steps
+            else:
+                leak_base_cfg = cfg_value
+                leak_base_steps = inference_timesteps
 
             # Continuation-mode prompt-echo mitigation: the model sometimes
             # re-produces the prompt (source) audio tail in the first generated
             # patches, which the built-in 3-patch context trim cannot remove.
             # The detector uses a relative threshold (see _detect_prompt_leak),
             # so uniform timbre similarity does not trigger it — only a clear
-            # echo peak does. One seed retry, then a short capped trim fallback.
+            # echo peak does. One seed retry (reusing the quality-retry-raised
+            # cfg/steps and nudging steps up once more — under-diffusion makes
+            # prompt-tail echo more likely), then a short capped trim fallback.
             if prompt_path is not None and prompt_audio_bytes is not None:
                 leak_detected, leak_samples = _detect_prompt_leak(
                     audio_waveform, sample_rate, prompt_audio_bytes
@@ -4553,6 +4591,8 @@ async def synthesize_voxcpm(request):
                 if leak_detected:
                     leak_args = list(gen_args)
                     leak_args[-1] = (seed + 1) % (2**31 - 1)  # bump seed
+                    leak_args[5] = leak_base_cfg               # keep raised cfg
+                    leak_args[6] = min(leak_base_steps + 2, 64)  # one more diffusion step
                     logger.info(
                         f"[{req_id}] voxcpm prompt-leak retry "
                         f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_args[-1]})"
@@ -4649,6 +4689,62 @@ async def synthesize_voxcpm(request):
             logger.warning(f"[{req_id}] voxcpm output text QC failed: {exc}")
             text_completeness_qc = {"version": 1, "status": "error", "error": str(exc)[:500]}
 
+    # Language-mismatch regenerate: when the output is both incomplete and
+    # whisper detected a different language (a strong signal the synth actually
+    # mis-spoke rather than a proper-noun transcription quirk), regenerate once
+    # with a bumped seed and keep whichever QC result is better. Shares the
+    # quality_retry budget (at most one extra generation).
+    lang_regen = False
+    if (
+        output_path_for_response
+        and quality_retry
+        and _qc_language_mismatch_triggers_retry(text_completeness_qc, language)
+    ):
+        regen_args = list(gen_args)
+        regen_args[-1] = (seed + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
+        logger.info(
+            f"[{req_id}] voxcpm language-mismatch regenerate "
+            f"(detected={text_completeness_qc.get('whisper_language')} "
+            f"expected={_whisper_language_code(language)}, "
+            f"coverage={text_completeness_qc.get('coverage')}, new seed={regen_args[-1]})"
+        )
+        try:
+            async with _API_INFER_SEM:
+                regen_wav = await asyncio.to_thread(_generate_voxcpm_sync, *regen_args)
+            attempts += 1
+            lang_regen = True
+            regen_wav, _ = _clamp_waveform_to_max_duration(regen_wav, sample_rate, max_duration_sec)
+            regen_wav, _ = _apply_peak_ceiling(regen_wav, OUTPUT_PEAK_CEILING)
+            regen_wav_bytes = _waveform_to_wav_bytes(regen_wav, sample_rate)
+            regen_path = out_dir / f"voxcpm2_{key}_langregen.wav"
+            try:
+                regen_path.write_bytes(regen_wav_bytes)
+                regen_qc = await _build_output_text_qc(
+                    str(regen_path.resolve()), text, language, data
+                )
+            finally:
+                _cleanup_temp_paths(regen_path)
+            # Keep the regenerate only if it lifted coverage above the
+            # threshold (a genuine fix); otherwise fall back to the original.
+            if regen_qc.get("coverage", 0) >= OUTPUT_TEXT_QC_MIN_COVERAGE:
+                audio_waveform = regen_wav
+                wav_bytes = regen_wav_bytes
+                out_path.write_bytes(wav_bytes)
+                if "text_incomplete" in quality_issues:
+                    quality_issues.remove("text_incomplete")
+                text_completeness_qc = regen_qc
+                logger.info(
+                    f"[{req_id}] voxcpm language-mismatch regenerate accepted "
+                    f"(coverage->{regen_qc.get('coverage')})"
+                )
+            else:
+                logger.info(
+                    f"[{req_id}] voxcpm language-mismatch regenerate rejected "
+                    f"(coverage {regen_qc.get('coverage')} did not recover)"
+                )
+        except Exception as exc:
+            logger.warning(f"[{req_id}] voxcpm language-mismatch regenerate failed: {exc}")
+
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / sample_rate, 3)
 
@@ -4696,6 +4792,7 @@ async def synthesize_voxcpm(request):
         "duration_attempts": attempts,
         "quality_issues": quality_issues,
         "quality_retried": quality_retried,
+        "language_regen": lang_regen,
         "severe_issues": severe_issues,
         "audio_qc": audio_qc or {},
         "duration_match": {
