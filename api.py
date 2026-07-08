@@ -4080,6 +4080,47 @@ async def voxcpm_voices_delete(request):
     return _json_response({"ok": True, "voice_id": voice_id, "removed": removed})
 
 
+def _voxcpm_adaptive_params(
+    cfg_value: float,
+    inference_timesteps: int,
+    ref_duration: Optional[float],
+    ref_quality: Optional[Dict[str, Any]],
+) -> tuple[float, int, str]:
+    """Lightweight VoxCPM2 cfg/steps adaptation by reference quality.
+
+    VoxCPM2 only accepts ``cfg_value`` and ``inference_timesteps`` (no
+    t_shift / layer_penalty), so we adapt just those two. Strong references
+    keep the caller's values; weak references nudge cfg up for clone stability
+    and add a few diffusion steps. User-specified higher values are never
+    downgraded (we take the max), so this only makes generation more careful,
+    never sloppier.
+
+    Returns ``(cfg_value, inference_timesteps, reason)``.
+    """
+    # Weak reference: short, low-activity, low-snr, or flagged poor.
+    is_poor = bool(ref_quality and ref_quality.get("is_poor"))
+    ref_short = ref_duration is not None and ref_duration < 2.0
+    low_snr = bool(
+        ref_quality
+        and ref_quality.get("snr_reliable")
+        and (ref_quality.get("snr_db") or 999) < 10.0
+    )
+    if not (is_poor or ref_short or low_snr):
+        return cfg_value, inference_timesteps, ""
+
+    adaptive_cfg = max(cfg_value, 2.3)
+    # Only nudge steps up toward the cap; a caller's already-higher value wins.
+    if inference_timesteps < 14:
+        adaptive_steps = 14
+    else:
+        adaptive_steps = inference_timesteps
+    reason = (
+        f"weak reference (poor={is_poor}, short={ref_short}, low_snr={low_snr}); "
+        f"cfg {cfg_value}->{adaptive_cfg}, steps {inference_timesteps}->{adaptive_steps}"
+    )
+    return adaptive_cfg, adaptive_steps, reason
+
+
 def _detect_prompt_leak(
     generated_waveform,
     sample_rate: int,
@@ -4290,6 +4331,19 @@ async def synthesize_voxcpm(request):
     retry_badcase_max_times = int(data.get("retry_badcase_max_times", 3))
     retry_badcase_ratio_threshold = float(data.get("retry_badcase_ratio_threshold", 6.0))
     trim_silence_vad = _bool_option(data.get("trim_silence_vad"), True)
+
+    # Lightweight cfg/steps adaptation by reference quality. On by default;
+    # a caller can disable it with ``voxcpm_adaptive=false``. Only nudges
+    # values up (never downgrades), so user-specified higher values win.
+    voxcpm_adaptive = _bool_option(data.get("voxcpm_adaptive"), True)
+    voxcpm_adaptive_reason = ""
+    if voxcpm_adaptive and ref_audio_bytes:
+        ref_quality_profile = _assess_reference_quality(ref_audio_bytes)
+        cfg_value, inference_timesteps, voxcpm_adaptive_reason = _voxcpm_adaptive_params(
+            cfg_value, inference_timesteps, ref_duration, ref_quality_profile,
+        )
+        if voxcpm_adaptive_reason:
+            logger.info(f"[{req_id}] voxcpm adaptive: {voxcpm_adaptive_reason}")
 
     normalize = _bool_option(data.get("normalize"), False)
     if normalize and not _voxcpm_normalize_available():
@@ -4606,6 +4660,8 @@ async def synthesize_voxcpm(request):
             "ref_duration": ref_duration,
             "num_step": inference_timesteps,
             "guidance_scale": cfg_value,
+            "voxcpm_adaptive": bool(voxcpm_adaptive_reason),
+            "voxcpm_adaptive_reason": voxcpm_adaptive_reason,
         },
     })
 
