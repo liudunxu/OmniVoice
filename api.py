@@ -4080,6 +4080,81 @@ async def voxcpm_voices_delete(request):
     return _json_response({"ok": True, "voice_id": voice_id, "removed": removed})
 
 
+def _detect_prompt_leak(
+    generated_waveform,
+    sample_rate: int,
+    prompt_audio_bytes: bytes,
+    min_leak_sec: float = 0.12,
+    check_sec: float = 2.5,
+    sim_threshold: float = 0.6,
+    drop_sustain_sec: float = 0.15,
+):
+    """Detect whether the start of generated audio echoes the prompt (source) tail.
+
+    In VoxCPM continuation mode the model sometimes re-produces the prompt
+    audio's tail in the first generated patches; the built-in 3-patch context
+    trim does not remove this echo. This helper compares the generated head
+    against the prompt tail frame-by-frame on a mel-spectrogram and returns the
+    length of the leading high-similarity region.
+
+    Returns ``(leak_detected, leak_samples)``. ``leak_samples`` is the number of
+    leading samples to trim when a leak is detected.
+    """
+    try:
+        gen = np.asarray(generated_waveform, dtype=np.float32).reshape(-1)
+        prompt_wav, _ = _decode_audio_bytes_mono(prompt_audio_bytes, int(sample_rate))
+    except Exception:
+        return False, 0
+    if gen.size < int(0.3 * sample_rate) or prompt_wav.size < int(0.3 * sample_rate):
+        return False, 0
+
+    import librosa
+
+    prompt_tail = prompt_wav[-int(1.5 * sample_rate):]
+    gen_head = gen[:int(check_sec * sample_rate)]
+    n_fft = min(1024, 2 ** int(np.floor(np.log2(max(256, min(gen_head.size, prompt_tail.size))))))
+    hop_length = max(1, int(0.025 * sample_rate))
+
+    try:
+        gen_mel = librosa.feature.melspectrogram(
+            y=gen_head, sr=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=32,
+        )
+        prompt_mel = librosa.feature.melspectrogram(
+            y=prompt_tail, sr=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=32,
+        )
+    except Exception:
+        return False, 0
+
+    gen_mel = librosa.power_to_db(gen_mel + 1e-10)
+    prompt_mel = librosa.power_to_db(prompt_mel + 1e-10)
+
+    def _l2_norm_frames(m):
+        f = m.T  # [frames, mels]
+        norm = np.linalg.norm(f, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        return f / norm
+
+    gen_frames = _l2_norm_frames(gen_mel)
+    prompt_frames = _l2_norm_frames(prompt_mel)
+    # max cosine similarity per generated frame against any prompt-tail frame
+    sim = gen_frames @ prompt_frames.T
+    max_sim = sim.max(axis=1)  # [gen_frames]
+
+    # Leading run of high similarity; a sustained drop ends the echo region.
+    high = max_sim > sim_threshold
+    drop_sustain_frames = max(1, int(drop_sustain_sec * sample_rate / hop_length))
+    leak_frames = 0
+    for i in range(len(high)):
+        if high[i]:
+            leak_frames = i + 1
+        elif i - leak_frames >= drop_sustain_frames:
+            break
+
+    leak_samples = int(leak_frames * hop_length)
+    leak_detected = leak_samples > int(min_leak_sec * sample_rate)
+    return leak_detected, leak_samples
+
+
 def _generate_voxcpm_sync(
     model,
     text,
@@ -4227,6 +4302,26 @@ async def synthesize_voxcpm(request):
         max_duration_ms = None
     max_duration_sec = (max_duration_ms / 1000.0) if max_duration_ms and max_duration_ms > 0 else None
 
+    # Relax max_duration when the target text's natural duration exceeds the
+    # hard cap — hard-trimming would cut the end of the text off mid-sentence.
+    # Mirror the OmniVoice main synth path (see _ENFORCE_MAX_DURATION logic).
+    # The dubbing pipeline's local atempo fits the full audio back to the cue
+    # window, so returning un-trimmed audio does not cause overlap.
+    duration_cap_relaxed = False
+    if max_duration_sec is not None:
+        estimated_natural_duration = _estimate_natural_duration(
+            text, prompt_text or None, ref_duration,
+        )
+        if estimated_natural_duration > max_duration_sec:
+            logger.warning(
+                f"[{req_id}] voxcpm relaxing max_duration_ms={max_duration_ms} "
+                f"(estimated natural duration {estimated_natural_duration:.2f}s "
+                f"exceeds cap); returning full audio for local atempo fit."
+            )
+            max_duration_sec = None
+            max_duration_ms = None
+            duration_cap_relaxed = True
+
     language = (
         data.get("language")
         or data.get("target_lang")
@@ -4330,6 +4425,52 @@ async def synthesize_voxcpm(request):
                     quality_issues = list(retry_issues)
                     spike_locations = retry_spikes
                     severe = retry_severe
+
+            # Continuation-mode prompt-echo mitigation: the model sometimes
+            # re-produces the prompt (source) audio tail in the first generated
+            # patches, which the built-in 3-patch context trim cannot remove.
+            # Detect the echo and retry with a new seed; fall back to trimming
+            # the residual echo so the output never starts with source audio.
+            if prompt_path is not None and prompt_audio_bytes is not None:
+                max_leak_retries = max(1, quality_retry_max)
+                for attempt in range(max_leak_retries):
+                    leak_detected, leak_samples = _detect_prompt_leak(
+                        audio_waveform, sample_rate, prompt_audio_bytes
+                    )
+                    if not leak_detected:
+                        break
+                    leak_args = list(gen_args)
+                    leak_args[-1] = (seed + attempt + 1) % (2**31 - 1)  # bump seed
+                    logger.info(
+                        f"[{req_id}] voxcpm prompt-leak retry attempt {attempt + 1} "
+                        f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_args[-1]})"
+                    )
+                    leak_wav = await asyncio.to_thread(_generate_voxcpm_sync, *leak_args)
+                    _, retry_leak = _detect_prompt_leak(
+                        leak_wav, sample_rate, prompt_audio_bytes
+                    )
+                    attempts += 1
+                    if retry_leak < leak_samples:
+                        audio_waveform = leak_wav
+                        leak_samples = retry_leak
+                    if retry_leak == 0:
+                        break
+                # Fallback: trim any residual echo with a short fade-in.
+                leak_detected, leak_samples = _detect_prompt_leak(
+                    audio_waveform, sample_rate, prompt_audio_bytes
+                )
+                if leak_detected and leak_samples > 0:
+                    fade = min(int(0.02 * sample_rate), leak_samples // 2)
+                    audio_waveform = np.asarray(audio_waveform, dtype=np.float32).reshape(-1)
+                    audio_waveform = audio_waveform[leak_samples:].copy()
+                    if fade > 1:
+                        audio_waveform[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                    if "prompt_leak" not in quality_issues:
+                        quality_issues.append("prompt_leak")
+                    logger.warning(
+                        f"[{req_id}] voxcpm prompt-leak trimmed {leak_samples} samples "
+                        f"({leak_samples / sample_rate:.2f}s) after retries"
+                    )
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] VoxCPM synthesis failed: {exc}\n{tb}")
@@ -4434,6 +4575,7 @@ async def synthesize_voxcpm(request):
         "elapsed_seconds": elapsed,
         "audio_duration_seconds": audio_duration,
         "max_duration_ms": max_duration_ms,
+        "duration_cap_relaxed": duration_cap_relaxed,
         "voice_id": voice_id or None,
         "seed": seed,
         "duration_attempts": attempts,
