@@ -123,7 +123,7 @@ OUTPUT_TEXT_QC_LANGS = {
     for code in os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_LANGS", "fil,tl").split(",")
     if code.strip()
 }
-OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "small")
+OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "large-v3")
 OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "3"))
 OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
 OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.94"))
