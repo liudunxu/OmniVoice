@@ -127,6 +127,19 @@ OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "small")
 OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "3"))
 OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
 OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.94"))
+VOXCPM_MODEL_ID = os.environ.get("VOXCPM_MODEL_ID", "openbmb/VoxCPM2")
+VOXCPM_LOAD_DENOISER = str(
+    os.environ.get("VOXCPM_LOAD_DENOISER", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
+VOXCPM_OPTIMIZE = str(
+    os.environ.get("VOXCPM_OPTIMIZE", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
+VOXCPM_VOICES_CACHE_SIZE = int(os.environ.get("VOXCPM_VOICES_CACHE_SIZE", "64"))
+# When true, loading one TTS engine unloads the other to free VRAM (single 24GB
+# GPU coexistence). Default 0: both may stay resident lazily.
+_EXCLUSIVE_MODE = str(
+    os.environ.get("OMNIVOICE_EXCLUSIVE_MODE", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
@@ -150,6 +163,14 @@ _VOICE_PROMPT_CACHE: OrderedDict[str, Any] = OrderedDict()
 _MAX_VOICE_PROMPT_CACHE_SIZE = int(
     os.environ.get("OMNIVOICE_VOICE_PROMPT_CACHE_SIZE", "100")
 )
+# Vendored VoxCPM2 backend state (parallel to the OmniVoice _API_MODEL globals).
+# Loaded lazily on first /api/voxcpm/synthesize request.
+_VOXCPM_MODEL = None
+_VOXCPM_MODEL_ID = VOXCPM_MODEL_ID
+_VOXCPM_LOAD_LOCK = asyncio.Lock()
+_VOXCPM_VOICES: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_VOXCPM_DENOISE_AVAILABLE = None
+_VOXCPM_NORMALIZE_AVAILABLE = None
 # Whether max_duration_ms should hard-reject requests whose natural duration
 # exceeds the limit. Default warn-only to avoid breaking existing callers.
 _ENFORCE_MAX_DURATION = str(
@@ -1521,6 +1542,8 @@ async def _ensure_api_model():
         # Double-check after acquiring lock.
         if _API_MODEL is not None:
             return _API_MODEL
+        if _EXCLUSIVE_MODE and _VOXCPM_MODEL is not None:
+            _unload_voxcpm_model_sync()
         _API_MODEL = await asyncio.to_thread(_load_api_model_sync)
     return _API_MODEL
 
@@ -1592,6 +1615,155 @@ def _apply_seed(seed):
     except Exception:
         pass
     return seed
+
+
+# ---------------------------------------------------------------------------
+# VoxCPM2 backend: lazy loader, memory release, voice registry
+# ---------------------------------------------------------------------------
+
+def _release_memory():
+    import gc
+    gc.collect()
+    if sys.platform != "win32":
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _voxcpm_optional_available(name: str) -> bool:
+    """Lazy capability probe for optional VoxCPM deps (modelscope/wetext)."""
+    try:
+        import importlib
+        importlib.import_module(name)
+        return True
+    except Exception:
+        return False
+
+
+def _voxcpm_denoise_available() -> bool:
+    global _VOXCPM_DENOISE_AVAILABLE
+    if _VOXCPM_DENOISE_AVAILABLE is None:
+        _VOXCPM_DENOISE_AVAILABLE = _voxcpm_optional_available("modelscope")
+    return _VOXCPM_DENOISE_AVAILABLE
+
+
+def _voxcpm_normalize_available() -> bool:
+    global _VOXCPM_NORMALIZE_AVAILABLE
+    if _VOXCPM_NORMALIZE_AVAILABLE is None:
+        _VOXCPM_NORMALIZE_AVAILABLE = (
+            _voxcpm_optional_available("wetext")
+            and _voxcpm_optional_available("inflect")
+        )
+    return _VOXCPM_NORMALIZE_AVAILABLE
+
+
+def _load_voxcpm_model_sync():
+    from voxcpm import VoxCPM
+    model_id = _VOXCPM_MODEL_ID
+    load_denoiser = VOXCPM_LOAD_DENOISER and _voxcpm_denoise_available()
+    if VOXCPM_LOAD_DENOISER and not load_denoiser:
+        logger.warning(
+            "VOXCPM_LOAD_DENOISER=1 but modelscope is not installed; "
+            "starting VoxCPM without the ZipEnhancer denoiser."
+        )
+    logger.info(f"加载 VoxCPM 模型: {model_id}, 设备: {_API_DEVICE}, denoiser={load_denoiser} ...")
+    model = VoxCPM.from_pretrained(
+        model_id,
+        load_denoiser=load_denoiser,
+        optimize=VOXCPM_OPTIMIZE,
+        device=_API_DEVICE,
+    )
+    logger.info("VoxCPM 模型加载完成！")
+    return model
+
+
+def _unload_voxcpm_model_sync():
+    global _VOXCPM_MODEL
+    count = 1 if _VOXCPM_MODEL is not None else 0
+    _VOXCPM_MODEL = None
+    _VOXCPM_VOICES.clear()
+    _release_memory()
+    return count
+
+
+async def _ensure_voxcpm_model():
+    global _VOXCPM_MODEL, _API_MODEL
+    if _VOXCPM_MODEL is not None:
+        return _VOXCPM_MODEL
+    async with _VOXCPM_LOAD_LOCK:
+        if _VOXCPM_MODEL is not None:
+            return _VOXCPM_MODEL
+        if _EXCLUSIVE_MODE and _API_MODEL is not None:
+            # Evict OmniVoice to make room on a single GPU.
+            _API_MODEL = None
+            _VOICE_PROMPT_CACHE.clear()
+            _release_memory()
+        _VOXCPM_MODEL = await asyncio.to_thread(_load_voxcpm_model_sync)
+    return _VOXCPM_MODEL
+
+
+def _voxcpm_sample_rate(model) -> int:
+    sr = getattr(getattr(model, "tts_model", None), "sample_rate", None)
+    if not sr:
+        sr = getattr(model, "sample_rate", 48000)
+    return int(sr)
+
+
+def _voice_id_for_bytes(audio_bytes: bytes) -> str:
+    return hashlib.sha256(audio_bytes).hexdigest()[:16]
+
+
+def _register_voxcpm_voice(reference_bytes: bytes, prompt_bytes=None, prompt_text=""):
+    voice_id = _voice_id_for_bytes(reference_bytes)
+    ref_dur = _bytes_audio_duration(reference_bytes) or 0.0
+    entry = {
+        "reference_bytes": reference_bytes,
+        "prompt_bytes": prompt_bytes,
+        "prompt_text": prompt_text or "",
+        "reference_duration_ms": int(round(ref_dur * 1000)),
+        "created_at": time.time(),
+    }
+    _VOXCPM_VOICES[voice_id] = entry
+    _VOXCPM_VOICES.move_to_end(voice_id)
+    while len(_VOXCPM_VOICES) > VOXCPM_VOICES_CACHE_SIZE:
+        _VOXCPM_VOICES.popitem(last=False)
+    return voice_id, entry
+
+
+def _voxcpm_voice_meta(entry) -> Dict[str, Any]:
+    return {
+        "voice_id": _voice_id_for_bytes(entry["reference_bytes"]),
+        "reference_duration_ms": entry.get("reference_duration_ms"),
+        "has_prompt": entry.get("prompt_bytes") is not None,
+        "created_at": round(entry.get("created_at") or 0.0, 3),
+    }
+
+
+def _stable_voxcpm_seed(data, text, prompt_text, reference_audio_base64, prompt_wav_base64):
+    """Deterministic seed for VoxCPM, aligned with the dubbing caller's stable_voxcpm_seed."""
+    explicit = _normalize_seed(data.get("seed") or data.get("voxcpm_seed"))
+    if explicit is not None:
+        return explicit
+    if str(os.environ.get("OMNIVOICE_DETERMINISTIC", "1")).lower() in {"0", "false", "no", "off"}:
+        return None
+    payload = {
+        "text": text,
+        "prompt_text": prompt_text,
+        "reference_audio_sha256": _sha256_text(reference_audio_base64),
+        "prompt_audio_sha256": _sha256_text(prompt_wav_base64),
+        "model_id": data.get("model_id") or _VOXCPM_MODEL_ID,
+        "cfg_value": data.get("cfg_value", 2.0),
+        "inference_timesteps": data.get("inference_timesteps", 10),
+        "denoise": _bool_option(data.get("denoise"), False),
+        "normalize": _bool_option(data.get("normalize"), False),
+        "control_instruction": data.get("control_instruction") or data.get("instruct") or "",
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return int(digest[:12], 16) % OMNIVOICE_SEED_MOD
 
 
 _LANG_CODE_ALIASES = {
@@ -2900,7 +3072,6 @@ async def models(request):
     })
 
 
-@routes.get("/api/voxcpm/status")
 @routes.get("/api/status")
 async def status(request):
     logger.info(f"[{request.method}] {request.path} from {request.remote}")
@@ -2924,7 +3095,6 @@ async def status(request):
     })
 
 
-@routes.post("/api/voxcpm/unload")
 @routes.post("/api/unload")
 async def unload(request):
     logger.info(f"[{request.method}] {request.path} from {request.remote}")
@@ -3151,7 +3321,6 @@ def _recommend_gain(levels, target_db):
     return round(max(0.2, min(5.0, 10 ** (db_change / 20.0))), 4)
 
 
-@routes.post("/api/voxcpm/synthesize")
 @routes.post("/api/synthesize")
 async def synthesize(request):
     client_ip = request.remote or "-"
@@ -3814,6 +3983,473 @@ async def synthesize(request):
             "num_step": inference_timesteps,
             "guidance_scale": cfg_value,
             "t_shift": t_shift,
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# VoxCPM2 routes: status / unload / voices registry / synthesize
+# ---------------------------------------------------------------------------
+
+@routes.get("/api/voxcpm/status")
+async def status_voxcpm(request):
+    logger.info(f"[{request.method}] {request.path} from {request.remote}")
+    cached_models = []
+    if _VOXCPM_MODEL is not None:
+        cached_models.append({
+            "model_id": _VOXCPM_MODEL_ID,
+            "device": _API_DEVICE,
+            "load_denoiser": VOXCPM_LOAD_DENOISER and _voxcpm_denoise_available(),
+            "optimize": VOXCPM_OPTIMIZE,
+        })
+    return _json_response({
+        "ok": True,
+        "engine": "voxcpm2",
+        "models_cached": len(cached_models),
+        "cached_models": cached_models,
+        "voices_cached": len(_VOXCPM_VOICES),
+        "voices_cache_size": VOXCPM_VOICES_CACHE_SIZE,
+        "exclusive_mode": _EXCLUSIVE_MODE,
+    })
+
+
+@routes.post("/api/voxcpm/unload")
+async def unload_voxcpm(request):
+    logger.info(f"[{request.method}] {request.path} from {request.remote}")
+    count = _unload_voxcpm_model_sync()
+    return _json_response({"ok": True, "engine": "voxcpm2", "unloaded": count})
+
+
+@routes.get("/api/voxcpm/voices")
+async def voxcpm_voices_list(request):
+    return _json_response({
+        "ok": True,
+        "voices": [_voxcpm_voice_meta(e) for e in _VOXCPM_VOICES.values()],
+        "count": len(_VOXCPM_VOICES),
+        "cache_size": VOXCPM_VOICES_CACHE_SIZE,
+    })
+
+
+@routes.get("/api/voxcpm/voices/{voice_id}")
+async def voxcpm_voices_get(request):
+    voice_id = request.match_info.get("voice_id", "")
+    entry = _VOXCPM_VOICES.get(voice_id)
+    if entry is None:
+        return _error(f"voice_id not found (evicted or never registered): {voice_id}", status=404)
+    return _json_response({"ok": True, **_voxcpm_voice_meta(entry)})
+
+
+@routes.post("/api/voxcpm/voices")
+async def voxcpm_voices_register(request):
+    req_id = uuid.uuid4().hex[:8]
+    client_ip = request.remote or "-"
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return _error(f"Invalid JSON body: {exc}", status=400)
+
+    ref_b64 = data.get("reference_audio_base64")
+    if not ref_b64:
+        return _error("reference_audio_base64 is required")
+    try:
+        reference_bytes = _decode_base64_audio_bytes(ref_b64)
+    except Exception as exc:
+        return _error(f"Failed to decode reference audio: {exc}")
+    if not reference_bytes:
+        return _error("Decoded reference audio is empty")
+
+    prompt_bytes = None
+    prompt_b64 = data.get("prompt_wav_base64") or data.get("prompt_audio_base64")
+    if prompt_b64:
+        try:
+            prompt_bytes = _decode_base64_audio_bytes(prompt_b64)
+        except Exception as exc:
+            return _error(f"Failed to decode prompt audio: {exc}")
+    prompt_text = str(data.get("prompt_text") or "")
+
+    voice_id, entry = _register_voxcpm_voice(reference_bytes, prompt_bytes, prompt_text)
+    logger.info(f"[{req_id}] registered voice_id={voice_id} ref_ms={entry['reference_duration_ms']}")
+    return _json_response({"ok": True, "voice_id": voice_id, **_voxcpm_voice_meta(entry)})
+
+
+@routes.delete("/api/voxcpm/voices/{voice_id}")
+async def voxcpm_voices_delete(request):
+    voice_id = request.match_info.get("voice_id", "")
+    removed = _VOXCPM_VOICES.pop(voice_id, None) is not None
+    return _json_response({"ok": True, "voice_id": voice_id, "removed": removed})
+
+
+def _generate_voxcpm_sync(
+    model,
+    text,
+    ref_path,
+    prompt_path,
+    prompt_text,
+    cfg_value,
+    inference_timesteps,
+    min_len,
+    max_len,
+    normalize,
+    denoise,
+    retry_badcase,
+    retry_badcase_max_times,
+    retry_badcase_ratio_threshold,
+    trim_silence_vad,
+    seed,
+):
+    """Run VoxCPM.generate in a worker thread. Returns a 1-D numpy waveform."""
+    kwargs = {
+        "text": text,
+        "cfg_value": float(cfg_value),
+        "inference_timesteps": int(inference_timesteps),
+        "min_len": int(min_len),
+        "max_len": int(max_len),
+        "normalize": bool(normalize),
+        "denoise": bool(denoise),
+        "retry_badcase": bool(retry_badcase),
+        "retry_badcase_max_times": int(retry_badcase_max_times),
+        "retry_badcase_ratio_threshold": float(retry_badcase_ratio_threshold),
+        "trim_silence_vad": bool(trim_silence_vad),
+        "seed": seed,
+    }
+    if ref_path is not None:
+        kwargs["reference_wav_path"] = ref_path
+    if prompt_path is not None and prompt_text:
+        kwargs["prompt_wav_path"] = prompt_path
+        kwargs["prompt_text"] = prompt_text
+    wav = model.generate(**kwargs)
+    arr = np.asarray(wav).reshape(-1).astype(np.float32)
+    return arr
+
+
+@routes.post("/api/voxcpm/synthesize")
+async def synthesize_voxcpm(request):
+    """VoxCPM2 synthesis. Mirrors the OmniVoice /api/synthesize contract.
+
+    Dual-mode cloning: ``reference_audio_base64`` (or ``voice_id``) drives timbre
+    cloning; ``prompt_wav_base64`` + ``prompt_text`` drive exact (ultimate) cloning.
+    The caller (dubbing VoxCPMBackend) already sends these as two separate fields.
+    """
+    req_id = uuid.uuid4().hex[:8]
+    client_ip = request.remote or "-"
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+    start_time = time.time()
+
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return _error(f"Invalid JSON body: {exc}", status=400)
+
+    text = re.sub(r"\s+", " ", (data.get("text") or "").strip())
+    if not text:
+        return _error("text is required and cannot be empty")
+    if len(text) > MAX_TEXT_LEN:
+        return _error(f"text exceeds max length {MAX_TEXT_LEN}")
+
+    out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve reference audio: voice_id (cached) takes precedence, else base64.
+    voice_id = str(data.get("voice_id") or "").strip()
+    ref_audio_bytes = None
+    prompt_audio_bytes = None
+    prompt_text = str(data.get("prompt_text") or "")
+
+    if voice_id:
+        entry = _VOXCPM_VOICES.get(voice_id)
+        if entry is None:
+            return _error(
+                f"voice_id not found (evicted or never registered): {voice_id}",
+                status=404,
+            )
+        ref_audio_bytes = entry.get("reference_bytes")
+        # Fall back to the registered prompt only if the request doesn't override.
+        if not data.get("prompt_wav_base64") and entry.get("prompt_bytes"):
+            prompt_audio_bytes = entry["prompt_bytes"]
+            if not prompt_text:
+                prompt_text = entry.get("prompt_text") or ""
+    else:
+        ref_b64 = data.get("reference_audio_base64")
+        if ref_b64:
+            try:
+                ref_audio_bytes = _decode_base64_audio_bytes(ref_b64)
+            except Exception as exc:
+                return _error(f"Failed to decode reference audio: {exc}")
+
+    # Prompt (ultimate cloning) audio + transcript — distinct from reference.
+    if prompt_audio_bytes is None:
+        prompt_b64 = data.get("prompt_wav_base64") or data.get("prompt_audio_base64")
+        if prompt_b64 and prompt_b64 != data.get("reference_audio_base64"):
+            try:
+                prompt_audio_bytes = _decode_base64_audio_bytes(prompt_b64)
+            except Exception:
+                prompt_audio_bytes = None
+
+    # prompt_wav without a transcript can't do ultimate cloning; demote to ref.
+    if prompt_audio_bytes and not prompt_text:
+        if ref_audio_bytes is None:
+            ref_audio_bytes = prompt_audio_bytes
+        prompt_audio_bytes = None
+
+    ref_duration = _bytes_audio_duration(ref_audio_bytes) if ref_audio_bytes else None
+
+    # Generation parameters (VoxCPM2 defaults; caller may override).
+    cfg_value = float(data.get("cfg_value", 2.0))
+    inference_timesteps = int(data.get("inference_timesteps", 10))
+    min_len = int(data.get("min_len", 2))
+    max_len = int(data.get("max_len", 4096))
+    retry_badcase = _bool_option(data.get("retry_badcase"), True)
+    retry_badcase_max_times = int(data.get("retry_badcase_max_times", 3))
+    retry_badcase_ratio_threshold = float(data.get("retry_badcase_ratio_threshold", 6.0))
+    trim_silence_vad = _bool_option(data.get("trim_silence_vad"), True)
+
+    normalize = _bool_option(data.get("normalize"), False)
+    if normalize and not _voxcpm_normalize_available():
+        logger.warning(f"[{req_id}] normalize requested but wetext/inflect not installed; skipping")
+        normalize = False
+    denoise = _bool_option(data.get("denoise"), False)
+    if denoise and not (VOXCPM_LOAD_DENOISER and _voxcpm_denoise_available()):
+        if denoise:
+            logger.warning(f"[{req_id}] denoise requested but modelscope/denoiser not available; skipping")
+        denoise = False
+
+    quality_retry = _bool_option(data.get("quality_retry"), True)
+    quality_retry_max = int(data.get("quality_retry_max", 2))
+    # control_instruction is accepted for API parity but VoxCPM2 has no
+    # instruction-following mode, so it is ignored.
+    _ = data.get("control_instruction") or data.get("instruct")
+
+    max_duration_ms = data.get("max_duration_ms")
+    try:
+        max_duration_ms = int(max_duration_ms) if max_duration_ms is not None else None
+    except (TypeError, ValueError):
+        max_duration_ms = None
+    max_duration_sec = (max_duration_ms / 1000.0) if max_duration_ms and max_duration_ms > 0 else None
+
+    language = (
+        data.get("language")
+        or data.get("target_lang")
+        or data.get("target_language")
+        or data.get("output_language_code")
+    )
+
+    seed = _stable_voxcpm_seed(
+        data, text, prompt_text,
+        data.get("reference_audio_base64") or "",
+        data.get("prompt_wav_base64") or "",
+    )
+
+    # Load model (lazy, serialized).
+    # VoxCPM needs at least a reference (timbre clone) or prompt (ultimate clone).
+    if ref_audio_bytes is None and prompt_audio_bytes is None:
+        return _error(
+            "VoxCPM synthesis requires reference_audio_base64, voice_id, "
+            "or prompt_wav_base64+prompt_text"
+        )
+
+    # Load model (lazy, serialized) — only after we know the request is valid.
+    model = await _ensure_voxcpm_model()
+    sample_rate = _voxcpm_sample_rate(model)
+
+    # Materialize temp wav paths for VoxCPM (it requires file paths).
+    ref_temp_path = None
+    prompt_temp_path = None
+    ref_path = None
+    prompt_path = None
+    try:
+        if ref_audio_bytes is not None:
+            ref_temp_path = out_dir / f"voxcpm_ref_{uuid.uuid4().hex}.wav"
+            ref_temp_path.write_bytes(ref_audio_bytes)
+            ref_path = str(ref_temp_path)
+        if prompt_audio_bytes is not None:
+            prompt_temp_path = out_dir / f"voxcpm_prompt_{uuid.uuid4().hex}.wav"
+            prompt_temp_path.write_bytes(prompt_audio_bytes)
+            prompt_path = str(prompt_temp_path)
+
+        gen_args = (
+            model,
+            text,
+            ref_path,
+            prompt_path,
+            prompt_text,
+            cfg_value,
+            inference_timesteps,
+            min_len,
+            max_len,
+            normalize,
+            denoise,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            trim_silence_vad,
+            seed,
+        )
+
+        quality_issues: list = []
+        spike_locations: list = []
+        quality_retried = False
+        attempts = 0
+
+        async with _API_INFER_SEM:
+            logger.info(f"[{req_id}] voxcpm synthesis started (cfg={cfg_value}, steps={inference_timesteps})")
+            audio_waveform = await asyncio.to_thread(_generate_voxcpm_sync, *gen_args)
+            attempts = 1
+            _issues, spike_locations = _check_audio_quality(
+                audio_waveform, sample_rate, ref_duration=ref_duration
+            )
+            quality_issues = list(_issues)
+
+            severe_labels = {"empty", "clipping", "near_clipping", "harsh_high_freq",
+                             "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete"}
+            severe = [i for i in quality_issues if i in severe_labels]
+
+            # One OmniVoice-style quality retry: bump cfg/steps and regenerate.
+            if quality_retry and severe and quality_retry_max >= 1 and "empty" not in severe:
+                retry_cfg = min(cfg_value + 0.2, 3.0)
+                retry_steps = min(int(inference_timesteps * 1.5), 64)
+                retry_args = list(gen_args)
+                retry_args[5] = retry_cfg        # cfg_value
+                retry_args[6] = retry_steps      # inference_timesteps
+                logger.info(
+                    f"[{req_id}] voxcpm quality retry: cfg {cfg_value}->{retry_cfg}, "
+                    f"steps {inference_timesteps}->{retry_steps} (issues={severe})"
+                )
+                retry_wav = await asyncio.to_thread(_generate_voxcpm_sync, *retry_args)
+                retry_issues, retry_spikes = _check_audio_quality(
+                    retry_wav, sample_rate, ref_duration=ref_duration
+                )
+                retry_severe = [i for i in retry_issues if i in severe_labels]
+                quality_retried = True
+                attempts = 2
+                # Keep whichever output has fewer severe issues.
+                if len(retry_severe) < len(severe) or (
+                    len(retry_severe) == len(severe) and len(retry_issues) <= len(quality_issues)
+                ):
+                    audio_waveform = retry_wav
+                    quality_issues = list(retry_issues)
+                    spike_locations = retry_spikes
+                    severe = retry_severe
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"[{req_id}] VoxCPM synthesis failed: {exc}\n{tb}")
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+        return _error(f"Synthesis failed: {exc}\n{tb}", status=502)
+
+    # Post-processing (reuse OmniVoice waveform helpers — all model-agnostic).
+    audio_waveform, was_trimmed = _clamp_waveform_to_max_duration(
+        audio_waveform, sample_rate, max_duration_sec
+    )
+    if was_trimmed:
+        logger.warning(
+            f"[{req_id}] voxcpm output trimmed to max_duration_ms={max_duration_ms}"
+        )
+        if "duration_off_target" not in quality_issues:
+            quality_issues.append("duration_off_target")
+
+    audio_waveform, peak_limited = _apply_peak_ceiling(audio_waveform, OUTPUT_PEAK_CEILING)
+
+    try:
+        wav_bytes = _waveform_to_wav_bytes(audio_waveform, sample_rate)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"[{req_id}] Failed to encode voxcpm output: {exc}\n{tb}")
+        _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+        return _error(f"Failed to encode output audio: {exc}\n{tb}", status=502)
+
+    key = hashlib.sha256(
+        json.dumps({
+            "engine": "voxcpm2",
+            "text": text,
+            "ref_sha": _sha256_text(data.get("reference_audio_base64") or voice_id or ""),
+            "prompt_sha": _sha256_text(data.get("prompt_wav_base64") or ""),
+            "prompt_text": prompt_text,
+            "cfg": cfg_value,
+            "steps": inference_timesteps,
+            "seed": seed,
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:20]
+    out_path = out_dir / f"voxcpm2_{key}.wav"
+    output_path_for_response = str(out_path.resolve())
+    try:
+        out_path.write_bytes(wav_bytes)
+    except Exception as exc:
+        logger.warning(f"[{req_id}] Failed to persist voxcpm output (continuing): {exc}")
+        output_path_for_response = ""
+
+    # Output text completeness QC (same language-gated path as OmniVoice).
+    text_completeness_qc = None
+    if output_path_for_response and _should_run_output_text_qc(data, language, text):
+        try:
+            text_completeness_qc = await _build_output_text_qc(
+                output_path_for_response, text, language, data
+            )
+            if text_completeness_qc.get("status") == "incomplete":
+                if "text_incomplete" not in quality_issues:
+                    quality_issues.append("text_incomplete")
+        except Exception as exc:
+            logger.warning(f"[{req_id}] voxcpm output text QC failed: {exc}")
+            text_completeness_qc = {"version": 1, "status": "error", "error": str(exc)[:500]}
+
+    elapsed = round(time.time() - start_time, 3)
+    audio_duration = round(audio_waveform.shape[-1] / sample_rate, 3)
+
+    severe_issue_labels = {"empty", "clipping", "near_clipping", "harsh_high_freq",
+                           "impulsive_spike", "plosive", "periodic_pulse",
+                           "text_incomplete", "duration_off_target", "duration_off_reference"}
+    severe_issues = sorted({i for i in quality_issues if i in severe_issue_labels})
+
+    audio_qc = None
+    if _bool_option(data.get("include_audio_qc"), True):
+        try:
+            audio_qc = _build_synth_audio_qc(
+                audio_waveform, sample_rate,
+                quality_issues=quality_issues, spike_locations=spike_locations,
+            )
+            if text_completeness_qc is not None:
+                audio_qc["text_completeness"] = text_completeness_qc
+            audio_qc["peak_limited"] = peak_limited
+            audio_qc["peak_ceiling"] = OUTPUT_PEAK_CEILING
+            audio_qc["severe_issues"] = severe_issues
+        except Exception as exc:
+            logger.warning(f"[{req_id}] Failed to build voxcpm audio_qc: {exc}")
+            audio_qc = {"version": 1, "status": "error", "error": str(exc)[:500],
+                        "severe_issues": severe_issues}
+
+    logger.info(
+        f"[{req_id}] voxcpm synthesis finished in {elapsed}s, audio_duration={audio_duration}s, "
+        f"attempts={attempts}, quality_issues={quality_issues}, "
+        f"quality_retried={quality_retried}, severe_issues={severe_issues}"
+    )
+
+    output_base64 = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
+    _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+
+    return _json_response({
+        "ok": True,
+        "engine": "voxcpm2",
+        "audio_base64": output_base64,
+        "output_path": output_path_for_response,
+        "relative_path": _relative_path(Path(output_path_for_response)) if output_path_for_response else "",
+        "elapsed_seconds": elapsed,
+        "audio_duration_seconds": audio_duration,
+        "max_duration_ms": max_duration_ms,
+        "voice_id": voice_id or None,
+        "seed": seed,
+        "duration_attempts": attempts,
+        "quality_issues": quality_issues,
+        "quality_retried": quality_retried,
+        "severe_issues": severe_issues,
+        "audio_qc": audio_qc or {},
+        "duration_match": {
+            "ref_duration": ref_duration,
+            "actual_duration": audio_duration,
+            "match_ratio": round(audio_duration / ref_duration, 3) if ref_duration and audio_duration else None,
+        },
+        "adaptive_params": {
+            "ref_duration": ref_duration,
+            "num_step": inference_timesteps,
+            "guidance_scale": cfg_value,
         },
     })
 
