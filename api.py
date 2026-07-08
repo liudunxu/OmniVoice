@@ -1778,6 +1778,8 @@ _LANG_CODE_ALIASES = {
     "tl": "fil",
     "filipino": "fil",
 }
+_CJK_SCRIPT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_CJK_PROMPT_LANGUAGE_CODES = {"zh", "ja", "ko", "yue", "cmn", "zho", "jpn", "kor"}
 
 
 def _resolve_language(value):
@@ -1795,6 +1797,21 @@ def _resolve_language(value):
     if raw.lower() in _LANG_CODE_ALIASES:
         return _LANG_CODE_ALIASES[raw.lower()]
     return raw
+
+
+def _language_allows_cjk_prompt(language) -> bool:
+    resolved = _resolve_language(language)
+    code = str(resolved or language or "").strip().lower().split("-", 1)[0]
+    return code in _CJK_PROMPT_LANGUAGE_CODES
+
+
+def _sanitize_cross_language_prompt_text(prompt_text: str, language) -> str:
+    prompt_text = re.sub(r"\s+", " ", (prompt_text or "").strip())
+    if not prompt_text:
+        return ""
+    if _CJK_SCRIPT_RE.search(prompt_text) and not _language_allows_cjk_prompt(language):
+        return ""
+    return prompt_text
 
 
 def _create_voice_clone_prompt(
@@ -3052,6 +3069,13 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
     actual_tokens = _text_qc_tokens(actual_text)
     coverage = _lcs_coverage(expected_tokens, actual_tokens)
     status = "pass" if coverage >= OUTPUT_TEXT_QC_MIN_COVERAGE else "incomplete"
+    source_script_residue = (
+        bool(actual_text)
+        and _CJK_SCRIPT_RE.search(actual_text) is not None
+        and not _language_allows_cjk_prompt(code)
+    )
+    if source_script_residue:
+        status = "incomplete"
     return {
         "version": 1,
         "status": status,
@@ -3065,6 +3089,7 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
         "actual_text": actual_text[:500],
         "whisper_language": result.get("language"),
         "whisper_language_probability": result.get("language_probability"),
+        "source_script_residue": source_script_residue,
     }
 
 
@@ -3390,9 +3415,20 @@ async def synthesize(request):
         logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}")
         return _error(f"text exceeds max length {MAX_TEXT_LEN}.")
 
+    language = (
+        data.get("language")
+        or data.get("target_lang")
+        or data.get("target_language")
+        or data.get("output_language_code")
+    )
     reference_audio_base64 = data.get("reference_audio_base64")
     prompt_wav_base64 = data.get("prompt_wav_base64") or data.get("prompt_audio_base64") or data.get("prompt_wav")
-    prompt_text = re.sub(r"\s+", " ", (data.get("prompt_text") or "").strip())
+    raw_prompt_text = re.sub(r"\s+", " ", (data.get("prompt_text") or "").strip())
+    prompt_text = _sanitize_cross_language_prompt_text(raw_prompt_text, language)
+    if raw_prompt_text and not prompt_text:
+        logger.info(
+            f"[{req_id}] dropped cross-language prompt_text for target language={language!r}"
+        )
     effective_prompt_text = (
         prompt_text if (reference_audio_base64 or prompt_wav_base64) else ""
     )
@@ -3404,6 +3440,10 @@ async def synthesize(request):
         alternate_refs = [alternate_refs]
     if isinstance(alternate_texts, str):
         alternate_texts = [alternate_texts]
+    alternate_texts = [
+        _sanitize_cross_language_prompt_text(str(text or ""), language)
+        for text in alternate_texts
+    ]
 
     # Get user-specified values (None means use adaptive defaults)
     user_cfg = data.get("cfg_value")
@@ -3740,12 +3780,6 @@ async def synthesize(request):
             f"and break exact duration matching."
         )
 
-    language = (
-        data.get("language")
-        or data.get("target_lang")
-        or data.get("target_language")
-        or data.get("output_language_code")
-    )
     instruct = data.get("instruct")
 
     gen_kwargs = {
@@ -3948,6 +3982,8 @@ async def synthesize(request):
                 quality_issues = list(quality_issues)
                 if "text_incomplete" not in quality_issues:
                     quality_issues.append("text_incomplete")
+                if text_completeness_qc.get("source_script_residue") and "source_script_residue" not in quality_issues:
+                    quality_issues.append("source_script_residue")
                 logger.warning(
                     f"[{req_id}] Output text completeness issue: "
                     f"coverage={text_completeness_qc.get('coverage')}, "
