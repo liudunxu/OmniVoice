@@ -4322,6 +4322,34 @@ async def synthesize_voxcpm(request):
 
     ref_duration = _bytes_audio_duration(ref_audio_bytes) if ref_audio_bytes else None
 
+    # Continuation (ultimate cloning) mode sanity check: if the prompt transcript
+    # does not match the prompt audio (e.g. an inaccurate source-line
+    # transcription), continuation cloning introduces badcase — the model tries
+    # to align mismatched text/audio. When the prompt text's estimated natural
+    # duration diverges too far from the prompt audio duration, demote to
+    # reference-only cloning (drop prompt_wav/prompt_text) so only the timbre
+    # anchor is used. The dubbing emotion_prompt path is the main caller.
+    prompt_demoted_to_ref = False
+    if prompt_audio_bytes and prompt_text:
+        prompt_wav_duration = _bytes_audio_duration(prompt_audio_bytes)
+        if prompt_wav_duration and prompt_wav_duration > 0:
+            prompt_text_natural = _estimate_natural_duration(prompt_text, None, None)
+            ratio = prompt_text_natural / prompt_wav_duration
+            # Allow a wide band: transcription may trim filler words or split
+            # mid-phrase. Only reject clear mismatches (<0.35 or >3.0).
+            if ratio < 0.35 or ratio > 3.0:
+                logger.warning(
+                    f"[{req_id}] voxcpm prompt/text mismatch "
+                    f"(prompt_text~{prompt_text_natural:.2f}s vs prompt_wav={prompt_wav_duration:.2f}s "
+                    f"ratio={ratio:.2f}); demoting to reference-only cloning"
+                )
+                if ref_audio_bytes is None:
+                    ref_audio_bytes = prompt_audio_bytes
+                    ref_duration = prompt_wav_duration
+                prompt_audio_bytes = None
+                prompt_text = ""
+                prompt_demoted_to_ref = True
+
     # Generation parameters (VoxCPM2 defaults; caller may override).
     cfg_value = float(data.get("cfg_value", 2.0))
     inference_timesteps = int(data.get("inference_timesteps", 10))
@@ -4644,6 +4672,7 @@ async def synthesize_voxcpm(request):
         "audio_duration_seconds": audio_duration,
         "max_duration_ms": max_duration_ms,
         "duration_cap_relaxed": duration_cap_relaxed,
+        "prompt_demoted_to_ref": prompt_demoted_to_ref,
         "voice_id": voice_id or None,
         "seed": seed,
         "duration_attempts": attempts,
