@@ -55,14 +55,16 @@ dependencies = [
     "safetensors",
     "huggingface-hub",
     # VoxCPM2 quality helpers: text normalization (numbers/dates/etc.) and
-    # ZipEnhancer denoising of reference/prompt audio. simplejson is an implicit
-    # runtime dependency of modelscope's config loader.
+    # ZipEnhancer denoising of reference/prompt audio. simplejson and
+    # sortedcontainers are implicit runtime dependencies of modelscope's config
+    # loader.
     "wetext",
     "inflect",
     "modelscope",
     "addict>=2.4.0",
     "datasets>=5.0.0",
     "simplejson",
+    "sortedcontainers",
 ]
 
 [project.optional-dependencies]
