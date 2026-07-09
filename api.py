@@ -329,6 +329,10 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         and active_ratio < 0.80
         and active_speech_ratio < 0.80
     )
+    # Defensive guard: if the clip is almost entirely active speech, the SNR
+    # estimate is not meaningful regardless of the computed value.
+    if active_ratio is not None and active_ratio >= 0.80 and active_speech_ratio >= 0.80:
+        snr_reliable = False
 
     issues = []
     if active_ratio is not None and active_ratio < 0.30:
@@ -358,6 +362,33 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         "is_poor": bool(issues),
         "issues": issues,
     }
+
+
+def _normalize_audio_peak(audio_bytes: bytes, target_peak: float = 0.88) -> bytes:
+    """Re-encode audio bytes with peak scaled to ``target_peak``.
+
+    Only scales downward; quiet references are left untouched. Returns the
+    original bytes on decode/encode errors so synthesis can still proceed.
+    """
+    if not audio_bytes:
+        return audio_bytes
+    try:
+        data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+        data = data.T
+        if data.shape[0] > 1:
+            data = np.mean(data, axis=0, keepdims=True)
+        arr = data.reshape(-1)
+        if arr.size == 0:
+            return audio_bytes
+        peak = float(np.max(np.abs(arr)))
+        if peak <= target_peak:
+            return audio_bytes
+        arr = arr * (target_peak / peak)
+        out = io.BytesIO()
+        sf.write(out, arr, sr, subtype="PCM_16", format="WAV")
+        return out.getvalue()
+    except Exception:
+        return audio_bytes
 
 
 def _select_quality_profile(
@@ -2767,6 +2798,17 @@ def _apply_peak_ceiling(waveform, ceiling: float = OUTPUT_PEAK_CEILING):
     return scaled.astype(np.float32), True
 
 
+def _check_audio_quality_after_ceiling(
+    waveform,
+    sampling_rate: int,
+    ceiling: float = OUTPUT_PEAK_CEILING,
+    **kwargs,
+):
+    """Run QC after peak limiting so transient overshoots don't drive retries."""
+    limited, _ = _apply_peak_ceiling(waveform, ceiling)
+    return _check_audio_quality(limited, sampling_rate, **kwargs)
+
+
 def _check_audio_quality(
     waveform,
     sampling_rate: int,
@@ -4343,6 +4385,34 @@ def _voxcpm_adaptive_params(
     return adaptive_cfg, adaptive_steps, reason
 
 
+def _voxcpm_retry_params(
+    cfg_value: float,
+    inference_timesteps: int,
+    severe_issues: list[str],
+) -> tuple[float, int, bool]:
+    """Choose VoxCPM quality-retry cfg/steps and normalize override.
+
+    Higher cfg + steps helps silence/empty/duration misses, but hurts clipping
+    and near-clipping by pushing the model toward stronger, sharper peaks. For
+    clipping-style issues we lower cfg and only modestly raise steps; for
+    everything else we keep the original aggressive bump.
+
+    Returns ``(retry_cfg, retry_steps, disable_normalize)``.
+    """
+    severe_set = set(severe_issues)
+    is_clipping = bool(severe_set & {"clipping", "near_clipping"})
+    if is_clipping:
+        retry_cfg = max(cfg_value - 0.15, 1.5)
+        retry_steps = min(int(inference_timesteps * 1.1), 48)
+    else:
+        retry_cfg = min(cfg_value + 0.2, 3.0)
+        retry_steps = min(int(inference_timesteps * 1.25), 48)
+    # Aggressive text normalization can amplify plosives/edge artifacts when the
+    # output is already too bright; disable it for clipping-related retries.
+    disable_normalize = bool(is_clipping and "harsh_high_freq" in severe_set)
+    return retry_cfg, retry_steps, disable_normalize
+
+
 def _detect_prompt_leak(
     generated_waveform,
     sample_rate: int,
@@ -4700,6 +4770,11 @@ async def synthesize_voxcpm(request):
             max_duration_sec = None
             max_duration_ms = None
             duration_cap_relaxed = True
+            # Since the caller will atempo-fit the full audio downstream, chasing
+            # an exact target duration is wasted work and likely produces false
+            # duration_off_target flags.
+            target_duration_sec = None
+            duration_tolerance_sec = None
 
     language = (
         data.get("language")
@@ -4733,6 +4808,15 @@ async def synthesize_voxcpm(request):
     prompt_path = None
     try:
         if ref_audio_bytes is not None:
+            ref_peak = (_assess_reference_quality(ref_audio_bytes) or {}).get("peak")
+            if ref_peak is not None and ref_peak > 0.95:
+                normalized_bytes = _normalize_audio_peak(ref_audio_bytes, target_peak=0.88)
+                if normalized_bytes is not ref_audio_bytes:
+                    logger.info(
+                        f"[{req_id}] voxcpm reference peak {ref_peak:.3f} > 0.95; "
+                        f"normalizing to 0.88 before voice cloning"
+                    )
+                    ref_audio_bytes = normalized_bytes
             ref_temp_path = out_dir / f"voxcpm_ref_{uuid.uuid4().hex}.wav"
             ref_temp_path.write_bytes(ref_audio_bytes)
             ref_path = str(ref_temp_path)
@@ -4807,7 +4891,7 @@ async def synthesize_voxcpm(request):
             logger.info(f"[{req_id}] voxcpm synthesis started (cfg={cfg_value}, steps={inference_timesteps})")
             audio_waveform = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **gen_kwargs)
             attempts = 1
-            _issues, spike_locations = _check_audio_quality(
+            _issues, spike_locations = _check_audio_quality_after_ceiling(
                 audio_waveform, sample_rate,
                 target_duration=target_duration_sec,
                 duration_tolerance=duration_tolerance_sec,
@@ -4827,19 +4911,25 @@ async def synthesize_voxcpm(request):
                 and not (duration_cap_relaxed and i == "duration_off_target")
             ]
 
-            # One OmniVoice-style quality retry: bump cfg/steps and regenerate.
+            # One OmniVoice-style quality retry: choose params based on the
+            # severe issue type so we don't push clipping cases toward higher
+            # cfg/steps.
             if quality_retry and severe and quality_retry_max >= 1 and "empty" not in severe:
-                retry_cfg = min(cfg_value + 0.2, 3.0)
-                retry_steps = min(int(inference_timesteps * 1.25), 48)
+                retry_cfg, retry_steps, retry_disable_normalize = _voxcpm_retry_params(
+                    cfg_value, inference_timesteps, severe
+                )
                 retry_kwargs = dict(gen_kwargs)
                 retry_kwargs["cfg_value"] = retry_cfg
                 retry_kwargs["inference_timesteps"] = retry_steps
+                if retry_disable_normalize:
+                    retry_kwargs["normalize"] = False
                 logger.info(
                     f"[{req_id}] voxcpm quality retry: cfg {cfg_value}->{retry_cfg}, "
-                    f"steps {inference_timesteps}->{retry_steps} (issues={severe})"
+                    f"steps {inference_timesteps}->{retry_steps} "
+                    f"(issues={severe}, disable_normalize={retry_disable_normalize})"
                 )
                 retry_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **retry_kwargs)
-                retry_issues, retry_spikes = _check_audio_quality(
+                retry_issues, retry_spikes = _check_audio_quality_after_ceiling(
                     retry_wav, sample_rate,
                     target_duration=target_duration_sec,
                     duration_tolerance=duration_tolerance_sec,
@@ -4860,11 +4950,13 @@ async def synthesize_voxcpm(request):
                     quality_issues = list(retry_issues)
                     spike_locations = retry_spikes
                     severe = retry_severe
-                    # Persist the raised cfg/steps into gen_kwargs so downstream
+                    # Persist the chosen retry params into gen_kwargs so downstream
                     # retries (duration, leak, language regen) start from the
                     # parameters that produced the chosen audio.
                     gen_kwargs["cfg_value"] = retry_cfg
                     gen_kwargs["inference_timesteps"] = retry_steps
+                    if retry_disable_normalize:
+                        gen_kwargs["normalize"] = False
 
             # VoxCPM has no direct duration control knob. If the first chosen
             # candidate is clearly off the cue target, try one fresh seed and keep
@@ -4887,7 +4979,7 @@ async def synthesize_voxcpm(request):
                 )
                 duration_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **duration_kwargs)
                 attempts += 1
-                duration_issues, duration_spikes = _check_audio_quality(
+                duration_issues, duration_spikes = _check_audio_quality_after_ceiling(
                     duration_wav, sample_rate,
                     target_duration=target_duration_sec,
                     duration_tolerance=duration_tolerance_sec,
