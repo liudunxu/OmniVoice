@@ -4365,26 +4365,28 @@ def _build_voxcpm_prompt_cache_sync(
     return model.tts_model.build_prompt_cache(**kwargs)
 
 
-def _generate_voxcpm_sync(
-    model,
-    text,
-    ref_path,
-    prompt_path,
-    prompt_text,
-    cfg_value,
-    inference_timesteps,
-    min_len,
-    max_len,
-    normalize,
-    denoise,
-    retry_badcase,
-    retry_badcase_max_times,
-    retry_badcase_ratio_threshold,
-    trim_silence_vad,
-    seed,
-    prompt_cache=None,
-):
-    """Run VoxCPM.generate in a worker thread. Returns a 1-D numpy waveform."""
+def _generate_voxcpm_sync(model, text, **kwargs):
+    """Run VoxCPM.generate in a worker thread. Returns a 1-D numpy waveform.
+
+    Accepts all generation parameters as keyword arguments to avoid brittle
+    positional-index manipulation in retry logic.
+    """
+    ref_path = kwargs.get("ref_path")
+    prompt_path = kwargs.get("prompt_path")
+    prompt_text = kwargs.get("prompt_text", "")
+    cfg_value = float(kwargs.get("cfg_value", 2.0))
+    inference_timesteps = int(kwargs.get("inference_timesteps", 10))
+    min_len = int(kwargs.get("min_len", 2))
+    max_len = int(kwargs.get("max_len", 4096))
+    normalize = bool(kwargs.get("normalize", False))
+    denoise = bool(kwargs.get("denoise", False))
+    retry_badcase = bool(kwargs.get("retry_badcase", True))
+    retry_badcase_max_times = int(kwargs.get("retry_badcase_max_times", 3))
+    retry_badcase_ratio_threshold = float(kwargs.get("retry_badcase_ratio_threshold", 6.0))
+    trim_silence_vad = bool(kwargs.get("trim_silence_vad", True))
+    seed = kwargs.get("seed")
+    prompt_cache = kwargs.get("prompt_cache")
+
     if prompt_cache is not None:
         if normalize:
             if model.text_normalizer is None:
@@ -4394,36 +4396,36 @@ def _generate_voxcpm_sync(
         wav, _, _ = model.tts_model.generate_with_prompt_cache(
             target_text=text,
             prompt_cache=prompt_cache,
-            cfg_value=float(cfg_value),
-            inference_timesteps=int(inference_timesteps),
-            min_len=int(min_len),
-            max_len=int(max_len),
-            retry_badcase=bool(retry_badcase),
-            retry_badcase_max_times=int(retry_badcase_max_times),
-            retry_badcase_ratio_threshold=float(retry_badcase_ratio_threshold),
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            min_len=min_len,
+            max_len=max_len,
+            retry_badcase=retry_badcase,
+            retry_badcase_max_times=retry_badcase_max_times,
+            retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
             seed=seed,
         )
     else:
-        kwargs = {
+        gen_kwargs = {
             "text": text,
-            "cfg_value": float(cfg_value),
-            "inference_timesteps": int(inference_timesteps),
-            "min_len": int(min_len),
-            "max_len": int(max_len),
-            "normalize": bool(normalize),
-            "denoise": bool(denoise),
-            "retry_badcase": bool(retry_badcase),
-            "retry_badcase_max_times": int(retry_badcase_max_times),
-            "retry_badcase_ratio_threshold": float(retry_badcase_ratio_threshold),
-            "trim_silence_vad": bool(trim_silence_vad),
+            "cfg_value": cfg_value,
+            "inference_timesteps": inference_timesteps,
+            "min_len": min_len,
+            "max_len": max_len,
+            "normalize": normalize,
+            "denoise": denoise,
+            "retry_badcase": retry_badcase,
+            "retry_badcase_max_times": retry_badcase_max_times,
+            "retry_badcase_ratio_threshold": retry_badcase_ratio_threshold,
+            "trim_silence_vad": trim_silence_vad,
             "seed": seed,
         }
         if ref_path is not None:
-            kwargs["reference_wav_path"] = ref_path
+            gen_kwargs["reference_wav_path"] = ref_path
         if prompt_path is not None and prompt_text:
-            kwargs["prompt_wav_path"] = prompt_path
-            kwargs["prompt_text"] = prompt_text
-        wav = model.generate(**kwargs)
+            gen_kwargs["prompt_wav_path"] = prompt_path
+            gen_kwargs["prompt_text"] = prompt_text
+        wav = model.generate(**gen_kwargs)
     arr = np.asarray(wav).reshape(-1).astype(np.float32)
     return arr
 
@@ -4691,25 +4693,23 @@ async def synthesize_voxcpm(request):
                         _VOXCPM_VOICES.move_to_end(voice_id)
                 logger.info(f"[{req_id}] voxcpm prompt cache built")
 
-        gen_args = (
-            model,
-            text,
-            ref_path,
-            prompt_path,
-            prompt_text,
-            cfg_value,
-            inference_timesteps,
-            min_len,
-            max_len,
-            normalize,
-            denoise,
-            retry_badcase,
-            retry_badcase_max_times,
-            retry_badcase_ratio_threshold,
-            trim_silence_vad,
-            seed,
-            prompt_cache,
-        )
+        gen_kwargs = {
+            "ref_path": ref_path,
+            "prompt_path": prompt_path,
+            "prompt_text": prompt_text,
+            "cfg_value": cfg_value,
+            "inference_timesteps": inference_timesteps,
+            "min_len": min_len,
+            "max_len": max_len,
+            "normalize": normalize,
+            "denoise": denoise,
+            "retry_badcase": retry_badcase,
+            "retry_badcase_max_times": retry_badcase_max_times,
+            "retry_badcase_ratio_threshold": retry_badcase_ratio_threshold,
+            "trim_silence_vad": trim_silence_vad,
+            "seed": seed,
+            "prompt_cache": prompt_cache,
+        }
 
         quality_issues: list = []
         spike_locations: list = []
@@ -4718,7 +4718,7 @@ async def synthesize_voxcpm(request):
 
         async with _API_INFER_SEM:
             logger.info(f"[{req_id}] voxcpm synthesis started (cfg={cfg_value}, steps={inference_timesteps})")
-            audio_waveform = await asyncio.to_thread(_generate_voxcpm_sync, *gen_args)
+            audio_waveform = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **gen_kwargs)
             attempts = 1
             _issues, spike_locations = _check_audio_quality(
                 audio_waveform, sample_rate,
@@ -4737,14 +4737,14 @@ async def synthesize_voxcpm(request):
             if quality_retry and severe and quality_retry_max >= 1 and "empty" not in severe:
                 retry_cfg = min(cfg_value + 0.2, 3.0)
                 retry_steps = min(int(inference_timesteps * 1.5), 64)
-                retry_args = list(gen_args)
-                retry_args[5] = retry_cfg        # cfg_value
-                retry_args[6] = retry_steps      # inference_timesteps
+                retry_kwargs = dict(gen_kwargs)
+                retry_kwargs["cfg_value"] = retry_cfg
+                retry_kwargs["inference_timesteps"] = retry_steps
                 logger.info(
                     f"[{req_id}] voxcpm quality retry: cfg {cfg_value}->{retry_cfg}, "
                     f"steps {inference_timesteps}->{retry_steps} (issues={severe})"
                 )
-                retry_wav = await asyncio.to_thread(_generate_voxcpm_sync, *retry_args)
+                retry_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **retry_kwargs)
                 retry_issues, retry_spikes = _check_audio_quality(
                     retry_wav, sample_rate,
                     target_duration=target_duration_sec,
@@ -4762,14 +4762,11 @@ async def synthesize_voxcpm(request):
                     quality_issues = list(retry_issues)
                     spike_locations = retry_spikes
                     severe = retry_severe
-                # Track the cfg/steps that produced the chosen audio, so the
-                # prompt-leak retry below regenerates from the same (possibly
-                # raised) parameters instead of the original gen_args.
-                leak_base_cfg = retry_cfg
-                leak_base_steps = retry_steps
-            else:
-                leak_base_cfg = cfg_value
-                leak_base_steps = inference_timesteps
+                    # Persist the raised cfg/steps into gen_kwargs so downstream
+                    # retries (duration, leak, language regen) start from the
+                    # parameters that produced the chosen audio.
+                    gen_kwargs["cfg_value"] = retry_cfg
+                    gen_kwargs["inference_timesteps"] = retry_steps
 
             # VoxCPM has no direct duration control knob. If the first chosen
             # candidate is clearly off the cue target, try one fresh seed and keep
@@ -4780,14 +4777,14 @@ async def synthesize_voxcpm(request):
                 and "duration_off_target" in quality_issues
                 and quality_retry_max >= 2
             ):
-                duration_args = list(gen_args)
-                duration_args[15] = ((seed or 0) + 13) % (2**31 - 1)
-                duration_new_seed = duration_args[15]
+                duration_kwargs = dict(gen_kwargs)
+                duration_kwargs["seed"] = ((seed or 0) + 13) % (2**31 - 1)
+                duration_new_seed = duration_kwargs["seed"]
                 logger.info(
                     f"[{req_id}] voxcpm duration candidate retry "
                     f"(target={target_duration_sec:.3f}s, new seed={duration_new_seed})"
                 )
-                duration_wav = await asyncio.to_thread(_generate_voxcpm_sync, *duration_args)
+                duration_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **duration_kwargs)
                 attempts += 1
                 duration_issues, duration_spikes = _check_audio_quality(
                     duration_wav, sample_rate,
@@ -4831,16 +4828,17 @@ async def synthesize_voxcpm(request):
                     audio_waveform, sample_rate, prompt_audio_bytes
                 )
                 if leak_detected:
-                    leak_args = list(gen_args)
-                    leak_args[15] = (seed + 1) % (2**31 - 1)  # bump seed
-                    leak_args[5] = leak_base_cfg               # keep raised cfg
-                    leak_args[6] = min(leak_base_steps + 2, 64)  # one more diffusion step
-                    leak_new_seed = leak_args[15]
+                    leak_kwargs = dict(gen_kwargs)
+                    leak_kwargs["seed"] = (seed + 1) % (2**31 - 1)  # bump seed
+                    leak_kwargs["inference_timesteps"] = min(
+                        gen_kwargs["inference_timesteps"] + 2, 64
+                    )  # one more diffusion step
+                    leak_new_seed = leak_kwargs["seed"]
                     logger.info(
                         f"[{req_id}] voxcpm prompt-leak retry "
                         f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_new_seed})"
                     )
-                    leak_wav = await asyncio.to_thread(_generate_voxcpm_sync, *leak_args)
+                    leak_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **leak_kwargs)
                     attempts += 1
                     retry_detected, retry_leak = _detect_prompt_leak(
                         leak_wav, sample_rate, prompt_audio_bytes
@@ -4943,9 +4941,9 @@ async def synthesize_voxcpm(request):
         and quality_retry
         and _qc_language_mismatch_triggers_retry(text_completeness_qc, language)
     ):
-        regen_args = list(gen_args)
-        regen_args[15] = ((seed or 0) + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
-        regen_new_seed = regen_args[15]
+        regen_kwargs = dict(gen_kwargs)
+        regen_kwargs["seed"] = ((seed or 0) + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
+        regen_new_seed = regen_kwargs["seed"]
         logger.info(
             f"[{req_id}] voxcpm language-mismatch regenerate "
             f"(detected={text_completeness_qc.get('whisper_language')} "
@@ -4954,7 +4952,7 @@ async def synthesize_voxcpm(request):
         )
         try:
             async with _API_INFER_SEM:
-                regen_wav = await asyncio.to_thread(_generate_voxcpm_sync, *regen_args)
+                regen_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **regen_kwargs)
             attempts += 1
             lang_regen = True
             regen_wav, _ = _clamp_waveform_to_max_duration(regen_wav, sample_rate, max_duration_sec)
