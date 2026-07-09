@@ -3682,8 +3682,11 @@ async def synthesize(request):
         logger.warning(f"[{req_id}] Missing text parameter")
         return _error("text is required and cannot be empty.")
     if len(text) > MAX_TEXT_LEN:
-        logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}; truncating to max length")
-        text = text[:MAX_TEXT_LEN]
+        logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}; rejecting request")
+        return _error(
+            f"text length ({len(text)}) exceeds MAX_TEXT_LEN ({MAX_TEXT_LEN}); split the input into shorter cues.",
+            status=400,
+        )
 
     language = (
         data.get("language")
@@ -4779,8 +4782,11 @@ async def synthesize_voxcpm(request):
     if not text:
         return _error("text is required and cannot be empty")
     if len(text) > MAX_TEXT_LEN:
-        logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}; truncating to max length")
-        text = text[:MAX_TEXT_LEN]
+        logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}; rejecting request")
+        return _error(
+            f"text length ({len(text)}) exceeds MAX_TEXT_LEN ({MAX_TEXT_LEN}); split the input into shorter cues.",
+            status=400,
+        )
 
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -5151,35 +5157,40 @@ async def synthesize_voxcpm(request):
                     f"steps {inference_timesteps}->{retry_steps} "
                     f"(issues={severe}, disable_normalize={retry_disable_normalize})"
                 )
-                retry_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **retry_kwargs)
-                retry_issues, retry_spikes = _check_audio_quality_after_ceiling(
-                    retry_wav, sample_rate,
-                    target_duration=target_duration_sec,
-                    duration_tolerance=duration_tolerance_sec,
-                    ref_duration=ref_duration,
-                )
-                retry_severe = [
-                    i for i in retry_issues
-                    if i in _SEVERE_ISSUE_LABELS
-                    and not (duration_cap_relaxed and i == "duration_off_target")
-                ]
                 quality_retried = True
-                attempts = 2
-                # Keep whichever output has fewer severe issues.
-                if len(retry_severe) < len(severe) or (
-                    len(retry_severe) == len(severe) and len(retry_issues) <= len(quality_issues)
-                ):
-                    audio_waveform = retry_wav
-                    quality_issues = list(retry_issues)
-                    spike_locations = retry_spikes
-                    severe = retry_severe
-                    # Persist the chosen retry params into gen_kwargs so downstream
-                    # retries (duration, leak, language regen) start from the
-                    # parameters that produced the chosen audio.
-                    gen_kwargs["cfg_value"] = retry_cfg
-                    gen_kwargs["inference_timesteps"] = retry_steps
-                    if retry_disable_normalize:
-                        gen_kwargs["normalize"] = False
+                attempts += 1
+                try:
+                    retry_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **retry_kwargs)
+                    retry_issues, retry_spikes = _check_audio_quality_after_ceiling(
+                        retry_wav, sample_rate,
+                        target_duration=target_duration_sec,
+                        duration_tolerance=duration_tolerance_sec,
+                        ref_duration=ref_duration,
+                    )
+                    retry_severe = [
+                        i for i in retry_issues
+                        if i in _SEVERE_ISSUE_LABELS
+                        and not (duration_cap_relaxed and i == "duration_off_target")
+                    ]
+                    # Keep whichever output has fewer severe issues.
+                    if len(retry_severe) < len(severe) or (
+                        len(retry_severe) == len(severe) and len(retry_issues) <= len(quality_issues)
+                    ):
+                        audio_waveform = retry_wav
+                        quality_issues = list(retry_issues)
+                        spike_locations = retry_spikes
+                        severe = retry_severe
+                        # Persist the chosen retry params into gen_kwargs so downstream
+                        # retries (duration, leak, language regen) start from the
+                        # parameters that produced the chosen audio.
+                        gen_kwargs["cfg_value"] = retry_cfg
+                        gen_kwargs["inference_timesteps"] = retry_steps
+                        if retry_disable_normalize:
+                            gen_kwargs["normalize"] = False
+                except Exception as exc:
+                    logger.warning(
+                        f"[{req_id}] voxcpm quality retry failed; keeping first candidate: {exc}"
+                    )
 
             # VoxCPM has no direct duration control knob. If the first chosen
             # candidate is clearly off the cue target, try one fresh seed and keep
@@ -5194,49 +5205,54 @@ async def synthesize_voxcpm(request):
                 and not duration_cap_relaxed
             ):
                 duration_kwargs = dict(gen_kwargs)
-                duration_kwargs["seed"] = ((seed or 0) + 13) % (2**31 - 1)
+                duration_kwargs["seed"] = ((_normalize_seed(seed) or 0) + 13) % OMNIVOICE_SEED_MOD
                 duration_new_seed = duration_kwargs["seed"]
                 logger.info(
                     f"[{req_id}] voxcpm duration candidate retry "
                     f"(target={target_duration_sec:.3f}s, new seed={duration_new_seed})"
                 )
-                duration_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **duration_kwargs)
                 attempts += 1
-                duration_issues, duration_spikes = _check_audio_quality_after_ceiling(
-                    duration_wav, sample_rate,
-                    target_duration=target_duration_sec,
-                    duration_tolerance=duration_tolerance_sec,
-                    ref_duration=ref_duration,
-                )
-                current_severe = [
-                    i for i in quality_issues
-                    if i in _SEVERE_ISSUE_LABELS
-                    and not (duration_cap_relaxed and i == "duration_off_target")
-                ]
-                duration_severe = [
-                    i for i in duration_issues
-                    if i in _SEVERE_ISSUE_LABELS
-                    and not (duration_cap_relaxed and i == "duration_off_target")
-                ]
-                current_error = _duration_error(audio_waveform, sample_rate, target_duration_sec)
-                duration_error = _duration_error(duration_wav, sample_rate, target_duration_sec)
-                if len(duration_severe) < len(current_severe) or (
-                    len(duration_severe) == len(current_severe)
-                    and duration_error + 0.03 < current_error
-                ):
-                    audio_waveform = duration_wav
-                    quality_issues = list(duration_issues)
-                    spike_locations = duration_spikes
-                    severe = duration_severe
-                    logger.info(
-                        f"[{req_id}] voxcpm duration candidate accepted "
-                        f"(error {current_error:.3f}s->{duration_error:.3f}s, issues={duration_issues})"
+                try:
+                    duration_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **duration_kwargs)
+                    duration_issues, duration_spikes = _check_audio_quality_after_ceiling(
+                        duration_wav, sample_rate,
+                        target_duration=target_duration_sec,
+                        duration_tolerance=duration_tolerance_sec,
+                        ref_duration=ref_duration,
                     )
-                else:
-                    logger.info(
-                        f"[{req_id}] voxcpm duration candidate rejected "
-                        f"(error {duration_error:.3f}s vs current {current_error:.3f}s, "
-                        f"issues={duration_issues})"
+                    current_severe = [
+                        i for i in quality_issues
+                        if i in _SEVERE_ISSUE_LABELS
+                        and not (duration_cap_relaxed and i == "duration_off_target")
+                    ]
+                    duration_severe = [
+                        i for i in duration_issues
+                        if i in _SEVERE_ISSUE_LABELS
+                        and not (duration_cap_relaxed and i == "duration_off_target")
+                    ]
+                    current_error = _duration_error(audio_waveform, sample_rate, target_duration_sec)
+                    duration_error = _duration_error(duration_wav, sample_rate, target_duration_sec)
+                    if len(duration_severe) < len(current_severe) or (
+                        len(duration_severe) == len(current_severe)
+                        and duration_error + 0.03 < current_error
+                    ):
+                        audio_waveform = duration_wav
+                        quality_issues = list(duration_issues)
+                        spike_locations = duration_spikes
+                        severe = duration_severe
+                        logger.info(
+                            f"[{req_id}] voxcpm duration candidate accepted "
+                            f"(error {current_error:.3f}s->{duration_error:.3f}s, issues={duration_issues})"
+                        )
+                    else:
+                        logger.info(
+                            f"[{req_id}] voxcpm duration candidate rejected "
+                            f"(error {duration_error:.3f}s vs current {current_error:.3f}s, "
+                            f"issues={duration_issues})"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"[{req_id}] voxcpm duration candidate retry failed; keeping current candidate: {exc}"
                     )
 
             # Continuation-mode prompt-echo mitigation: the model sometimes
@@ -5253,7 +5269,7 @@ async def synthesize_voxcpm(request):
                 )
                 if leak_detected:
                     leak_kwargs = dict(gen_kwargs)
-                    leak_kwargs["seed"] = (seed + 1) % (2**31 - 1)  # bump seed
+                    leak_kwargs["seed"] = ((_normalize_seed(seed) or 0) + 1) % OMNIVOICE_SEED_MOD
                     leak_kwargs["inference_timesteps"] = min(
                         gen_kwargs["inference_timesteps"] + 2, 64
                     )  # one more diffusion step
