@@ -135,6 +135,26 @@ _SEVERE_ISSUE_LABELS = frozenset({
     "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete",
     "source_script_residue", "duration_off_target", "duration_off_reference",
 })
+
+# Reference-quality issues that should block synthesis outright. Dubbing callers
+# can then fall back to Edge TTS or a stronger same-speaker anchor reference.
+_FATAL_REFERENCE_ISSUES = frozenset({
+    "mostly_silence",
+    "low_activity",
+    "empty_reference",
+    "short_reference",
+    "decode_error",
+})
+_BLOCK_FATAL_REFERENCE = str(
+    os.environ.get("OMNIVOICE_BLOCK_FATAL_REFERENCE", "1")
+).strip().lower() in {"1", "true", "yes", "on"}
+_FATAL_REFERENCE_MIN_DURATION = float(
+    os.environ.get("OMNIVOICE_FATAL_REFERENCE_MIN_DURATION", "0.5")
+)
+_FATAL_REFERENCE_MAX_PEAK = float(
+    os.environ.get("OMNIVOICE_FATAL_REFERENCE_MAX_PEAK", "0.99")
+)
+
 VOXCPM_MODEL_ID = os.environ.get("VOXCPM_MODEL_ID", "openbmb/VoxCPM2")
 VOXCPM_LOAD_DENOISER = str(
     os.environ.get("VOXCPM_LOAD_DENOISER", "0")
@@ -389,6 +409,21 @@ def _normalize_audio_peak(audio_bytes: bytes, target_peak: float = 0.88) -> byte
         return out.getvalue()
     except Exception:
         return audio_bytes
+
+
+def _check_fatal_reference_quality(ref_quality: Optional[Dict[str, Any]]) -> tuple[bool, list[str]]:
+    """Return (is_fatal, blocking_issues) for a reference-quality dict."""
+    if not ref_quality or not ref_quality.get("has_ref"):
+        return False, []
+    issues = set(ref_quality.get("issues") or [])
+    blocking = sorted(issues & _FATAL_REFERENCE_ISSUES)
+    duration = ref_quality.get("duration")
+    peak = ref_quality.get("peak")
+    if duration is not None and duration < _FATAL_REFERENCE_MIN_DURATION:
+        blocking.append("short_reference")
+    if peak is not None and peak > _FATAL_REFERENCE_MAX_PEAK:
+        blocking.append("clipping")
+    return bool(blocking), sorted(set(blocking))
 
 
 def _select_quality_profile(
@@ -3599,6 +3634,7 @@ async def synthesize(request):
     duration_tolerance_ms = data.get("duration_tolerance_ms")
     requested_max_duration_ms = max_duration_ms
     duration_cap_relaxed = False
+    strict_duration = _bool_option(data.get("strict_duration"), False)
     user_duration = data.get("duration")
     user_speed = float(data.get("speed", 1.0))
     seed = _stable_seed_from_request(data, text, effective_prompt_text, reference_audio_base64, prompt_wav_base64)
@@ -3671,6 +3707,15 @@ async def synthesize(request):
             f"duration={ref_quality.get('duration')}, active_ratio={ref_quality.get('active_ratio')}, "
             f"peak={ref_quality.get('peak')}, snr={ref_quality.get('snr_db')}"
         )
+    if _BLOCK_FATAL_REFERENCE:
+        is_fatal, fatal_issues = _check_fatal_reference_quality(ref_quality)
+        if is_fatal:
+            _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
+            return _error(
+                f"Reference audio quality too poor for synthesis: {fatal_issues}. "
+                f"Use a longer, non-silent reference or fall back to text-only TTS.",
+                status=400,
+            )
 
     # If alternate references are provided, score them and use the best one.
     if alternate_refs:
@@ -3749,6 +3794,11 @@ async def synthesize(request):
         max_duration_sec = None
         max_duration_ms = None
         duration_cap_relaxed = True
+        if not strict_duration:
+            # When the caller accepts local atempo fitting, do not chase a tight
+            # cloud-side duration target.
+            target_duration_sec = None
+            duration_tolerance_sec = None
 
     # Adaptive duration: try to match ref audio length when user doesn't specify duration
     # Strategy: use ref audio duration as target, but avoid badcases by checking text length
@@ -4696,6 +4746,7 @@ async def synthesize_voxcpm(request):
     target_duration_ms = data.get("target_duration_ms")
     duration_tolerance_ms = data.get("duration_tolerance_ms")
     max_duration_ms = data.get("max_duration_ms")
+    strict_duration = _bool_option(data.get("strict_duration"), False)
     try:
         target_duration_ms = int(target_duration_ms) if target_duration_ms is not None else None
     except (TypeError, ValueError):
@@ -4723,10 +4774,21 @@ async def synthesize_voxcpm(request):
     # Lightweight cfg/steps adaptation by reference quality. On by default;
     # a caller can disable it with ``voxcpm_adaptive=false``. Only nudges
     # values up (never downgrades), so user-specified higher values win.
+    ref_quality_profile = None
+    if ref_audio_bytes:
+        ref_quality_profile = _assess_reference_quality(ref_audio_bytes)
+        if _BLOCK_FATAL_REFERENCE:
+            is_fatal, fatal_issues = _check_fatal_reference_quality(ref_quality_profile)
+            if is_fatal:
+                return _error(
+                    f"Reference audio quality too poor for synthesis: {fatal_issues}. "
+                    f"Use a longer, non-silent reference or fall back to text-only TTS.",
+                    status=400,
+                )
+
     voxcpm_adaptive = _bool_option(data.get("voxcpm_adaptive"), True)
     voxcpm_adaptive_reason = ""
-    if voxcpm_adaptive and ref_audio_bytes:
-        ref_quality_profile = _assess_reference_quality(ref_audio_bytes)
+    if voxcpm_adaptive and ref_quality_profile:
         cfg_value, inference_timesteps, voxcpm_adaptive_reason = _voxcpm_adaptive_params(
             cfg_value, inference_timesteps, ref_duration, ref_quality_profile,
             target_duration=target_duration_sec,
@@ -4739,11 +4801,31 @@ async def synthesize_voxcpm(request):
     if normalize and not _voxcpm_normalize_available():
         logger.warning(f"[{req_id}] normalize requested but wetext/inflect not installed; skipping")
         normalize = False
-    denoise = _bool_option(data.get("denoise"), False)
+    denoise_value = data.get("denoise")
+    auto_denoise = False
+    if denoise_value is None and ref_quality_profile:
+        issues = set(ref_quality_profile.get("issues") or [])
+        if "low_snr" in issues or "too_quiet" in issues:
+            if VOXCPM_LOAD_DENOISER and _voxcpm_denoise_available():
+                denoise_value = True
+                auto_denoise = True
+                logger.info(f"[{req_id}] auto-enabling denoise for weak reference (issues={sorted(issues)})")
+    denoise = _bool_option(denoise_value, False)
     if denoise and not (VOXCPM_LOAD_DENOISER and _voxcpm_denoise_available()):
-        if denoise:
-            logger.warning(f"[{req_id}] denoise requested but modelscope/denoiser not available; skipping")
+        logger.warning(f"[{req_id}] denoise requested but modelscope/denoiser not available; skipping")
         denoise = False
+
+    # Short references are easily over-trimmed by VAD; keep the full clip when
+    # it is already mostly active speech.
+    if (
+        trim_silence_vad
+        and ref_duration is not None
+        and ref_duration < 2.0
+        and ref_quality_profile
+        and (ref_quality_profile.get("active_ratio") or 0.0) > 0.6
+    ):
+        trim_silence_vad = False
+        logger.info(f"[{req_id}] short reference ({ref_duration:.2f}s, active); disabling trim_silence_vad")
 
     quality_retry = _bool_option(data.get("quality_retry"), True)
     quality_retry_max = int(data.get("quality_retry_max", 2))
@@ -4770,11 +4852,12 @@ async def synthesize_voxcpm(request):
             max_duration_sec = None
             max_duration_ms = None
             duration_cap_relaxed = True
-            # Since the caller will atempo-fit the full audio downstream, chasing
-            # an exact target duration is wasted work and likely produces false
-            # duration_off_target flags.
-            target_duration_sec = None
-            duration_tolerance_sec = None
+            if not strict_duration:
+                # Since the caller will atempo-fit the full audio downstream, chasing
+                # an exact target duration is wasted work and likely produces false
+                # duration_off_target flags.
+                target_duration_sec = None
+                duration_tolerance_sec = None
 
     language = (
         data.get("language")
@@ -5260,6 +5343,8 @@ async def synthesize_voxcpm(request):
             "guidance_scale": cfg_value,
             "voxcpm_adaptive": bool(voxcpm_adaptive_reason),
             "voxcpm_adaptive_reason": voxcpm_adaptive_reason,
+            "auto_denoise": auto_denoise,
+            "trim_silence_vad": trim_silence_vad,
         },
     })
 
