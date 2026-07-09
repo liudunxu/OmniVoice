@@ -4304,11 +4304,17 @@ def _voxcpm_adaptive_params(
     adaptive_steps = max(inference_timesteps, profile["num_step"])
     reasons = [f"duration_profile={profile_name}"]
 
-    # Duration-constrained requests benefit from a bit more stability.
-    if target_duration is not None and target_duration > 0:
-        adaptive_cfg = max(adaptive_cfg, min(profile["guidance_scale"] + 0.15, 2.4))
+    # Duration-constrained requests benefit from a bit more stability, but keep
+    # the bump modest: long refs are already slow, and a 1.5x quality retry can
+    # push them into minutes. Only apply to short/medium/optimal refs.
+    if (
+        target_duration is not None
+        and target_duration > 0
+        and profile_name in ("short", "medium", "optimal")
+    ):
+        adaptive_cfg = max(adaptive_cfg, min(profile["guidance_scale"] + 0.1, 2.3))
         adaptive_steps = max(
-            adaptive_steps, min(int(profile["num_step"] * 1.2), 40)
+            adaptive_steps, min(int(profile["num_step"] * 1.1), 32)
         )
         reasons.append("duration_targeted")
 
@@ -4824,7 +4830,7 @@ async def synthesize_voxcpm(request):
             # One OmniVoice-style quality retry: bump cfg/steps and regenerate.
             if quality_retry and severe and quality_retry_max >= 1 and "empty" not in severe:
                 retry_cfg = min(cfg_value + 0.2, 3.0)
-                retry_steps = min(int(inference_timesteps * 1.5), 64)
+                retry_steps = min(int(inference_timesteps * 1.25), 48)
                 retry_kwargs = dict(gen_kwargs)
                 retry_kwargs["cfg_value"] = retry_cfg
                 retry_kwargs["inference_timesteps"] = retry_steps
