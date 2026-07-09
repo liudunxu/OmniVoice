@@ -4617,6 +4617,33 @@ async def synthesize_voxcpm(request):
     retry_badcase_ratio_threshold = float(data.get("retry_badcase_ratio_threshold", 6.0))
     trim_silence_vad = _bool_option(data.get("trim_silence_vad"), True)
 
+    target_duration_ms = data.get("target_duration_ms")
+    duration_tolerance_ms = data.get("duration_tolerance_ms")
+    max_duration_ms = data.get("max_duration_ms")
+    try:
+        target_duration_ms = int(target_duration_ms) if target_duration_ms is not None else None
+    except (TypeError, ValueError):
+        target_duration_ms = None
+    try:
+        duration_tolerance_ms = int(duration_tolerance_ms) if duration_tolerance_ms is not None else None
+    except (TypeError, ValueError):
+        duration_tolerance_ms = None
+    try:
+        max_duration_ms = int(max_duration_ms) if max_duration_ms is not None else None
+    except (TypeError, ValueError):
+        max_duration_ms = None
+    target_duration_sec = (
+        target_duration_ms / 1000.0 if target_duration_ms and target_duration_ms > 0 else None
+    )
+    duration_tolerance_sec = (
+        duration_tolerance_ms / 1000.0
+        if duration_tolerance_ms and duration_tolerance_ms > 0
+        else None
+    )
+    max_duration_sec = (
+        max_duration_ms / 1000.0 if max_duration_ms and max_duration_ms > 0 else None
+    )
+
     # Lightweight cfg/steps adaptation by reference quality. On by default;
     # a caller can disable it with ``voxcpm_adaptive=false``. Only nudges
     # values up (never downgrades), so user-specified higher values win.
@@ -4647,29 +4674,6 @@ async def synthesize_voxcpm(request):
     # control_instruction is accepted for API parity but VoxCPM2 has no
     # instruction-following mode, so it is ignored.
     _ = data.get("control_instruction") or data.get("instruct")
-
-    target_duration_ms = data.get("target_duration_ms")
-    duration_tolerance_ms = data.get("duration_tolerance_ms")
-    max_duration_ms = data.get("max_duration_ms")
-    try:
-        target_duration_ms = int(target_duration_ms) if target_duration_ms is not None else None
-    except (TypeError, ValueError):
-        target_duration_ms = None
-    try:
-        duration_tolerance_ms = int(duration_tolerance_ms) if duration_tolerance_ms is not None else None
-    except (TypeError, ValueError):
-        duration_tolerance_ms = None
-    try:
-        max_duration_ms = int(max_duration_ms) if max_duration_ms is not None else None
-    except (TypeError, ValueError):
-        max_duration_ms = None
-    target_duration_sec = (target_duration_ms / 1000.0) if target_duration_ms and target_duration_ms > 0 else None
-    duration_tolerance_sec = (
-        duration_tolerance_ms / 1000.0
-        if duration_tolerance_ms and duration_tolerance_ms > 0
-        else None
-    )
-    max_duration_sec = (max_duration_ms / 1000.0) if max_duration_ms and max_duration_ms > 0 else None
 
     # Relax max_duration when the target text's natural duration exceeds the
     # hard cap — hard-trimming would cut the end of the text off mid-sentence.
