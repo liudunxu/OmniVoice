@@ -54,6 +54,13 @@ dependencies = [
     "tqdm",
     "safetensors",
     "huggingface-hub",
+    # VoxCPM2 quality helpers: text normalization (numbers/dates/etc.) and
+    # ZipEnhancer denoising of reference/prompt audio.
+    "wetext",
+    "inflect",
+    "modelscope",
+    "addict>=2.4.0",
+    "datasets>=5.0.0",
 ]
 
 [project.optional-dependencies]
