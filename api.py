@@ -235,6 +235,27 @@ _QUALITY_PROFILES = {
     },
 }
 
+# VoxCPM2 duration-based quality profiles. VoxCPM2 only exposes cfg_value and
+# inference_timesteps, so we tune just those two by reference duration.
+_VOXCPM_DURATION_PROFILES = {
+    "short": {  # ref audio < 2s
+        "num_step": 28,
+        "guidance_scale": 1.9,
+    },
+    "medium": {  # ref audio 2-4s
+        "num_step": 24,
+        "guidance_scale": 2.0,
+    },
+    "optimal": {  # ref audio 4-5s (sweet spot)
+        "num_step": 20,
+        "guidance_scale": 2.1,
+    },
+    "long": {  # ref audio >5s
+        "num_step": 18,
+        "guidance_scale": 2.2,
+    },
+}
+
 
 def _get_ref_audio_duration(audio_path: str) -> Optional[float]:
     """Get duration of reference audio in seconds."""
@@ -1742,6 +1763,11 @@ def _register_voxcpm_voice(reference_bytes: bytes, prompt_bytes=None, prompt_tex
         "prompt_text": prompt_text or "",
         "reference_duration_ms": int(round(ref_dur * 1000)),
         "created_at": time.time(),
+        # Lazy prompt-cache fields; populated on first synthesis after the model
+        # is loaded. Caching the VAE latent avoids re-encoding the same reference
+        # / prompt audio for every request using this voice.
+        "prompt_cache": None,
+        "prompt_cache_params": None,
     }
     _VOXCPM_VOICES[voice_id] = entry
     _VOXCPM_VOICES.move_to_end(voice_id)
@@ -4178,23 +4204,40 @@ async def voxcpm_voices_delete(request):
     return _json_response({"ok": True, "voice_id": voice_id, "removed": removed})
 
 
+def _voxcpm_select_duration_profile(ref_duration: Optional[float]) -> tuple[str, Dict[str, Any]]:
+    """Pick a VoxCPM2 duration profile by reference audio length."""
+    if ref_duration is None:
+        return "medium", _VOXCPM_DURATION_PROFILES["medium"]
+    if ref_duration < 2.0:
+        return "short", _VOXCPM_DURATION_PROFILES["short"]
+    if ref_duration < 4.0:
+        return "medium", _VOXCPM_DURATION_PROFILES["medium"]
+    if ref_duration <= 5.0:
+        return "optimal", _VOXCPM_DURATION_PROFILES["optimal"]
+    return "long", _VOXCPM_DURATION_PROFILES["long"]
+
+
 def _voxcpm_adaptive_params(
     cfg_value: float,
     inference_timesteps: int,
     ref_duration: Optional[float],
     ref_quality: Optional[Dict[str, Any]],
 ) -> tuple[float, int, str]:
-    """Lightweight VoxCPM2 cfg/steps adaptation by reference quality.
+    """VoxCPM2 cfg/steps adaptation by reference duration + quality.
 
-    VoxCPM2 only accepts ``cfg_value`` and ``inference_timesteps`` (no
-    t_shift / layer_penalty), so we adapt just those two. Strong references
-    keep the caller's values; weak references nudge cfg up for clone stability
-    and add a few diffusion steps. User-specified higher values are never
+    First applies a duration-based profile (short/medium/optimal/long), then
+    bumps values further for weak references (short, low-activity, low-snr,
+    or otherwise flagged poor). User-specified higher values are never
     downgraded (we take the max), so this only makes generation more careful,
     never sloppier.
 
     Returns ``(cfg_value, inference_timesteps, reason)``.
     """
+    profile_name, profile = _voxcpm_select_duration_profile(ref_duration)
+    adaptive_cfg = max(cfg_value, profile["guidance_scale"])
+    adaptive_steps = max(inference_timesteps, profile["num_step"])
+    reasons = [f"duration_profile={profile_name}"]
+
     # Weak reference: short, low-activity, low-snr, or flagged poor.
     is_poor = bool(ref_quality and ref_quality.get("is_poor"))
     ref_short = ref_duration is not None and ref_duration < 2.0
@@ -4203,17 +4246,16 @@ def _voxcpm_adaptive_params(
         and ref_quality.get("snr_reliable")
         and (ref_quality.get("snr_db") or 999) < 10.0
     )
-    if not (is_poor or ref_short or low_snr):
+    if is_poor or ref_short or low_snr:
+        adaptive_cfg = max(adaptive_cfg, 2.5)
+        adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 8, 32))
+        reasons.append(f"weak_ref (poor={is_poor}, short={ref_short}, low_snr={low_snr})")
+
+    if adaptive_cfg == cfg_value and adaptive_steps == inference_timesteps:
         return cfg_value, inference_timesteps, ""
 
-    adaptive_cfg = max(cfg_value, 2.3)
-    # Only nudge steps up toward the cap; a caller's already-higher value wins.
-    if inference_timesteps < 14:
-        adaptive_steps = 14
-    else:
-        adaptive_steps = inference_timesteps
     reason = (
-        f"weak reference (poor={is_poor}, short={ref_short}, low_snr={low_snr}); "
+        f"{' | '.join(reasons)}; "
         f"cfg {cfg_value}->{adaptive_cfg}, steps {inference_timesteps}->{adaptive_steps}"
     )
     return adaptive_cfg, adaptive_steps, reason
@@ -4306,6 +4348,23 @@ def _detect_prompt_leak(
     return leak_detected, leak_samples
 
 
+def _build_voxcpm_prompt_cache_sync(
+    model,
+    ref_path: Optional[str],
+    prompt_path: Optional[str],
+    prompt_text: str,
+    trim_silence_vad: bool,
+):
+    """Build a VoxCPM2 prompt cache from file paths. Returns the cache dict."""
+    kwargs: Dict[str, Any] = {"trim_silence_vad": bool(trim_silence_vad)}
+    if ref_path is not None:
+        kwargs["reference_wav_path"] = ref_path
+    if prompt_path is not None and prompt_text:
+        kwargs["prompt_wav_path"] = prompt_path
+        kwargs["prompt_text"] = prompt_text
+    return model.tts_model.build_prompt_cache(**kwargs)
+
+
 def _generate_voxcpm_sync(
     model,
     text,
@@ -4323,28 +4382,48 @@ def _generate_voxcpm_sync(
     retry_badcase_ratio_threshold,
     trim_silence_vad,
     seed,
+    prompt_cache=None,
 ):
     """Run VoxCPM.generate in a worker thread. Returns a 1-D numpy waveform."""
-    kwargs = {
-        "text": text,
-        "cfg_value": float(cfg_value),
-        "inference_timesteps": int(inference_timesteps),
-        "min_len": int(min_len),
-        "max_len": int(max_len),
-        "normalize": bool(normalize),
-        "denoise": bool(denoise),
-        "retry_badcase": bool(retry_badcase),
-        "retry_badcase_max_times": int(retry_badcase_max_times),
-        "retry_badcase_ratio_threshold": float(retry_badcase_ratio_threshold),
-        "trim_silence_vad": bool(trim_silence_vad),
-        "seed": seed,
-    }
-    if ref_path is not None:
-        kwargs["reference_wav_path"] = ref_path
-    if prompt_path is not None and prompt_text:
-        kwargs["prompt_wav_path"] = prompt_path
-        kwargs["prompt_text"] = prompt_text
-    wav = model.generate(**kwargs)
+    if prompt_cache is not None:
+        if normalize:
+            if model.text_normalizer is None:
+                from voxcpm.utils.text_normalize import TextNormalizer
+                model.text_normalizer = TextNormalizer()
+            text = model.text_normalizer.normalize(text)
+        wav, _, _ = model.tts_model.generate_with_prompt_cache(
+            target_text=text,
+            prompt_cache=prompt_cache,
+            cfg_value=float(cfg_value),
+            inference_timesteps=int(inference_timesteps),
+            min_len=int(min_len),
+            max_len=int(max_len),
+            retry_badcase=bool(retry_badcase),
+            retry_badcase_max_times=int(retry_badcase_max_times),
+            retry_badcase_ratio_threshold=float(retry_badcase_ratio_threshold),
+            seed=seed,
+        )
+    else:
+        kwargs = {
+            "text": text,
+            "cfg_value": float(cfg_value),
+            "inference_timesteps": int(inference_timesteps),
+            "min_len": int(min_len),
+            "max_len": int(max_len),
+            "normalize": bool(normalize),
+            "denoise": bool(denoise),
+            "retry_badcase": bool(retry_badcase),
+            "retry_badcase_max_times": int(retry_badcase_max_times),
+            "retry_badcase_ratio_threshold": float(retry_badcase_ratio_threshold),
+            "trim_silence_vad": bool(trim_silence_vad),
+            "seed": seed,
+        }
+        if ref_path is not None:
+            kwargs["reference_wav_path"] = ref_path
+        if prompt_path is not None and prompt_text:
+            kwargs["prompt_wav_path"] = prompt_path
+            kwargs["prompt_text"] = prompt_text
+        wav = model.generate(**kwargs)
     arr = np.asarray(wav).reshape(-1).astype(np.float32)
     return arr
 
@@ -4378,6 +4457,7 @@ async def synthesize_voxcpm(request):
 
     # Resolve reference audio: voice_id (cached) takes precedence, else base64.
     voice_id = str(data.get("voice_id") or "").strip()
+    voice_entry = None
     ref_audio_bytes = None
     prompt_audio_bytes = None
     prompt_text = str(data.get("prompt_text") or "")
@@ -4389,6 +4469,7 @@ async def synthesize_voxcpm(request):
                 f"voice_id not found (evicted or never registered): {voice_id}",
                 status=404,
             )
+        voice_entry = entry
         ref_audio_bytes = entry.get("reference_bytes")
         # Fall back to the registered prompt only if the request doesn't override.
         if not data.get("prompt_wav_base64") and entry.get("prompt_bytes"):
@@ -4471,7 +4552,8 @@ async def synthesize_voxcpm(request):
         if voxcpm_adaptive_reason:
             logger.info(f"[{req_id}] voxcpm adaptive: {voxcpm_adaptive_reason}")
 
-    normalize = _bool_option(data.get("normalize"), False)
+    normalize_default = _voxcpm_normalize_available()
+    normalize = _bool_option(data.get("normalize"), normalize_default)
     if normalize and not _voxcpm_normalize_available():
         logger.warning(f"[{req_id}] normalize requested but wetext/inflect not installed; skipping")
         normalize = False
@@ -4570,6 +4652,45 @@ async def synthesize_voxcpm(request):
             prompt_temp_path.write_bytes(prompt_audio_bytes)
             prompt_path = str(prompt_temp_path)
 
+        # Build (or reuse) a VoxCPM2 prompt cache. Caching the encoded VAE latent
+        # avoids re-encoding the same reference/prompt audio on every request.
+        # The cache is keyed by trim_silence_vad and prompt_text; denoise is not
+        # cached because the denoiser mutates the audio before encoding.
+        prompt_cache = None
+        cache_params = {
+            "trim_silence_vad": bool(trim_silence_vad),
+            "denoise": False,
+            "prompt_text": prompt_text if prompt_path else None,
+        }
+        if not denoise and (ref_path is not None or prompt_path is not None):
+            if (
+                voice_entry is not None
+                and voice_entry.get("prompt_cache_params") == cache_params
+            ):
+                prompt_cache = voice_entry.get("prompt_cache")
+                if prompt_cache is not None:
+                    logger.info(f"[{req_id}] voxcpm prompt cache hit for voice_id={voice_id}")
+            if prompt_cache is None:
+                prompt_cache = await asyncio.to_thread(
+                    _build_voxcpm_prompt_cache_sync,
+                    model,
+                    ref_path,
+                    prompt_path,
+                    prompt_text,
+                    trim_silence_vad,
+                )
+                if voice_entry is not None:
+                    # Only cache in the voice registry when the prompt audio (if
+                    # used) came from the registered entry, not from a request-level
+                    # prompt_wav_base64 override. Identity comparison works because
+                    # the entry stores the bytes object directly.
+                    entry_prompt_bytes = voice_entry.get("prompt_bytes")
+                    if prompt_audio_bytes is None or prompt_audio_bytes is entry_prompt_bytes:
+                        voice_entry["prompt_cache"] = prompt_cache
+                        voice_entry["prompt_cache_params"] = cache_params
+                        _VOXCPM_VOICES.move_to_end(voice_id)
+                logger.info(f"[{req_id}] voxcpm prompt cache built")
+
         gen_args = (
             model,
             text,
@@ -4587,6 +4708,7 @@ async def synthesize_voxcpm(request):
             retry_badcase_ratio_threshold,
             trim_silence_vad,
             seed,
+            prompt_cache,
         )
 
         quality_issues: list = []
@@ -4659,10 +4781,11 @@ async def synthesize_voxcpm(request):
                 and quality_retry_max >= 2
             ):
                 duration_args = list(gen_args)
-                duration_args[-1] = ((seed or 0) + 13) % (2**31 - 1)
+                duration_args[17] = ((seed or 0) + 13) % (2**31 - 1)
+                duration_new_seed = duration_args[17]
                 logger.info(
                     f"[{req_id}] voxcpm duration candidate retry "
-                    f"(target={target_duration_sec:.3f}s, new seed={duration_args[-1]})"
+                    f"(target={target_duration_sec:.3f}s, new seed={duration_new_seed})"
                 )
                 duration_wav = await asyncio.to_thread(_generate_voxcpm_sync, *duration_args)
                 attempts += 1
@@ -4709,12 +4832,13 @@ async def synthesize_voxcpm(request):
                 )
                 if leak_detected:
                     leak_args = list(gen_args)
-                    leak_args[-1] = (seed + 1) % (2**31 - 1)  # bump seed
+                    leak_args[17] = (seed + 1) % (2**31 - 1)  # bump seed
                     leak_args[5] = leak_base_cfg               # keep raised cfg
                     leak_args[6] = min(leak_base_steps + 2, 64)  # one more diffusion step
+                    leak_new_seed = leak_args[17]
                     logger.info(
                         f"[{req_id}] voxcpm prompt-leak retry "
-                        f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_args[-1]})"
+                        f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_new_seed})"
                     )
                     leak_wav = await asyncio.to_thread(_generate_voxcpm_sync, *leak_args)
                     attempts += 1
@@ -4820,12 +4944,13 @@ async def synthesize_voxcpm(request):
         and _qc_language_mismatch_triggers_retry(text_completeness_qc, language)
     ):
         regen_args = list(gen_args)
-        regen_args[-1] = ((seed or 0) + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
+        regen_args[17] = ((seed or 0) + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
+        regen_new_seed = regen_args[17]
         logger.info(
             f"[{req_id}] voxcpm language-mismatch regenerate "
             f"(detected={text_completeness_qc.get('whisper_language')} "
             f"expected={_whisper_language_code(language)}, "
-            f"coverage={text_completeness_qc.get('coverage')}, new seed={regen_args[-1]})"
+            f"coverage={text_completeness_qc.get('coverage')}, new seed={regen_new_seed})"
         )
         try:
             async with _API_INFER_SEM:
