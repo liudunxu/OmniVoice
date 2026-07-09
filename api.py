@@ -188,7 +188,7 @@ _ENFORCE_MAX_DURATION = str(
 # this (env var) when cloud callers frequently see duration_off_target severe
 # issues and the extra latency is acceptable.
 _DURATION_REFINEMENT_INITIAL_ATTEMPTS = int(
-    os.environ.get("OMNIVOICE_DURATION_REFINEMENT_INITIAL_ATTEMPTS", "3")
+    os.environ.get("OMNIVOICE_DURATION_REFINEMENT_INITIAL_ATTEMPTS", "2")
 )
 
 
@@ -2014,6 +2014,9 @@ def _generate_with_duration_refinement(
 ):
     """Generate audio, optionally retrying until duration is within tolerance.
 
+    Uses dampened ratio correction to handle the OmniVoice model's non-linear
+    duration response and avoid overshoot/oscillation.
+
     Returns:
         (audio_waveform, attempts_made, attempt_log)
     """
@@ -2024,14 +2027,19 @@ def _generate_with_duration_refinement(
         return audio, 1, []
 
     target_duration = float(target_duration)
-    # Default tolerance: 5% of target or 50ms, whichever is larger, so that
-    # callers who only pass target_duration still get refinement.
+    # Default tolerance: 7.5% of target or 80ms, whichever is larger.
+    # This is intentionally looser than the previous 5%/50ms because the
+    # downstream dubbing pipeline usually atempo-fits the audio anyway, and
+    # chasing sub-100ms precision burns retries on a non-linear model.
     if duration_tolerance is None or duration_tolerance <= 0:
-        duration_tolerance = max(0.05, target_duration * 0.05)
+        duration_tolerance = max(0.08, target_duration * 0.075)
 
-    # Use a wider correction range when the first attempt is far off; tighten
-    # afterwards to avoid oscillation.
-    ratio_clamp = ratio_clamp or (0.33, 3.0)
+    # Tighter clamps than before: the model's duration response saturates, so
+    # huge ratio corrections overshoot. First attempt gets a slightly wider
+    # window; subsequent attempts are narrow to fine-tune.
+    first_clamp = (0.6, 1.6)
+    rest_clamp = ratio_clamp or (0.8, 1.3)
+    dampening = 0.6
 
     current_duration = target_duration
     best_audio = None
@@ -2063,20 +2071,15 @@ def _generate_with_duration_refinement(
             best_audio = audio
 
         if attempt < max_attempts - 1 and actual_duration > 0:
-            # If the model is roughly linear in the duration parameter,
-            # actual = k * current_duration. We want next such that
-            # k * next = target_duration, so next = target_duration / k
-            # = target_duration * current_duration / actual_duration.
-            # Clamp to avoid divergence when the model output is wildly off
-            # (e.g. actual=0.1s for a 10s target).
             raw_ratio = target_duration / actual_duration
-            # Tighten clamp after first attempt.
-            if attempt == 0:
-                low, high = 0.25, 4.0
-            else:
-                low, high = ratio_clamp
+            low, high = first_clamp if attempt == 0 else rest_clamp
             clamped_ratio = max(low, min(high, raw_ratio))
-            next_duration = current_duration * clamped_ratio
+            # Dampen the correction to avoid overshooting on the model's
+            # saturating duration response. A factor of 0.6 means we move 60%
+            # of the way toward the linear-theory target.
+            dampened_ratio = 1.0 + dampening * (clamped_ratio - 1.0)
+            next_duration = current_duration * dampened_ratio
+
             if max_duration is not None and next_duration > max_duration:
                 logger.warning(
                     "Duration refinement ratio %.3f would push duration param to %.3fs, "
@@ -2086,14 +2089,30 @@ def _generate_with_duration_refinement(
                     max_duration,
                 )
                 next_duration = float(max_duration)
+
+            # Early stop: if the predicted next result would not improve on the
+            # best so far, don't waste another generation.
+            predicted_actual = actual_duration * dampened_ratio
+            predicted_error = abs(predicted_actual - target_duration)
+            if predicted_error >= best_error:
+                logger.info(
+                    "Duration refinement early stop at attempt %d: predicted error %.3fs "
+                    "would not improve on best error %.3fs",
+                    attempt + 1,
+                    predicted_error,
+                    best_error,
+                )
+                break
+
             logger.info(
                 "Duration refinement attempt %d: target=%.3fs actual=%.3fs "
-                "ratio=%.3f (clamped=%.3f); retrying with duration=%.3fs",
+                "ratio=%.3f (clamped=%.3f, dampened=%.3f); retrying with duration=%.3fs",
                 attempt + 1,
                 current_duration,
                 actual_duration,
                 raw_ratio,
                 clamped_ratio,
+                dampened_ratio,
                 next_duration,
             )
             current_duration = next_duration
@@ -2102,10 +2121,10 @@ def _generate_with_duration_refinement(
         "Duration refinement did not converge within tolerance %.3fs after %d attempts; "
         "returning closest result (error=%.3fs)",
         duration_tolerance,
-        max_attempts,
+        len(attempt_log),
         best_error,
     )
-    return best_audio, max_attempts, attempt_log
+    return best_audio, len(attempt_log), attempt_log
 
 
 def _audio_duration(waveform, sampling_rate: int) -> float:
