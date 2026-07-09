@@ -295,8 +295,12 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
     snr_reliable = bool(
         snr is not None
         and active_ratio is not None
-        and active_ratio < 0.90
-        and active_speech_ratio < 0.90
+        # Require enough non-active frames for the noise-floor estimate to be
+        # meaningful. When almost the whole clip is active speech, mean_db and
+        # active_mean_db are nearly identical and SNR collapses to ~0 dB even
+        # for clean audio, producing false low_snr flags.
+        and active_ratio < 0.80
+        and active_speech_ratio < 0.80
     )
 
     issues = []
@@ -2027,9 +2031,12 @@ def _generate_with_duration_refinement(
             best_audio = audio
 
         if attempt < max_attempts - 1 and actual_duration > 0:
-            # Scale target duration by the observed ratio, clamped to avoid
-            # divergence when the model output is wildly off (e.g. actual=0.1s
-            # for a 10s target would otherwise try 100s next).
+            # If the model is roughly linear in the duration parameter,
+            # actual = k * current_duration. We want next such that
+            # k * next = target_duration, so next = target_duration / k
+            # = target_duration * current_duration / actual_duration.
+            # Clamp to avoid divergence when the model output is wildly off
+            # (e.g. actual=0.1s for a 10s target).
             raw_ratio = target_duration / actual_duration
             # Tighten clamp after first attempt.
             if attempt == 0:
@@ -2037,10 +2044,10 @@ def _generate_with_duration_refinement(
             else:
                 low, high = ratio_clamp
             clamped_ratio = max(low, min(high, raw_ratio))
-            next_duration = target_duration * clamped_ratio
+            next_duration = current_duration * clamped_ratio
             if max_duration is not None and next_duration > max_duration:
                 logger.warning(
-                    "Duration refinement ratio %.3f would push target to %.3fs, "
+                    "Duration refinement ratio %.3f would push duration param to %.3fs, "
                     "exceeding max_duration=%.3fs; clamping to max_duration.",
                     raw_ratio,
                     next_duration,
@@ -2741,8 +2748,10 @@ def _check_audio_quality(
 
     if target_duration is not None and target_duration > 0:
         tol = duration_tolerance if duration_tolerance is not None else 0.0
-        # Flag if deviation is more than 2x tolerance or > 0.5s, whichever is larger.
-        if abs(duration - target_duration) > max(tol * 2, 0.5):
+        # Flag only when deviation is clearly outside normal model variance.
+        # Use a relative threshold (15% of target) so longer cues are not
+        # penalized for sub-second drift, plus an absolute floor for short cues.
+        if abs(duration - target_duration) > max(tol * 2, target_duration * 0.15, 0.5):
             issues.append("duration_off_target")
 
     if ref_duration is not None and ref_duration >= MIN_REFERENCE_DURATION_FOR_DURATION_RATIO:
