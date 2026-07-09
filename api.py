@@ -4283,14 +4283,19 @@ def _voxcpm_adaptive_params(
     inference_timesteps: int,
     ref_duration: Optional[float],
     ref_quality: Optional[Dict[str, Any]],
+    target_duration: Optional[float] = None,
 ) -> tuple[float, int, str]:
     """VoxCPM2 cfg/steps adaptation by reference duration + quality.
 
     First applies a duration-based profile (short/medium/optimal/long), then
-    bumps values further for weak references (short, low-activity, low-snr,
-    or otherwise flagged poor). User-specified higher values are never
-    downgraded (we take the max), so this only makes generation more careful,
-    never sloppier.
+    bumps values further for weak references (low-activity, low-snr, or
+    otherwise flagged poor). Short refs are bumped only when quality is also
+    poor, otherwise the short profile alone is enough. User-specified higher
+    values are never downgraded (we take the max), so this only makes generation
+    more careful, never sloppier.
+
+    When ``target_duration`` is supplied, a slightly more conservative profile is
+    used because hitting a timing target is harder than free-running generation.
 
     Returns ``(cfg_value, inference_timesteps, reason)``.
     """
@@ -4299,7 +4304,17 @@ def _voxcpm_adaptive_params(
     adaptive_steps = max(inference_timesteps, profile["num_step"])
     reasons = [f"duration_profile={profile_name}"]
 
-    # Weak reference: short, low-activity, low-snr, or flagged poor.
+    # Duration-constrained requests benefit from a bit more stability.
+    if target_duration is not None and target_duration > 0:
+        adaptive_cfg = max(adaptive_cfg, min(profile["guidance_scale"] + 0.15, 2.4))
+        adaptive_steps = max(
+            adaptive_steps, min(int(profile["num_step"] * 1.2), 40)
+        )
+        reasons.append("duration_targeted")
+
+    # Weak reference: low-activity, low-snr, or flagged poor. Short refs alone
+    # are not bumped unless they are also poor/low-snr; the short profile above
+    # already handles them conservatively.
     is_poor = bool(ref_quality and ref_quality.get("is_poor"))
     ref_short = ref_duration is not None and ref_duration < 2.0
     low_snr = bool(
@@ -4307,7 +4322,7 @@ def _voxcpm_adaptive_params(
         and ref_quality.get("snr_reliable")
         and (ref_quality.get("snr_db") or 999) < 10.0
     )
-    if is_poor or ref_short or low_snr:
+    if is_poor or low_snr or (ref_short and is_poor):
         adaptive_cfg = max(adaptive_cfg, 2.5)
         adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 8, 32))
         reasons.append(f"weak_ref (poor={is_poor}, short={ref_short}, low_snr={low_snr})")
@@ -4611,6 +4626,7 @@ async def synthesize_voxcpm(request):
         ref_quality_profile = _assess_reference_quality(ref_audio_bytes)
         cfg_value, inference_timesteps, voxcpm_adaptive_reason = _voxcpm_adaptive_params(
             cfg_value, inference_timesteps, ref_duration, ref_quality_profile,
+            target_duration=target_duration_sec,
         )
         if voxcpm_adaptive_reason:
             logger.info(f"[{req_id}] voxcpm adaptive: {voxcpm_adaptive_reason}")
@@ -4792,7 +4808,14 @@ async def synthesize_voxcpm(request):
             # Retry trigger set: at this stage quality_issues comes only from
             # _check_audio_quality, so duration_off_* (added later by the
             # max_duration clamp) cannot appear — _SEVERE_ISSUE_LABELS is safe.
-            severe = [i for i in quality_issues if i in _SEVERE_ISSUE_LABELS]
+            # When the duration cap was relaxed, the caller already accepts a
+            # longer audio for downstream atempo fitting, so duration_off_target
+            # should not trigger expensive retries.
+            severe = [
+                i for i in quality_issues
+                if i in _SEVERE_ISSUE_LABELS
+                and not (duration_cap_relaxed and i == "duration_off_target")
+            ]
 
             # One OmniVoice-style quality retry: bump cfg/steps and regenerate.
             if quality_retry and severe and quality_retry_max >= 1 and "empty" not in severe:
@@ -4812,7 +4835,11 @@ async def synthesize_voxcpm(request):
                     duration_tolerance=duration_tolerance_sec,
                     ref_duration=ref_duration,
                 )
-                retry_severe = [i for i in retry_issues if i in _SEVERE_ISSUE_LABELS]
+                retry_severe = [
+                    i for i in retry_issues
+                    if i in _SEVERE_ISSUE_LABELS
+                    and not (duration_cap_relaxed and i == "duration_off_target")
+                ]
                 quality_retried = True
                 attempts = 2
                 # Keep whichever output has fewer severe issues.
@@ -4832,11 +4859,14 @@ async def synthesize_voxcpm(request):
             # VoxCPM has no direct duration control knob. If the first chosen
             # candidate is clearly off the cue target, try one fresh seed and keep
             # it only when it is less severe and closer to the requested duration.
+            # Skip this when the duration cap was relaxed: the caller already
+            # accepts a longer audio for downstream atempo fitting.
             if (
                 quality_retry
                 and target_duration_sec is not None
                 and "duration_off_target" in quality_issues
                 and quality_retry_max >= 2
+                and not duration_cap_relaxed
             ):
                 duration_kwargs = dict(gen_kwargs)
                 duration_kwargs["seed"] = ((seed or 0) + 13) % (2**31 - 1)
@@ -4853,8 +4883,16 @@ async def synthesize_voxcpm(request):
                     duration_tolerance=duration_tolerance_sec,
                     ref_duration=ref_duration,
                 )
-                current_severe = [i for i in quality_issues if i in _SEVERE_ISSUE_LABELS]
-                duration_severe = [i for i in duration_issues if i in _SEVERE_ISSUE_LABELS]
+                current_severe = [
+                    i for i in quality_issues
+                    if i in _SEVERE_ISSUE_LABELS
+                    and not (duration_cap_relaxed and i == "duration_off_target")
+                ]
+                duration_severe = [
+                    i for i in duration_issues
+                    if i in _SEVERE_ISSUE_LABELS
+                    and not (duration_cap_relaxed and i == "duration_off_target")
+                ]
                 current_error = _duration_error(audio_waveform, sample_rate, target_duration_sec)
                 duration_error = _duration_error(duration_wav, sample_rate, target_duration_sec)
                 if len(duration_severe) < len(current_severe) or (
@@ -5051,7 +5089,14 @@ async def synthesize_voxcpm(request):
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / sample_rate, 3)
 
-    severe_issues = sorted({i for i in quality_issues if i in _SEVERE_ISSUE_LABELS})
+    severe_issues = sorted(
+        {
+            i
+            for i in quality_issues
+            if i in _SEVERE_ISSUE_LABELS
+            and not (duration_cap_relaxed and i == "duration_off_target")
+        }
+    )
 
     audio_qc = None
     if _bool_option(data.get("include_audio_qc"), True):
