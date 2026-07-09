@@ -87,6 +87,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Document any version constraints
 
 ### Vast.ai Instance Operations
+
+- The `VAST_API_KEY` is stored in `~/.zshrc` (line 162). Load it from there or export it explicitly; do not hard-code tokens in this repository.
 - Use the reusable helper script `scripts/vast.py` for all Vast.ai operations. It reads the API key from the `VAST_API_KEY` environment variable; do not hard-code tokens.
   - Check balance/credit: `VAST_API_KEY=$KEY python scripts/vast.py balance`
   - List instances: `VAST_API_KEY=$KEY python scripts/vast.py list`
@@ -98,17 +100,20 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
   - Smoke test: `python scripts/vast.py smoke <url>`
   - Fetch logs: `VAST_API_KEY=$KEY python scripts/vast.py logs <instance_id>`
   - Destroy one instance: `VAST_API_KEY=$KEY python scripts/vast.py destroy <instance_id>`
+  - Stop one instance (pause, keep it): `VAST_API_KEY=$KEY python scripts/vast.py stop <instance_id>`
+  - Stop all active OmniVoice instances: `VAST_API_KEY=$KEY python scripts/vast.py stop-all --yes`
   - Destroy all active OmniVoice instances: `VAST_API_KEY=$KEY python scripts/vast.py destroy-all --yes`
 - Use label prefix `omnivoice-api` for OmniVoice Vast.ai service instances.
-- When the user says "关闭vast.ai实例" or asks to close/stop Vast.ai instances, destroy all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the remaining instance list afterward.
-- When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, create a new RTX 3090 instance with:
+- When the user says "停止vast.ai实例" or asks to stop/pause Vast.ai instances, **stop** all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the instance list afterward.
+- When the user says "销毁vast.ai实例"/"关闭vast.ai实例" or asks to destroy/close Vast.ai instances, **destroy** all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the remaining instance list afterward.
+- When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, **launch two RTX 3090 instances** with:
   - image: `liudunxu/omnivoice-api:vast-gpu` unless the user specifies a fixed tag
-  - label: `omnivoice-api-mvp-<short-tag-or-date>`
+  - label: `omnivoice-api-mvp-<short-tag-or-date>-<region>`
   - disk: `80`
   - runtype: `args`
   - env: `{"-p 8000:8000": "1", "PORT": "8000", "HOST": "0.0.0.0", "MODEL_DIR": "/workspace/models"}`
-- Prefer verified, rentable, on-demand, single RTX 3090 offers with at least 20GB GPU RAM, at least one direct port, and at least 80GB disk space. 选择实例时优先选东南亚地区且能访问 Docker Hub 的实例；若没有合适的，再选东亚、中西亚地区；最后可选美洲地区（US/CA）。
-- After creating an instance, wait for the public port, then verify `GET /` returns `ok` and `GET /health` returns `{"ok": true, ...}`. Report the URL, instance id, image tag, label, GPU, and `dph_total`.
+- Prefer verified, rentable, on-demand, single RTX 3090 offers with at least 20GB GPU RAM, at least one direct port, and at least 80GB disk space. **Prioritize Southeast Asia for both instances.** If only one Southeast Asia offer is available, place the second instance in the next preferred region (East Asia, then Central/West Asia, then Americas US/CA). Verify the host can reach Docker Hub before committing; stalled `Pulling fs layer` or registry timeouts mean the offer should be abandoned.
+- After creating instances, wait for the public ports and verify `GET /` returns `ok` and `GET /health` returns `{"ok": true, ...}`. **Report the first instance that passes health checks immediately; do not wait for both instances to be ready.** Once both are verified, report the second URL as well.
 - Do not keep old and new Vast.ai instances running after a redeploy unless the user explicitly asks for overlap. Once the new instance is verified, destroy old `omnivoice-api*` instances.
 
 ### Known Working Vast.ai Instances

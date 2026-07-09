@@ -362,15 +362,24 @@ def cmd_destroy(args: argparse.Namespace) -> None:
     print(f"Instance {args.instance_id} destroyed.")
 
 
-def cmd_destroy_all(args: argparse.Namespace) -> None:
-    """Destroy all running/loading/active instances whose label starts with the prefix."""
-    prefix = args.prefix or DEFAULT_LABEL_PREFIX
+def cmd_stop(args: argparse.Namespace) -> None:
+    """Stop a specific instance by id (pause without deleting)."""
+    _request(
+        "PUT",
+        f"/api/v0/instances/{args.instance_id}/",
+        {"target_state": "stopped"},
+        content_json=True,
+    )
+    print(f"Instance {args.instance_id} stopped.")
+
+
+def _active_omnivoice_instances(prefix: str) -> List[Dict[str, Any]]:
+    """Return active instances whose label starts with prefix."""
     cols = urllib.parse.quote(json.dumps(["id", "label", "actual_status", "cur_state"]))
     data = _request("GET", f"/api/v1/instances/?select_cols={cols}&limit=200")
     instances = data.get("instances", [])
-
     active_states = {"running", "loading", "active"}
-    targets = [
+    return [
         inst for inst in instances
         if str(inst.get("label") or "").startswith(prefix)
         and (
@@ -378,6 +387,57 @@ def cmd_destroy_all(args: argparse.Namespace) -> None:
             or str(inst.get("actual_status") or "").lower() in active_states
         )
     ]
+
+
+def cmd_stop_all(args: argparse.Namespace) -> None:
+    """Stop all running/loading/active instances whose label starts with the prefix."""
+    prefix = args.prefix or DEFAULT_LABEL_PREFIX
+    targets = _active_omnivoice_instances(prefix)
+
+    if not targets:
+        print(f"No active instances with label prefix '{prefix}' found.")
+        return
+
+    print(f"Stopping {len(targets)} instance(s) with label prefix '{prefix}':")
+    for inst in targets:
+        print(
+            f"  - id={inst['id']} label={inst.get('label')} "
+            f"state={inst.get('cur_state')} status={inst.get('actual_status')}"
+        )
+
+    if not args.yes:
+        confirm = input("Proceed? [y/N] ")
+        if confirm.lower() != "y":
+            sys.exit("Aborted.")
+
+    for inst in targets:
+        _request(
+            "PUT",
+            f"/api/v0/instances/{inst['id']}/",
+            {"target_state": "stopped"},
+            content_json=True,
+        )
+        print(f"  Stopped id={inst['id']}")
+
+    # Confirm resulting states.
+    cols = urllib.parse.quote(json.dumps(["id", "label", "actual_status", "cur_state"]))
+    data = _request("GET", f"/api/v1/instances/?select_cols={cols}&limit=200")
+    remaining = [
+        inst for inst in data.get("instances", [])
+        if str(inst.get("label") or "").startswith(prefix)
+    ]
+    print(f"\n'{prefix}*' instances: {len(remaining)}")
+    for inst in remaining:
+        print(
+            f"  - id={inst['id']} label={inst.get('label')} "
+            f"state={inst.get('cur_state')} status={inst.get('actual_status')}"
+        )
+
+
+def cmd_destroy_all(args: argparse.Namespace) -> None:
+    """Destroy all running/loading/active instances whose label starts with the prefix."""
+    prefix = args.prefix or DEFAULT_LABEL_PREFIX
+    targets = _active_omnivoice_instances(prefix)
 
     if not targets:
         print(f"No active instances with label prefix '{prefix}' found.")
@@ -400,6 +460,7 @@ def cmd_destroy_all(args: argparse.Namespace) -> None:
         print(f"  Destroyed id={inst['id']}")
 
     # Confirm remaining instances and credit.
+    cols = urllib.parse.quote(json.dumps(["id", "label", "actual_status", "cur_state"]))
     data = _request("GET", f"/api/v1/instances/?select_cols={cols}&limit=200")
     remaining = [
         inst for inst in data.get("instances", [])
@@ -478,8 +539,17 @@ def main() -> None:
     p_smoke.add_argument("--text", default="Hello, this is OmniVoice running on Vast.ai.")
     p_smoke.add_argument("--language", default="en")
 
-    p_destroy = sub.add_parser("destroy", help="Destroy a specific instance")
+    p_destroy = sub.add_parser("destroy", help="Destroy a specific instance permanently")
     p_destroy.add_argument("instance_id", type=int, help="Instance id")
+
+    p_stop = sub.add_parser("stop", help="Stop (pause) a specific instance without deleting it")
+    p_stop.add_argument("instance_id", type=int, help="Instance id")
+
+    p_stop_all = sub.add_parser(
+        "stop-all", help="Stop all active instances with a label prefix"
+    )
+    p_stop_all.add_argument("--prefix", default=DEFAULT_LABEL_PREFIX, help="Label prefix")
+    p_stop_all.add_argument("--yes", action="store_true", help="Skip confirmation")
 
     p_destroy_all = sub.add_parser(
         "destroy-all", help="Destroy all active instances with a label prefix"
