@@ -2010,12 +2010,19 @@ def _generate_with_duration_refinement(
     voice_clone_prompt=None,
     max_duration=None,
     ratio_clamp=None,
+    initial_duration=None,
     **gen_kwargs,
 ):
     """Generate audio, optionally retrying until duration is within tolerance.
 
     Uses dampened ratio correction to handle the OmniVoice model's non-linear
     duration response and avoid overshoot/oscillation.
+
+    Args:
+        initial_duration: Optional starting value for the duration parameter.
+            When provided (e.g. from a previous refinement pass), refinement
+            starts from this value instead of target_duration, reducing the
+            number of generations needed to converge.
 
     Returns:
         (audio_waveform, attempts_made, attempt_log)
@@ -2041,7 +2048,11 @@ def _generate_with_duration_refinement(
     rest_clamp = ratio_clamp or (0.8, 1.3)
     dampening = 0.6
 
-    current_duration = target_duration
+    current_duration = (
+        float(initial_duration)
+        if initial_duration is not None and initial_duration > 0
+        else target_duration
+    )
     best_audio = None
     best_error = float("inf")
     attempt_log = []
@@ -2873,6 +2884,26 @@ def _duration_error(waveform, sampling_rate: int, target_duration: Optional[floa
     return abs(_audio_duration(waveform, sampling_rate) - target_duration)
 
 
+def _apply_duration_target_params(gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Make generation parameters more conservative when a target duration is set.
+
+    Lower t_shift and slightly more steps/guidance improve timing stability on
+    the first pass, which is the main source of retry latency for duration-
+    constrained requests.
+    """
+    conservative = dict(gen_kwargs)
+    conservative["inference_timesteps"] = min(
+        int(conservative.get("inference_timesteps", 32) * 1.25), 64
+    )
+    conservative["cfg_value"] = min(
+        float(conservative.get("cfg_value", 2.0)) + 0.2, 3.0
+    )
+    conservative["t_shift"] = max(
+        float(conservative.get("t_shift", 0.1)) * 0.7, 0.03
+    )
+    return conservative
+
+
 def _generate_with_quality_retry(
     model,
     text,
@@ -2889,6 +2920,13 @@ def _generate_with_quality_retry(
     Returns:
         (audio_waveform, duration_attempts, duration_log, quality_issues, quality_retried)
     """
+    # When a target duration is requested, use conservative timing params on the
+    # first pass so the model is more likely to hit the target without retrying.
+    first_pass_kwargs = (
+        _apply_duration_target_params(gen_kwargs)
+        if target_duration is not None and target_duration > 0
+        else gen_kwargs
+    )
     audio, attempts, log = _generate_with_duration_refinement(
         model,
         text,
@@ -2897,7 +2935,7 @@ def _generate_with_quality_retry(
         max_attempts=_DURATION_REFINEMENT_INITIAL_ATTEMPTS,
         voice_clone_prompt=voice_clone_prompt,
         max_duration=max_duration,
-        **gen_kwargs,
+        **first_pass_kwargs,
     )
     issues, _spike_locs = _check_audio_quality(
         audio,
@@ -2922,6 +2960,9 @@ def _generate_with_quality_retry(
     retry_attempts = 2
     if any(i in issues for i in ("duration_off_target", "duration_off_reference")):
         retry_attempts = 3
+    # Seed the retry with the last explored duration parameter from the first
+    # pass so we don't relearn the model's duration response from scratch.
+    retry_initial_duration = log[-1]["target_duration"] if log else None
     audio2, attempts2, log2 = _generate_with_duration_refinement(
         model,
         text,
@@ -2930,6 +2971,7 @@ def _generate_with_quality_retry(
         max_attempts=retry_attempts,
         voice_clone_prompt=voice_clone_prompt,
         max_duration=max_duration,
+        initial_duration=retry_initial_duration,
         **fallback_kwargs,
     )
     issues2, _spike_locs2 = _check_audio_quality(
