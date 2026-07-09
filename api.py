@@ -184,6 +184,12 @@ _VOXCPM_NORMALIZE_AVAILABLE = None
 _ENFORCE_MAX_DURATION = str(
     os.environ.get("OMNIVOICE_ENFORCE_MAX_DURATION", "0")
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Number of duration-refinement attempts on the first synthesis pass. Increase
+# this (env var) when cloud callers frequently see duration_off_target severe
+# issues and the extra latency is acceptable.
+_DURATION_REFINEMENT_INITIAL_ATTEMPTS = int(
+    os.environ.get("OMNIVOICE_DURATION_REFINEMENT_INITIAL_ATTEMPTS", "3")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2843,7 +2849,7 @@ def _generate_with_quality_retry(
         text,
         target_duration=target_duration,
         duration_tolerance=duration_tolerance,
-        max_attempts=2,
+        max_attempts=_DURATION_REFINEMENT_INITIAL_ATTEMPTS,
         voice_clone_prompt=voice_clone_prompt,
         max_duration=max_duration,
         **gen_kwargs,
