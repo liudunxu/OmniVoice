@@ -146,7 +146,7 @@ _FATAL_REFERENCE_ISSUES = frozenset({
     "decode_error",
 })
 _BLOCK_FATAL_REFERENCE = str(
-    os.environ.get("OMNIVOICE_BLOCK_FATAL_REFERENCE", "1")
+    os.environ.get("OMNIVOICE_BLOCK_FATAL_REFERENCE", "0")
 ).strip().lower() in {"1", "true", "yes", "on"}
 _FATAL_REFERENCE_MIN_DURATION = float(
     os.environ.get("OMNIVOICE_FATAL_REFERENCE_MIN_DURATION", "0.5")
@@ -1414,11 +1414,20 @@ def _separate_audio_sync(input_path, output_dir, options):
 
 
 def _decode_base64_audio_bytes(b64_data):
-    """Decode base64 audio data to bytes. Supports data URI prefix."""
+    """Decode base64 audio data to bytes. Supports data URI prefix.
+
+    Tolerates missing padding so a malformed client payload still has a chance
+    to decode instead of failing the whole request.
+    """
     b64_data = str(b64_data or "").strip()
     if b64_data.startswith("data:"):
         b64_data = b64_data.split(",", 1)[1] if "," in b64_data else b64_data
-    return base64.b64decode(b64_data)
+    try:
+        return base64.b64decode(b64_data)
+    except base64.binascii.Error:
+        # Retry with corrected padding before giving up.
+        padded = b64_data + "=" * (-len(b64_data) % 4)
+        return base64.b64decode(padded)
 
 
 def _write_base64_audio(b64_data, out_path):
@@ -3574,6 +3583,88 @@ def _recommend_gain(levels, target_db):
 
 
 @routes.post("/api/synthesize")
+def _last_resort_omnivoice_retry(
+    model,
+    text,
+    *,
+    target_duration,
+    duration_tolerance,
+    voice_clone_prompt,
+    ref_duration,
+    max_duration,
+    base_seed,
+    **gen_kwargs,
+):
+    """Final retry when the normal synthesis path raised or produced empty audio.
+
+    Uses maximally conservative diffusion params and disables prompt preprocessing
+    / denoising to give the model the best chance of emitting *any* audio.
+    Returns the same tuple as _generate_with_quality_retry.
+    """
+    logger.warning(
+        "OmniVoice last-resort retry for text=%r seed=%s target=%s",
+        text[:80],
+        base_seed,
+        target_duration,
+    )
+    retry_kwargs = dict(gen_kwargs)
+    retry_kwargs["inference_timesteps"] = 64
+    retry_kwargs["cfg_value"] = 3.0
+    retry_kwargs["denoise"] = False
+    retry_kwargs["preprocess_prompt"] = False
+    retry_kwargs["postprocess_output"] = True
+    retry_kwargs["t_shift"] = 0.03
+    retry_kwargs["position_temperature"] = 1.0
+    retry_kwargs["seed"] = ((base_seed or 0) + 1) % (2**31 - 1)
+    return _generate_with_quality_retry(
+        model,
+        text,
+        target_duration=target_duration,
+        duration_tolerance=duration_tolerance,
+        voice_clone_prompt=voice_clone_prompt,
+        ref_duration=ref_duration,
+        max_duration=max_duration,
+        enable_quality_retry=False,
+        **retry_kwargs,
+    )
+
+
+def _last_resort_voxcpm_retry(
+    model,
+    text,
+    *,
+    base_seed,
+    **gen_kwargs,
+):
+    """Final retry for VoxCPM2 when normal generation raised an exception."""
+    logger.warning(
+        "VoxCPM last-resort retry for text=%r seed=%s",
+        text[:80],
+        base_seed,
+    )
+    retry_kwargs = dict(gen_kwargs)
+    retry_kwargs["seed"] = ((base_seed or 0) + 1) % (2**31 - 1)
+    retry_kwargs["inference_timesteps"] = min(
+        int(retry_kwargs.get("inference_timesteps", 32)) + 4, 64
+    )
+    retry_kwargs["cfg_value"] = min(
+        float(retry_kwargs.get("cfg_value", 2.0)) + 0.2, 3.0
+    )
+    retry_kwargs["denoise"] = False
+    retry_kwargs["trim_silence_vad"] = False
+    retry_kwargs["normalize"] = False
+    retry_kwargs["retry_badcase"] = False
+    return _generate_voxcpm_sync(model, text, **retry_kwargs)
+
+
+async def _last_resort_omnivoice_retry_async(*args, **kwargs):
+    return await asyncio.to_thread(_last_resort_omnivoice_retry, *args, **kwargs)
+
+
+async def _last_resort_voxcpm_retry_async(*args, **kwargs):
+    return await asyncio.to_thread(_last_resort_voxcpm_retry, *args, **kwargs)
+
+
 async def synthesize(request):
     client_ip = request.remote or "-"
     req_id = uuid.uuid4().hex[:8]
@@ -3591,8 +3682,8 @@ async def synthesize(request):
         logger.warning(f"[{req_id}] Missing text parameter")
         return _error("text is required and cannot be empty.")
     if len(text) > MAX_TEXT_LEN:
-        logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}")
-        return _error(f"text exceeds max length {MAX_TEXT_LEN}.")
+        logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}; truncating to max length")
+        text = text[:MAX_TEXT_LEN]
 
     language = (
         data.get("language")
@@ -4051,29 +4142,63 @@ async def synthesize(request):
                             preprocess_prompt=False,
                         )
 
-            (
-                audio_waveform,
-                attempts_made,
-                attempt_log,
-                quality_issues,
-                quality_retried,
-            ) = await asyncio.to_thread(
-                _generate_with_quality_retry,
-                model,
-                text,
-                target_duration=effective_duration,
-                duration_tolerance=duration_tolerance_sec,
-                voice_clone_prompt=voice_clone_prompt,
-                ref_duration=ref_duration,
-                max_duration=max_duration_sec,
-                enable_quality_retry=_bool_option(
-                    data.get("quality_retry"), True
-                ),
-                **gen_kwargs,
-            )
+            async def _generate_once():
+                return await asyncio.to_thread(
+                    _generate_with_quality_retry,
+                    model,
+                    text,
+                    target_duration=effective_duration,
+                    duration_tolerance=duration_tolerance_sec,
+                    voice_clone_prompt=voice_clone_prompt,
+                    ref_duration=ref_duration,
+                    max_duration=max_duration_sec,
+                    enable_quality_retry=_bool_option(
+                        data.get("quality_retry"), True
+                    ),
+                    **gen_kwargs,
+                )
+
+            try:
+                (
+                    audio_waveform,
+                    attempts_made,
+                    attempt_log,
+                    quality_issues,
+                    quality_retried,
+                ) = await _generate_once()
+                if "empty" in quality_issues:
+                    raise RuntimeError("Generated audio is empty after quality retry")
+            except Exception as first_exc:
+                logger.warning(
+                    f"[{req_id}] first synthesis attempt failed: {first_exc}; "
+                    "trying last-resort conservative retry"
+                )
+                try:
+                    (
+                        audio_waveform,
+                        attempts_made,
+                        attempt_log,
+                        quality_issues,
+                        quality_retried,
+                    ) = await _last_resort_omnivoice_retry_async(
+                        model,
+                        text,
+                        target_duration=effective_duration,
+                        duration_tolerance=duration_tolerance_sec,
+                        voice_clone_prompt=voice_clone_prompt,
+                        ref_duration=ref_duration,
+                        max_duration=max_duration_sec,
+                        base_seed=seed,
+                        **gen_kwargs,
+                    )
+                except Exception as retry_exc:
+                    raise RuntimeError(
+                        f"Synthesis failed after last-resort retry: {retry_exc}"
+                    ) from retry_exc
+
             if "empty" in quality_issues:
                 raise RuntimeError(
-                    "Generated audio is empty after quality retry. "
+                    "Generated audio is empty after last-resort retry. "
                     "Use a longer, non-silent reference audio or disable voice cloning."
                 )
             # Re-run QC on the final waveform to capture spike locations after any
@@ -4654,7 +4779,8 @@ async def synthesize_voxcpm(request):
     if not text:
         return _error("text is required and cannot be empty")
     if len(text) > MAX_TEXT_LEN:
-        return _error(f"text exceeds max length {MAX_TEXT_LEN}")
+        logger.warning(f"[{req_id}] Text too long: {len(text)} > {MAX_TEXT_LEN}; truncating to max length")
+        text = text[:MAX_TEXT_LEN]
 
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -4972,7 +5098,21 @@ async def synthesize_voxcpm(request):
 
         async with _API_INFER_SEM:
             logger.info(f"[{req_id}] voxcpm synthesis started (cfg={cfg_value}, steps={inference_timesteps})")
-            audio_waveform = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **gen_kwargs)
+            try:
+                audio_waveform = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **gen_kwargs)
+            except Exception as first_exc:
+                logger.warning(
+                    f"[{req_id}] first voxcpm synthesis attempt failed: {first_exc}; "
+                    "trying last-resort conservative retry"
+                )
+                try:
+                    audio_waveform = await _last_resort_voxcpm_retry_async(
+                        model, text, base_seed=seed, **gen_kwargs
+                    )
+                except Exception as retry_exc:
+                    raise RuntimeError(
+                        f"VoxCPM synthesis failed after last-resort retry: {retry_exc}"
+                    ) from retry_exc
             attempts = 1
             _issues, spike_locations = _check_audio_quality_after_ceiling(
                 audio_waveform, sample_rate,
