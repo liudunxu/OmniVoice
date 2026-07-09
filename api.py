@@ -4781,8 +4781,8 @@ async def synthesize_voxcpm(request):
                 and quality_retry_max >= 2
             ):
                 duration_args = list(gen_args)
-                duration_args[17] = ((seed or 0) + 13) % (2**31 - 1)
-                duration_new_seed = duration_args[17]
+                duration_args[15] = ((seed or 0) + 13) % (2**31 - 1)
+                duration_new_seed = duration_args[15]
                 logger.info(
                     f"[{req_id}] voxcpm duration candidate retry "
                     f"(target={target_duration_sec:.3f}s, new seed={duration_new_seed})"
@@ -4832,10 +4832,10 @@ async def synthesize_voxcpm(request):
                 )
                 if leak_detected:
                     leak_args = list(gen_args)
-                    leak_args[17] = (seed + 1) % (2**31 - 1)  # bump seed
+                    leak_args[15] = (seed + 1) % (2**31 - 1)  # bump seed
                     leak_args[5] = leak_base_cfg               # keep raised cfg
                     leak_args[6] = min(leak_base_steps + 2, 64)  # one more diffusion step
-                    leak_new_seed = leak_args[17]
+                    leak_new_seed = leak_args[15]
                     logger.info(
                         f"[{req_id}] voxcpm prompt-leak retry "
                         f"(leak~{leak_samples / sample_rate:.2f}s, new seed={leak_new_seed})"
@@ -4944,8 +4944,8 @@ async def synthesize_voxcpm(request):
         and _qc_language_mismatch_triggers_retry(text_completeness_qc, language)
     ):
         regen_args = list(gen_args)
-        regen_args[17] = ((seed or 0) + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
-        regen_new_seed = regen_args[17]
+        regen_args[15] = ((seed or 0) + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
+        regen_new_seed = regen_args[15]
         logger.info(
             f"[{req_id}] voxcpm language-mismatch regenerate "
             f"(detected={text_completeness_qc.get('whisper_language')} "
