@@ -130,6 +130,18 @@ OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOK
 OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
 OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.94"))
 
+# Non-speech emotional-vocalization event detection (crying/screaming/etc.).
+# Conservative by design: prefer false negatives over false positives on short
+# impulses, because injected events preserve the original vocal and a short
+# spike gated on/off at mix time pops.
+EVENT_DETECT_MIN_DURATION_S = float(os.environ.get("OMNIVOICE_EVENT_MIN_DURATION", "0.35"))
+EVENT_DETECT_MERGE_GAP_S = float(os.environ.get("OMNIVOICE_EVENT_MERGE_GAP", "0.25"))
+EVENT_DETECT_MIN_GAP_S = float(os.environ.get("OMNIVOICE_EVENT_MIN_GAP", "0.12"))
+EVENT_DETECT_MAX_EVENTS = int(os.environ.get("OMNIVOICE_EVENT_MAX_EVENTS", "60"))
+EVENT_DETECT_MIN_CONF = float(os.environ.get("OMNIVOICE_EVENT_MIN_CONF", "0.55"))
+EVENT_DETECT_TARGET_SR = int(os.environ.get("OMNIVOICE_EVENT_TARGET_SR", "16000"))
+EVENT_BOUNDARY_SEARCH_S = float(os.environ.get("OMNIVOICE_EVENT_BOUNDARY_SEARCH", "0.06"))
+
 # Quality-issue labels considered severe enough to drive retry / report.
 # Shared by the OmniVoice and VoxCPM synth paths so the set stays in sync.
 _SEVERE_ISSUE_LABELS = frozenset({
@@ -186,6 +198,11 @@ _API_INFER_SEM = asyncio.Semaphore(
 )
 _WHISPER_INFER_SEM = asyncio.Semaphore(
     int(os.environ.get("WHISPER_MAX_CONCURRENCY", "1"))
+)
+# Non-speech event detection is numpy-only (no NN model), so it can run with
+# higher concurrency than the GPU-bound synthesize/whisper paths.
+_EVENTS_INFER_SEM = asyncio.Semaphore(
+    int(os.environ.get("EVENTS_MAX_CONCURRENCY", "4"))
 )
 
 _DURATION_ESTIMATOR = RuleDurationEstimator()
@@ -2703,6 +2720,251 @@ def _detect_plosive_spikes(
         issues.append("plosive")
 
     return issues, spike_locations
+
+
+def _snap_to_zerocrossing(waveform, sampling_rate: int, t_sec: float, search_s: float) -> float:
+    """Return a time near t_sec where |sample| is locally minimal (a zero
+    crossing / energy valley) within +/- search_s. Aligning mix gate edges to
+    near-silent samples avoids clicks. Falls back to t_sec if no audio/bounds.
+    """
+    arr = _mono_float32(waveform)
+    if arr.size == 0 or sampling_rate <= 0 or search_s <= 0:
+        return t_sec
+    center = int(t_sec * sampling_rate)
+    span = int(search_s * sampling_rate)
+    lo = max(0, center - span)
+    hi = min(arr.size, center + span + 1)
+    if hi <= lo:
+        return t_sec
+    window = np.abs(arr[lo:hi])
+    if window.size == 0:
+        return t_sec
+    best = int(np.argmin(window))
+    return (lo + best) / sampling_rate
+
+
+def _interval_f0_contour(waveform, sampling_rate: int, start: float, end: float):
+    """Frame-wise F0 + correlation over [start, end] via _estimate_frame_f0.
+    80ms frames, 40ms hop. Returns (f0_list, corr_list) excluding None frames."""
+    arr = _mono_float32(waveform)
+    s = max(0, int(start * sampling_rate))
+    e = min(arr.size, int(end * sampling_rate))
+    if e <= s:
+        return [], []
+    frame = max(1, int(0.080 * sampling_rate))
+    hop = max(1, int(0.040 * sampling_rate))
+    f0_list, corr_list = [], []
+    for off in range(s, max(s, e - frame + 1), hop):
+        chunk = arr[off:off + frame]
+        if chunk.size < frame:
+            break
+        res = _estimate_frame_f0(chunk.tolist(), sampling_rate)
+        if res is not None:
+            f0, corr = res
+            f0_list.append(float(f0))
+            corr_list.append(float(corr))
+    return f0_list, corr_list
+
+
+def _interval_feature_stats(waveform, sampling_rate: int, start: float, end: float) -> Optional[dict]:
+    """Raw per-frame spectral stats over [start, end]. Reuses the 8-band FFT
+    math from _basic_voice_feature but returns un-normalized means/stds (and a
+    clipped_ratio) for rule-based classification, not a fingerprint vector."""
+    y = _mono_float32(waveform)
+    s = max(0, int(start * sampling_rate))
+    e = min(y.size, int(end * sampling_rate))
+    if e - s < max(256, int(0.18 * sampling_rate)):
+        return None
+    seg = y[s:e]
+    frame = max(128, int(0.04 * sampling_rate))
+    hop = max(64, int(0.02 * sampling_rate))
+    if seg.size < frame:
+        frame = seg.size
+    window = np.hanning(frame).astype(np.float32)
+    freqs = np.fft.rfftfreq(frame, d=1.0 / sampling_rate)
+    rows = []
+    for st in range(0, max(1, seg.size - frame + 1), hop):
+        chunk = seg[st:st + frame]
+        if chunk.size < frame:
+            break
+        rms = _compute_rms(chunk)
+        spec = np.abs(np.fft.rfft(chunk * window)).astype(np.float64)
+        power = spec ** 2
+        total = float(np.sum(power)) + 1e-12
+        centroid = float(np.sum(freqs * power) / total)
+        bandwidth = float(np.sqrt(np.sum(((freqs - centroid) ** 2) * power) / total))
+        cumulative = np.cumsum(power)
+        rolloff_idx = min(max(0, int(np.searchsorted(cumulative, total * 0.85, side="left"))), len(freqs) - 1)
+        rolloff = float(freqs[rolloff_idx])
+        zcr = float(np.mean(np.abs(np.diff(np.signbit(chunk)))))
+        low = float(np.sum(power[(freqs >= 80) & (freqs < 400)]) / total)
+        mid = float(np.sum(power[(freqs >= 400) & (freqs < 1600)]) / total)
+        high = float(np.sum(power[(freqs >= 1600) & (freqs < 5000)]) / total)
+        flatness = float(np.exp(np.mean(np.log(power + 1e-12))) / (np.mean(power) + 1e-12))
+        rows.append([rms, centroid, bandwidth, rolloff, zcr, low, mid, high, flatness])
+    if not rows:
+        return None
+    arr = np.asarray(rows, dtype=np.float64)
+    clip_count = float(np.sum(np.abs(seg) > 0.985))
+    return {
+        "rms_mean": float(np.mean(arr[:, 0])),
+        "rms_std": float(np.std(arr[:, 0])),
+        "centroid_mean": float(np.mean(arr[:, 1])),
+        "bandwidth_mean": float(np.mean(arr[:, 2])),
+        "rolloff_mean": float(np.mean(arr[:, 3])),
+        "zcr_mean": float(np.mean(arr[:, 4])),
+        "low_mean": float(np.mean(arr[:, 5])),
+        "mid_mean": float(np.mean(arr[:, 6])),
+        "high_mean": float(np.mean(arr[:, 7])),
+        "flatness_mean": float(np.mean(arr[:, 8])),
+        "peak": float(np.max(np.abs(seg))),
+        "clipped_ratio": clip_count / float(seg.size),
+    }
+
+
+def _classify_event(stats, f0_list, spikes, duration, global_rms) -> Optional[tuple]:
+    """Rule-based, conservative classification of a candidate vocalization.
+    Returns (label, confidence) or None. Prefers false negatives on short
+    impulses — injected events preserve the original vocal, so a wrong label is
+    cosmetic but a short spike gated on/off pops."""
+    if stats is None:
+        return None
+    num_frames = max(1, len(f0_list) + max(0, int(duration / 0.04)))
+    voiced_ratio = len(f0_list) / num_frames
+    median_f0 = float(np.median(f0_list)) if f0_list else 0.0
+    f0_std = float(np.std(f0_list)) if f0_list else 0.0
+    rms_mean = stats["rms_mean"]
+    rms_rel = rms_mean / max(global_rms, 1e-6)
+    band_sum = stats["low_mean"] + stats["mid_mean"] + stats["high_mean"] + 1e-9
+    high_ratio = stats["high_mean"] / band_sum
+    centroid = stats["centroid_mean"]
+    spike_count = len(spikes)
+
+    # Reject clipped / pure-impulse regions — not sustained vocalization.
+    if stats["clipped_ratio"] > 0.02:
+        return None
+    if spike_count > 0 and duration < 0.5 and voiced_ratio < 0.3:
+        return None
+
+    label = None
+    conf = 0.0
+    if voiced_ratio >= 0.55 and 180 <= median_f0 <= 420 and f0_std < 45 \
+            and rms_rel >= 0.6 and centroid < 3500 and spike_count <= 2:
+        label = "crying"
+        conf = 0.5 * voiced_ratio + 0.3 * (1 - f0_std / 45) + 0.2 * min(1.0, rms_rel)
+    elif voiced_ratio >= 0.45 and median_f0 >= 200 and 45 <= f0_std < 120 \
+            and rms_rel >= 0.6 and centroid < 4000:
+        label = "wailing"
+        conf = 0.4 * voiced_ratio + 0.4 * min(1.0, f0_std / 120) + 0.2 * min(1.0, rms_rel)
+    elif rms_rel >= 1.2 and centroid >= 3500 and median_f0 >= 300 \
+            and high_ratio >= 0.25 and spike_count >= 1 and voiced_ratio >= 0.3:
+        label = "screaming"
+        conf = 0.3 * min(1.0, rms_rel / 2) + 0.3 * min(1.0, centroid / 6000) \
+            + 0.2 * min(1.0, high_ratio / 0.4) + 0.2 * voiced_ratio
+    elif 0.15 <= voiced_ratio <= 0.6 and median_f0 >= 150 \
+            and (stats["rms_std"] / max(rms_mean, 1e-6)) >= 0.5 and centroid < 4500:
+        label = "laughter"
+        conf = 0.4 * (stats["rms_std"] / max(rms_mean, 1e-6)) + 0.3 * voiced_ratio + 0.3 * min(1.0, rms_rel)
+    elif duration <= 1.2 and stats["flatness_mean"] >= 0.3 and voiced_ratio <= 0.4 \
+            and centroid >= 2000 and rms_rel >= 0.8:
+        label = "gasp"
+        conf = 0.4 * stats["flatness_mean"] + 0.3 * min(1.0, rms_rel) + 0.3 * (1 - voiced_ratio)
+
+    if label is None:
+        return None
+    conf = max(0.0, min(1.0, conf))
+    if conf < EVENT_DETECT_MIN_CONF:
+        return None
+    return label, conf
+
+
+def _detect_non_speech_events_sync(input_path, options) -> dict:
+    """Detect non-speech emotional vocalizations (crying/screaming/wailing/
+    laughter/gasp) on an isolated vocal track. Rule-based, conservative.
+
+    Returns {"events": [{"start","end","label","confidence"}]} (english labels).
+    """
+    try:
+        data, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
+        data = data.T
+    except Exception:
+        import librosa
+        data, sr = librosa.load(str(input_path), sr=EVENT_DETECT_TARGET_SR, mono=True)
+        data = np.asarray(data, dtype=np.float32)
+    if data.ndim > 1:
+        data = np.mean(data, axis=0)
+    else:
+        data = data.reshape(-1)
+    data = _mono_float32(data)
+    if data.size == 0 or sr <= 0:
+        return {"events": []}
+    if sr != EVENT_DETECT_TARGET_SR:
+        data = torchaudio.functional.resample(
+            torch.from_numpy(data), orig_freq=sr, new_freq=EVENT_DETECT_TARGET_SR
+        ).numpy()
+        sr = EVENT_DETECT_TARGET_SR
+
+    global_rms = float(np.sqrt(np.mean(np.square(data)))) if data.size else 0.0
+    if global_rms <= 1e-5:
+        return {"events": []}
+
+    candidates = _active_intervals_from_rms(
+        data, sr, min_duration=0.12, merge_gap=0.14
+    )
+    raw_events = []
+    for s, e in candidates:
+        if e - s < EVENT_DETECT_MIN_DURATION_S:
+            continue
+        stats = _interval_feature_stats(data, sr, s, e)
+        f0_list, _ = _interval_f0_contour(data, sr, s, e)
+        _, spike_locs = _detect_plosive_spikes(data[int(s * sr):int(e * sr)], sr)
+        res = _classify_event(stats, f0_list, spike_locs, e - s, global_rms)
+        if res is None:
+            continue
+        label, conf = res
+        raw_events.append({"start": s, "end": e, "label": label, "confidence": conf})
+
+    # Merge adjacent same-label events within the merge gap.
+    raw_events.sort(key=lambda ev: ev["start"])
+    merged = []
+    for ev in raw_events:
+        if merged and ev["label"] == merged[-1]["label"] \
+                and ev["start"] - merged[-1]["end"] <= EVENT_DETECT_MERGE_GAP_S:
+            merged[-1]["end"] = ev["end"]
+            merged[-1]["confidence"] = max(merged[-1]["confidence"], ev["confidence"])
+        else:
+            merged.append(dict(ev))
+
+    # Enforce min inter-event gap: drop the lower-confidence of overlapping.
+    merged.sort(key=lambda ev: ev["start"])
+    deduped = []
+    for ev in merged:
+        if deduped and ev["start"] < deduped[-1]["end"] + EVENT_DETECT_MIN_GAP_S:
+            if ev["confidence"] > deduped[-1]["confidence"]:
+                deduped[-1] = ev
+            continue
+        deduped.append(ev)
+
+    # Cap to max events, keeping highest confidence.
+    if len(deduped) > EVENT_DETECT_MAX_EVENTS:
+        deduped.sort(key=lambda ev: ev["confidence"], reverse=True)
+        deduped = deduped[:EVENT_DETECT_MAX_EVENTS]
+        deduped.sort(key=lambda ev: ev["start"])
+
+    # Snap boundaries to zero crossings.
+    events = []
+    for ev in deduped:
+        s = _snap_to_zerocrossing(data, sr, ev["start"], EVENT_BOUNDARY_SEARCH_S)
+        e = _snap_to_zerocrossing(data, sr, ev["end"], EVENT_BOUNDARY_SEARCH_S)
+        if e - s < EVENT_DETECT_MIN_DURATION_S:
+            continue
+        events.append({
+            "start": _round_float(s, 3),
+            "end": _round_float(e, 3),
+            "label": ev["label"],
+            "confidence": _round_float(ev["confidence"], 3),
+        })
+    return {"events": events}
 
 
 def _detect_periodic_pulse_artifact(
@@ -5729,6 +5991,48 @@ async def whisper_transcribe(request):
         "model": model_name,
         "elapsed_seconds": elapsed,
         **result,
+    })
+
+
+@routes.post("/api/asr/detect_events")
+async def asr_detect_events(request):
+    """Detect non-speech emotional vocalizations (crying/screaming/wailing/
+    laughter/gasp) on an isolated vocal track. Rule-based, no NN model.
+
+    Returns timestamped events so callers (e.g. the dubbing pipeline) can inject
+    them as keep_original cues that preserve the original vocal. English labels.
+    """
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+
+    out_root = Path(os.environ.get("EVENTS_OUTPUT_DIR") or (WORK_ROOT / "events_outputs"))
+    request_dir = out_root / req_id
+    input_path = None
+    start_time = time.time()
+    try:
+        input_path, options = await _read_separation_request(request, req_id, request_dir)
+        logger.info(f"[{req_id}] detect_events started: input={input_path}")
+        async with _EVENTS_INFER_SEM:
+            result = await asyncio.to_thread(_detect_non_speech_events_sync, input_path, options)
+    except ValueError as exc:
+        logger.warning(f"[{req_id}] Invalid detect_events request: {exc}")
+        return _error(f"Invalid detect_events request: {exc}", status=400)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"[{req_id}] detect_events failed: {exc}\n{tb}")
+        return _error(f"Event detection failed: {exc}\n{tb}", status=502)
+    finally:
+        if input_path is not None:
+            _cleanup_temp_paths(input_path)
+
+    elapsed = round(time.time() - start_time, 3)
+    events = result.get("events") or []
+    logger.info(f"[{req_id}] detect_events finished in {elapsed}s, events={len(events)}")
+    return _json_response({
+        "ok": True,
+        "elapsed_seconds": elapsed,
+        "events": events,
     })
 
 
