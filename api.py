@@ -3607,7 +3607,6 @@ def _recommend_gain(levels, target_db):
     return round(max(0.2, min(5.0, 10 ** (db_change / 20.0))), 4)
 
 
-@routes.post("/api/synthesize")
 def _last_resort_omnivoice_retry(
     model,
     text,
@@ -3690,6 +3689,7 @@ async def _last_resort_voxcpm_retry_async(*args, **kwargs):
     return await asyncio.to_thread(_last_resort_voxcpm_retry, *args, **kwargs)
 
 
+@routes.post("/api/synthesize")
 async def synthesize(request):
     client_ip = request.remote or "-"
     req_id = uuid.uuid4().hex[:8]
