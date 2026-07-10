@@ -128,6 +128,11 @@ OUTPUT_TEXT_QC_LANGS = {
 OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "large-v3")
 OUTPUT_TEXT_QC_MIN_TOKENS = int(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_TOKENS", "3"))
 OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_COVERAGE", "0.62"))
+# Whisper coverage on very short clips is unreliable (partial transcriptions,
+# no-speech misfires), so text_incomplete is not flagged below this output length.
+OUTPUT_TEXT_QC_MIN_AUDIO_DURATION = float(
+    os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_AUDIO_DURATION", "1.0")
+)
 OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.94"))
 
 # Quality-issue labels considered severe enough to drive retry / report.
@@ -4327,8 +4332,13 @@ async def synthesize(request):
             )
             if text_completeness_qc.get("status") == "incomplete":
                 quality_issues = list(quality_issues)
-                if "text_incomplete" not in quality_issues:
-                    quality_issues.append("text_incomplete")
+                # Whisper coverage on very short clips is unreliable; don't
+                # escalate to a severe text_incomplete flag below the threshold.
+                # source_script_residue is a deterministic check, not whisper-based.
+                output_dur = audio_waveform.shape[-1] / model.sampling_rate
+                if output_dur >= OUTPUT_TEXT_QC_MIN_AUDIO_DURATION:
+                    if "text_incomplete" not in quality_issues:
+                        quality_issues.append("text_incomplete")
                 if text_completeness_qc.get("source_script_residue") and "source_script_residue" not in quality_issues:
                     quality_issues.append("source_script_residue")
                 logger.warning(
@@ -5149,12 +5159,16 @@ async def synthesize_voxcpm(request):
                 audio_waveform, sample_rate,
                 target_duration=target_duration_sec,
                 duration_tolerance=duration_tolerance_sec,
-                ref_duration=ref_duration,
+                # VoxCPM's reference audio is only a timbre anchor; its duration
+                # has no relation to the requested output length. Comparing the
+                # generated duration to the reference duration falsely flags
+                # short texts as duration_off_reference.
+                ref_duration=None,
             )
             quality_issues = list(_issues)
 
             # Retry trigger set: at this stage quality_issues comes only from
-            # _check_audio_quality, so duration_off_* (added later by the
+            # _check_audio_quality, so duration_off_target (added later by the
             # max_duration clamp) cannot appear — _SEVERE_ISSUE_LABELS is safe.
             # When the duration cap was relaxed, the caller already accepts a
             # longer audio for downstream atempo fitting, so duration_off_target
@@ -5190,7 +5204,7 @@ async def synthesize_voxcpm(request):
                         retry_wav, sample_rate,
                         target_duration=target_duration_sec,
                         duration_tolerance=duration_tolerance_sec,
-                        ref_duration=ref_duration,
+                        ref_duration=None,
                     )
                     retry_severe = [
                         i for i in retry_issues
@@ -5243,7 +5257,7 @@ async def synthesize_voxcpm(request):
                         duration_wav, sample_rate,
                         target_duration=target_duration_sec,
                         duration_tolerance=duration_tolerance_sec,
-                        ref_duration=ref_duration,
+                        ref_duration=None,
                     )
                     current_severe = [
                         i for i in quality_issues
@@ -5389,8 +5403,15 @@ async def synthesize_voxcpm(request):
                 output_path_for_response, text, language, data
             )
             if text_completeness_qc.get("status") == "incomplete":
-                if "text_incomplete" not in quality_issues:
-                    quality_issues.append("text_incomplete")
+                # Whisper coverage on very short clips is unreliable (partial
+                # transcriptions, no-speech misfires). Keep the raw QC result
+                # attached for inspection, but don't escalate to a severe
+                # text_incomplete flag when the output is too short for a
+                # stable transcription.
+                output_dur = audio_waveform.shape[-1] / sample_rate
+                if output_dur >= OUTPUT_TEXT_QC_MIN_AUDIO_DURATION:
+                    if "text_incomplete" not in quality_issues:
+                        quality_issues.append("text_incomplete")
         except Exception as exc:
             logger.warning(f"[{req_id}] voxcpm output text QC failed: {exc}")
             text_completeness_qc = {"version": 1, "status": "error", "error": str(exc)[:500]}
@@ -5427,7 +5448,7 @@ async def synthesize_voxcpm(request):
                 sample_rate,
                 target_duration=target_duration_sec,
                 duration_tolerance=duration_tolerance_sec,
-                ref_duration=ref_duration,
+                ref_duration=None,
             )
             regen_signal_severe = [
                 issue
