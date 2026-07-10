@@ -5,6 +5,7 @@ WORKDIR /app
 
 COPY api.py /app/api.py
 COPY omnivoice/ /app/omnivoice/
+COPY voxcpm/ /app/voxcpm/
 COPY docker/entrypoint.sh /usr/local/bin/omnivoice-api-entrypoint
 
 RUN chmod +x /usr/local/bin/omnivoice-api-entrypoint
