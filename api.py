@@ -120,7 +120,9 @@ MIN_REFERENCE_DURATION_FOR_DURATION_RATIO = float(
 )
 OUTPUT_TEXT_QC_LANGS = {
     code.strip().lower()
-    for code in os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_LANGS", "fil,tl").split(",")
+    for code in os.environ.get(
+        "OMNIVOICE_OUTPUT_TEXT_QC_LANGS", "fil,tl,id,en,th,pt,vi,zh"
+    ).split(",")
     if code.strip()
 }
 OUTPUT_TEXT_QC_MODEL = os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MODEL", "large-v3")
@@ -3190,8 +3192,14 @@ def _whisper_language_code(value) -> str:
 
 
 def _text_qc_tokens(text: str) -> list[str]:
-    normalized = re.sub(r"[^\w\s]+", " ", str(text or "").lower(), flags=re.UNICODE)
-    return [token for token in normalized.split() if token]
+    normalized = str(text or "").lower()
+    # Whisper often changes whitespace for CJK/Thai, so compare those scripts at
+    # character granularity while keeping space-delimited languages word-based.
+    return re.findall(
+        r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u0e00-\u0e7f]|[^\W_]+",
+        normalized,
+        flags=re.UNICODE,
+    )
 
 
 def _lcs_coverage(expected_tokens: list[str], actual_tokens: list[str]) -> float:
@@ -3307,6 +3315,23 @@ def _qc_language_mismatch_triggers_retry(
     if not expected:
         return False
     return str(detected).lower() != expected.lower()
+
+
+def _should_accept_text_qc_candidate(
+    current_qc: Optional[Dict[str, Any]],
+    candidate_qc: Optional[Dict[str, Any]],
+    current_signal_severe_count: int,
+    candidate_signal_severe_count: int,
+    prompt_leak: bool,
+) -> bool:
+    current_coverage = float((current_qc or {}).get("coverage") or 0.0)
+    candidate_coverage = float((candidate_qc or {}).get("coverage") or 0.0)
+    return (
+        candidate_coverage >= OUTPUT_TEXT_QC_MIN_COVERAGE
+        and candidate_coverage >= current_coverage + 0.05
+        and candidate_signal_severe_count <= current_signal_severe_count
+        and not prompt_leak
+    )
 
 
 routes = web.RouteTableDef()
@@ -5396,7 +5421,32 @@ async def synthesize_voxcpm(request):
             attempts += 1
             lang_regen = True
             regen_wav, _ = _clamp_waveform_to_max_duration(regen_wav, sample_rate, max_duration_sec)
-            regen_wav, _ = _apply_peak_ceiling(regen_wav, OUTPUT_PEAK_CEILING)
+            regen_wav, regen_peak_limited = _apply_peak_ceiling(regen_wav, OUTPUT_PEAK_CEILING)
+            regen_issues, regen_spikes = _check_audio_quality_after_ceiling(
+                regen_wav,
+                sample_rate,
+                target_duration=target_duration_sec,
+                duration_tolerance=duration_tolerance_sec,
+                ref_duration=ref_duration,
+            )
+            regen_signal_severe = [
+                issue
+                for issue in regen_issues
+                if issue in _SEVERE_ISSUE_LABELS
+                and not (duration_cap_relaxed and issue == "duration_off_target")
+            ]
+            current_signal_severe = [
+                issue
+                for issue in quality_issues
+                if issue in _SEVERE_ISSUE_LABELS
+                and issue not in {"text_incomplete", "source_script_residue"}
+                and not (duration_cap_relaxed and issue == "duration_off_target")
+            ]
+            regen_prompt_leak = False
+            if prompt_path is not None and prompt_audio_bytes is not None:
+                regen_prompt_leak, _ = _detect_prompt_leak(
+                    regen_wav, sample_rate, prompt_audio_bytes
+                )
             regen_wav_bytes = _waveform_to_wav_bytes(regen_wav, sample_rate)
             regen_path = out_dir / f"voxcpm2_{key}_langregen.wav"
             try:
@@ -5406,23 +5456,34 @@ async def synthesize_voxcpm(request):
                 )
             finally:
                 _cleanup_temp_paths(regen_path)
-            # Keep the regenerate only if it lifted coverage above the
-            # threshold (a genuine fix); otherwise fall back to the original.
-            if regen_qc.get("coverage", 0) >= OUTPUT_TEXT_QC_MIN_COVERAGE:
+            current_coverage = float((text_completeness_qc or {}).get("coverage") or 0.0)
+            regen_coverage = float(regen_qc.get("coverage") or 0.0)
+            # A language retry must improve the text materially without making
+            # signal quality worse or reintroducing the source prompt at the head.
+            if _should_accept_text_qc_candidate(
+                text_completeness_qc,
+                regen_qc,
+                len(current_signal_severe),
+                len(regen_signal_severe),
+                regen_prompt_leak,
+            ):
                 audio_waveform = regen_wav
                 wav_bytes = regen_wav_bytes
                 out_path.write_bytes(wav_bytes)
-                if "text_incomplete" in quality_issues:
-                    quality_issues.remove("text_incomplete")
+                quality_issues = list(regen_issues)
+                spike_locations = regen_spikes
+                peak_limited = regen_peak_limited
                 text_completeness_qc = regen_qc
                 logger.info(
                     f"[{req_id}] voxcpm language-mismatch regenerate accepted "
-                    f"(coverage->{regen_qc.get('coverage')})"
+                    f"(coverage {current_coverage:.3f}->{regen_coverage:.3f}, "
+                    f"issues={regen_issues})"
                 )
             else:
                 logger.info(
                     f"[{req_id}] voxcpm language-mismatch regenerate rejected "
-                    f"(coverage {regen_qc.get('coverage')} did not recover)"
+                    f"(coverage {current_coverage:.3f}->{regen_coverage:.3f}, "
+                    f"signal_issues={regen_signal_severe}, prompt_leak={regen_prompt_leak})"
                 )
         except Exception as exc:
             logger.warning(f"[{req_id}] voxcpm language-mismatch regenerate failed: {exc}")
