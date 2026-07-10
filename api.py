@@ -147,6 +147,17 @@ EVENT_DETECT_MIN_CONF = float(os.environ.get("OMNIVOICE_EVENT_MIN_CONF", "0.55")
 EVENT_DETECT_TARGET_SR = int(os.environ.get("OMNIVOICE_EVENT_TARGET_SR", "16000"))
 EVENT_BOUNDARY_SEARCH_S = float(os.environ.get("OMNIVOICE_EVENT_BOUNDARY_SEARCH", "0.06"))
 
+# Energy-based cue boundary refinement: trim trailing silence off cue ends by
+# snapping each end to the midpoint of the silence valley straddling it.
+# Conservative: only move a boundary when a real silence valley (>=MIN_GAP_S)
+# is found near it; continuous speech without a pause is left untouched.
+ENERGY_REFINE_SEARCH_S = float(os.environ.get("OMNIVOICE_ENERGY_REFINE_SEARCH", "0.30"))
+ENERGY_REFINE_FRAME_S = float(os.environ.get("OMNIVOICE_ENERGY_REFINE_FRAME", "0.025"))
+ENERGY_REFINE_HOP_S = float(os.environ.get("OMNIVOICE_ENERGY_REFINE_HOP", "0.010"))
+ENERGY_REFINE_SILENCE_RATIO = float(os.environ.get("OMNIVOICE_ENERGY_REFINE_SILENCE_RATIO", "0.25"))
+ENERGY_REFINE_MIN_GAP_S = float(os.environ.get("OMNIVOICE_ENERGY_REFINE_MIN_GAP", "0.06"))
+ENERGY_REFINE_TARGET_SR = int(os.environ.get("OMNIVOICE_ENERGY_REFINE_TARGET_SR", "16000"))
+
 # Quality-issue labels considered severe enough to drive retry / report.
 # Shared by the OmniVoice and VoxCPM synth paths so the set stays in sync.
 _SEVERE_ISSUE_LABELS = frozenset({
@@ -2970,6 +2981,131 @@ def _detect_non_speech_events_sync(input_path, options) -> dict:
             "confidence": _round_float(ev["confidence"], 3),
         })
     return {"events": events}
+
+
+def _find_silence_midpoint(
+    waveform: np.ndarray,
+    sampling_rate: int,
+    boundary_sec: float,
+    search_s: float,
+    frame_s: float,
+    hop_s: float,
+    silence_ratio: float,
+    min_gap_s: float,
+) -> Optional[float]:
+    """Find the midpoint of the silence valley straddling ``boundary_sec``.
+
+    Searches [boundary-search_s, boundary+search_s] for the longest run of
+    low-energy frames (rms < peak*silence_ratio). Returns its midpoint, or None
+    if no run is at least min_gap_s long — meaning continuous speech with no
+    real pause, so the boundary should not be moved.
+    """
+    y = _mono_float32(waveform)
+    if y.size == 0 or sampling_rate <= 0:
+        return None
+    lo_t = max(0.0, boundary_sec - search_s)
+    hi_t = min(y.size / sampling_rate, boundary_sec + search_s)
+    if hi_t <= lo_t:
+        return None
+    lo = int(lo_t * sampling_rate)
+    hi = int(hi_t * sampling_rate)
+    seg = y[lo:hi]
+    if seg.size < int(sampling_rate * frame_s):
+        return None
+    frames = _frame_rms_profile(seg, sampling_rate, frame_seconds=frame_s, hop_seconds=hop_s)
+    if not frames:
+        return None
+    # _frame_rms_profile returns times relative to seg; offset to absolute.
+    frames = [(lo_t + fs, lo_t + fe, r) for fs, fe, r in frames]
+    rms_vals = [r for _, _, r in frames]
+    peak = max(rms_vals) if rms_vals else 0.0
+    if peak <= 1e-6:
+        return None
+    thr = peak * silence_ratio
+    boundary_frame_idx = min(range(len(frames)), key=lambda i: abs(frames[i][0] - boundary_sec))
+    cur_start = None
+    runs = []
+    for i, r in enumerate(rms_vals):
+        if r < thr:
+            if cur_start is None:
+                cur_start = i
+        elif cur_start is not None:
+            runs.append((cur_start, i - 1))
+            cur_start = None
+    if cur_start is not None:
+        runs.append((cur_start, len(rms_vals) - 1))
+    # Only move the boundary if a silence run actually straddles it. Do NOT
+    # fall back to an arbitrary nearby valley — that would cut mid-word when
+    # the boundary itself sits in continuous speech.
+    containing = [r for r in runs if r[0] <= boundary_frame_idx <= r[1]]
+    if not containing:
+        return None
+    best_run = max(containing, key=lambda r: r[1] - r[0])
+    s_idx, e_idx = best_run
+    run_start_t = frames[s_idx][0]
+    run_end_t = frames[e_idx][1]
+    if run_end_t - run_start_t < min_gap_s:
+        return None
+    return (run_start_t + run_end_t) / 2.0
+
+
+def _refine_boundaries_by_energy_sync(input_path, options) -> dict:
+    """Trim trailing silence off each cue end by snapping it to the midpoint of
+    the silence valley straddling the end. Returns {"refined":[...], "adjusted_count"}.
+
+    Only moves an end inward (toward start); continuous-speech ends with no
+    detectable silence valley are left unchanged.
+    """
+    import json as _json
+    raw = options.get("boundaries") or "[]"
+    try:
+        boundaries = _json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        boundaries = []
+    if not isinstance(boundaries, list) or not boundaries:
+        return {"refined": [], "adjusted_count": 0}
+
+    try:
+        data, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
+        data = data.T
+    except Exception:
+        import librosa
+        data, sr = librosa.load(str(input_path), sr=ENERGY_REFINE_TARGET_SR, mono=True)
+        data = np.asarray(data, dtype=np.float32)
+    if data.ndim > 1:
+        data = np.mean(data, axis=0)
+    else:
+        data = data.reshape(-1)
+    data = _mono_float32(data)
+    if sr != ENERGY_REFINE_TARGET_SR:
+        data = torchaudio.functional.resample(
+            torch.from_numpy(data), orig_freq=sr, new_freq=ENERGY_REFINE_TARGET_SR
+        ).numpy()
+        sr = ENERGY_REFINE_TARGET_SR
+
+    refined = []
+    adjusted = 0
+    for item in boundaries:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = item.get("index")
+            start = float(item.get("start") or 0.0)
+            end = float(item.get("end") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        new_end = end
+        if end > start + 0.1:
+            mid = _find_silence_midpoint(
+                data, sr, end,
+                ENERGY_REFINE_SEARCH_S, ENERGY_REFINE_FRAME_S, ENERGY_REFINE_HOP_S,
+                ENERGY_REFINE_SILENCE_RATIO, ENERGY_REFINE_MIN_GAP_S,
+            )
+            if mid is not None and start + 0.1 < mid < end:
+                new_end = mid
+                adjusted += 1
+        refined.append({"index": idx, "start": _round_float(start, 3), "end": _round_float(new_end, 3)})
+    return {"refined": refined, "adjusted_count": adjusted}
 
 
 def _detect_periodic_pulse_artifact(
@@ -6054,6 +6190,50 @@ async def asr_detect_events(request):
         "ok": True,
         "elapsed_seconds": elapsed,
         "events": events,
+    })
+
+
+@routes.post("/api/energy/refine_boundaries")
+async def energy_refine_boundaries(request):
+    """Trim trailing silence off cue ends by snapping each end to the midpoint
+    of the silence valley straddling it. Audio + boundaries JSON in, refined
+    boundaries out. Conservative: ends with no detectable silence valley are
+    left unchanged (continuous speech is not perturbed).
+    """
+    client_ip = request.remote or "-"
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {client_ip}")
+
+    out_root = Path(os.environ.get("EVENTS_OUTPUT_DIR") or (WORK_ROOT / "events_outputs"))
+    request_dir = out_root / req_id
+    input_path = None
+    start_time = time.time()
+    try:
+        input_path, options = await _read_separation_request(request, req_id, request_dir)
+        async with _EVENTS_INFER_SEM:
+            result = await asyncio.to_thread(_refine_boundaries_by_energy_sync, input_path, options)
+    except ValueError as exc:
+        logger.warning(f"[{req_id}] Invalid refine_boundaries request: {exc}")
+        return _error(f"Invalid refine_boundaries request: {exc}", status=400)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"[{req_id}] refine_boundaries failed: {exc}\n{tb}")
+        return _error(f"Boundary refinement failed: {exc}\n{tb}", status=502)
+    finally:
+        if input_path is not None:
+            _cleanup_temp_paths(input_path)
+
+    elapsed = round(time.time() - start_time, 3)
+    refined = result.get("refined") or []
+    logger.info(
+        f"[{req_id}] refine_boundaries finished in {elapsed}s, "
+        f"boundaries={len(refined)}, adjusted={result.get('adjusted_count', 0)}"
+    )
+    return _json_response({
+        "ok": True,
+        "elapsed_seconds": elapsed,
+        "refined": refined,
+        "adjusted_count": result.get("adjusted_count", 0),
     })
 
 
