@@ -198,7 +198,9 @@ class MiniCPMAttention(nn.Module):
 
         # Use an explicit broadcastable mask shape for SDPA. A 1D mask can
         # trigger a CPU-side dimension bug in some PyTorch versions.
-        attn_mask = (torch.arange(key_cache.size(2), device=key_cache.device) <= position_id).view(1, 1, 1, -1)
+        # Use precomputed position ids to avoid torch.arange() on every step.
+        causal_positions = self._causal_position_ids[:, :, :, : key_cache.size(2)]
+        attn_mask = causal_positions <= position_id
 
         # ref: https://github.com/pytorch/pytorch/issues/163597
         # there is a bug in MPS for non-contiguous tensors, so we need to make them contiguous
@@ -429,3 +431,10 @@ class MiniCPMModel(nn.Module):
             dtype=dtype,
             max_length=max_length,
         )
+        # Precompute position indices for causal mask construction in forward_step.
+        # Avoids creating torch.arange() on every autoregressive step.
+        position_ids = torch.arange(max_length, device=device).view(1, 1, 1, -1)
+        for layer in self.layers:
+            if hasattr(layer.self_attn, "_causal_position_ids"):
+                delattr(layer.self_attn, "_causal_position_ids")
+            layer.self_attn.register_buffer("_causal_position_ids", position_ids, persistent=False)

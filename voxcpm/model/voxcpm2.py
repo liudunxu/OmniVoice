@@ -36,7 +36,6 @@ try:
     SAFETENSORS_AVAILABLE = True
 except ImportError:
     SAFETENSORS_AVAILABLE = False
-from tqdm import tqdm
 from transformers import LlamaTokenizerFast
 
 from ..modules.audiovae import AudioVAEV2, AudioVAEConfigV2
@@ -1080,7 +1079,7 @@ class VoxCPM2Model(nn.Module):
         self.residual_lm.kv_cache.fill_caches(residual_kv_cache_tuple)
         residual_hidden = residual_enc_outputs[:, -1, :]
 
-        for i in tqdm(range(max_len)):
+        for i in range(max_len):
             dit_hidden_1 = self.lm_to_dit_proj(lm_hidden)  # [b, h_dit]
             dit_hidden_2 = self.res_to_dit_proj(residual_hidden)  # [b, h_dit]
             dit_hidden = torch.cat((dit_hidden_1, dit_hidden_2), dim=-1)
@@ -1110,9 +1109,12 @@ class VoxCPM2Model(nn.Module):
                 if len(pred_feat_seq) > streaming_prefix_len:
                     pred_feat_seq = pred_feat_seq[-streaming_prefix_len:]
 
-            stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)[0].cpu().item()
-            if i > min_len and stop_flag == 1:
-                break
+            # Check stop predictor every 2 steps to reduce GPU->CPU sync overhead.
+            # At most one extra patch (~160 ms) is generated before stopping.
+            if i > min_len and (i - min_len) % 2 == 1:
+                stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)[0].cpu().item()
+                if stop_flag == 1:
+                    break
 
             lm_hidden = self.base_lm.forward_step(
                 curr_embed[:, 0, :], torch.tensor([self.base_lm.kv_cache.step()], device=curr_embed.device)

@@ -193,6 +193,15 @@ VOXCPM_OPTIMIZE = str(
     os.environ.get("VOXCPM_OPTIMIZE", "0")
 ).strip().lower() in {"1", "true", "yes", "on"}
 VOXCPM_VOICES_CACHE_SIZE = int(os.environ.get("VOXCPM_VOICES_CACHE_SIZE", "64"))
+VOXCPM_TRIM_LEADING_SILENCE = str(
+    os.environ.get("VOXCPM_TRIM_LEADING_SILENCE", "1")
+).strip().lower() in {"1", "true", "yes", "on"}
+VOXCPM_MAX_LEADING_TRIM_SEC = float(
+    os.environ.get("VOXCPM_MAX_LEADING_TRIM_SEC", "1.0")
+)
+VOXCPM_LEADING_TRIM_FADE_MS = float(
+    os.environ.get("VOXCPM_LEADING_TRIM_FADE_MS", "5.0")
+)
 # When true, loading one TTS engine unloads the other to free VRAM (single 24GB
 # GPU coexistence). Default 0: both may stay resident lazily.
 _EXCLUSIVE_MODE = str(
@@ -2270,6 +2279,61 @@ def _measure_active_speech_ratio(waveform, sampling_rate: int) -> float:
     intervals = _active_intervals_from_rms(waveform, sampling_rate)
     speech_total = sum(max(0.0, end - start) for start, end in intervals)
     return max(0.0, min(1.0, speech_total / duration))
+
+
+def _trim_voxcpm_leading_silence(
+    waveform,
+    sampling_rate: int,
+    max_trim_sec: float = 1.0,
+    fade_ms: float = 5.0,
+) -> tuple[np.ndarray, float]:
+    """Trim leading silence from VoxCPM2 generated audio to align speech start.
+
+    VoxCPM2 sometimes emits a short leading gap/room-tone before the first
+    phoneme, which makes the dubbed voice start later than the source cue.
+    This helper detects the first active frame with an adaptive RMS threshold
+    (10% of the 90th percentile, floor at ~-60 dBFS), keeps 10 ms of pre-onset
+    audio to preserve plosives, and applies a short fade-in.
+
+    Returns:
+        (trimmed_waveform, trimmed_seconds)
+    """
+    arr = _mono_float32(waveform)
+    if arr.size == 0:
+        return arr, 0.0
+
+    frames = _frame_rms_profile(arr, sampling_rate, frame_seconds=0.01, hop_seconds=0.005)
+    if not frames:
+        return arr, 0.0
+
+    rms_values = np.asarray([r for _, _, r in frames], dtype=np.float64)
+    high = float(np.percentile(rms_values, 90)) if rms_values.size else 0.0
+    # ~-60 dBFS floor, 10% of the loud-speech level.
+    threshold = max(0.001, high * 0.1)
+
+    first_speech_idx = None
+    for idx, (_, _, rms) in enumerate(frames):
+        if rms >= threshold:
+            first_speech_idx = idx
+            break
+
+    if first_speech_idx is None:
+        return arr, 0.0
+
+    # Look back one frame to preserve attack/plosive onset.
+    onset_idx = max(0, first_speech_idx - 1)
+    onset_sample = int(frames[onset_idx][0] * sampling_rate)
+    max_samples = int(max_trim_sec * sampling_rate)
+    trim_samples = min(onset_sample, max_samples)
+    if trim_samples <= 0:
+        return arr, 0.0
+
+    trimmed = arr[trim_samples:].copy()
+    fade_samples = min(int(fade_ms / 1000.0 * sampling_rate), trimmed.size // 4, 200)
+    if fade_samples > 1:
+        trimmed[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+
+    return trimmed, float(trim_samples / sampling_rate)
 
 
 def _compute_rms(waveform) -> float:
@@ -5299,8 +5363,10 @@ async def synthesize_voxcpm(request):
                 prompt_demoted_to_ref = True
 
     # Generation parameters (VoxCPM2 defaults; caller may override).
+    # inference_timesteps default raised from 10 to 20 to reduce AudioVAE V2
+    # transient smearing / "microphone-like" reverberant artifacts.
     cfg_value = float(data.get("cfg_value", 2.0))
-    inference_timesteps = int(data.get("inference_timesteps", 10))
+    inference_timesteps = int(data.get("inference_timesteps", 20))
     min_len = int(data.get("min_len", 2))
     max_len = int(data.get("max_len", 4096))
     retry_badcase = _bool_option(data.get("retry_badcase"), True)
@@ -5394,6 +5460,15 @@ async def synthesize_voxcpm(request):
 
     quality_retry = _bool_option(data.get("quality_retry"), True)
     quality_retry_max = int(data.get("quality_retry_max", 2))
+    trim_leading_silence = _bool_option(
+        data.get("trim_leading_silence"), VOXCPM_TRIM_LEADING_SILENCE
+    )
+    max_leading_trim_sec = float(
+        data.get("max_leading_trim_sec", VOXCPM_MAX_LEADING_TRIM_SEC)
+    )
+    leading_trim_fade_ms = float(
+        data.get("leading_trim_fade_ms", VOXCPM_LEADING_TRIM_FADE_MS)
+    )
     # control_instruction is accepted for API parity but VoxCPM2 has no
     # instruction-following mode, so it is ignored.
     _ = data.get("control_instruction") or data.get("instruct")
@@ -5753,6 +5828,20 @@ async def synthesize_voxcpm(request):
         return _error(f"Synthesis failed: {exc}\n{tb}", status=502)
 
     # Post-processing (reuse OmniVoice waveform helpers — all model-agnostic).
+    leading_trim_sec = 0.0
+    if trim_leading_silence:
+        audio_waveform, leading_trim_sec = _trim_voxcpm_leading_silence(
+            audio_waveform,
+            sample_rate,
+            max_trim_sec=max_leading_trim_sec,
+            fade_ms=leading_trim_fade_ms,
+        )
+        if leading_trim_sec > 0.005:
+            logger.info(
+                f"[{req_id}] voxcpm trimmed {leading_trim_sec:.3f}s leading silence "
+                f"(max={max_leading_trim_sec}s, fade={leading_trim_fade_ms}ms)"
+            )
+
     audio_waveform, was_trimmed = _clamp_waveform_to_max_duration(
         audio_waveform, sample_rate, max_duration_sec
     )
@@ -5981,6 +6070,8 @@ async def synthesize_voxcpm(request):
             "voxcpm_adaptive_reason": voxcpm_adaptive_reason,
             "auto_denoise": auto_denoise,
             "trim_silence_vad": trim_silence_vad,
+            "trim_leading_silence": trim_leading_silence,
+            "leading_trim_sec": leading_trim_sec,
         },
     })
 

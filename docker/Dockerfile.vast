@@ -15,7 +15,10 @@ ENV PYTHONUNBUFFERED=1 \
     WHISPER_MODEL_DIR=/workspace/models/whisper \
     OMNIVOICE_MAX_REQUEST_MB=512 \
     SEPARATION_MODEL=vocals_mel_band_roformer.ckpt \
-    OMNIVOICE_MODEL_ID=${OMNIVOICE_MODEL_ID}
+    OMNIVOICE_MODEL_ID=${OMNIVOICE_MODEL_ID} \
+    VOXCPM_LOAD_DENOISER=1 \
+    VOXCPM_OPTIMIZE=1 \
+    VOXCPM_TRIM_LEADING_SILENCE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \

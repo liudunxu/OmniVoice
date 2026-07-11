@@ -41,7 +41,10 @@ class StaticKVCache:
 
     def fill_caches(self, kv_caches: List[Tuple[torch.Tensor, torch.Tensor]]):
         self.current_length = kv_caches[0][0].size(2)
-        self.kv_cache.zero_()
+        # Note: we intentionally do NOT zero_() the full max_length cache.
+        # The model only reads positions <= current_length via the causal mask,
+        # so stale data beyond current_length from a previous request is never
+        # attended to. Skipping zero_() saves significant memory bandwidth.
         for i in range(self.num_layers):
             self.kv_cache[0, i, :, :, : self.current_length, :] = kv_caches[i][0]
             self.kv_cache[1, i, :, :, : self.current_length, :] = kv_caches[i][1]
