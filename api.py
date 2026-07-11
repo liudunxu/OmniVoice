@@ -559,6 +559,17 @@ def _assess_reference_quality(
         issues.append("low_rms")
     if snr_reliable and snr < 10.0:
         issues.append("low_snr")
+    # Noisy active reference: when almost the whole clip is active speech and
+    # the SNR estimate is still very low, the audio is likely contaminated by
+    # background noise / room tone / microphone hiss. The standard SNR guard
+    # marks this as unreliable, but the clip is still audibly noisy.
+    if (
+        active_ratio is not None
+        and active_ratio >= 0.95
+        and snr is not None
+        and snr < 5.0
+    ):
+        issues.append("noisy_reference")
     if "impulsive_spike" in ref_plosive_issues:
         issues.append("reference_impulsive_spike")
 
@@ -5249,10 +5260,27 @@ def _voxcpm_adaptive_params(
         and ref_quality.get("snr_reliable")
         and (ref_quality.get("snr_db") or 999) < 10.0
     )
+    noisy_reference = bool(
+        ref_quality
+        and "noisy_reference" in (ref_quality.get("issues") or [])
+    )
+    # Severe reference issues get a strong bump (higher cfg + more steps).
     if is_poor or low_snr or (ref_short and is_poor):
         adaptive_cfg = max(adaptive_cfg, 2.5)
         adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 8, 32))
         reasons.append(f"weak_ref (poor={is_poor}, short={ref_short}, low_snr={low_snr})")
+    # Noisy-but-active reference: the clip is mostly speech but contaminated by
+    # background noise / hiss. Give it more diffusion steps to smooth artifacts,
+    # but keep cfg close to the profile default so we don't amplify the noise.
+    elif noisy_reference:
+        adaptive_cfg = max(
+            adaptive_cfg, min(profile["guidance_scale"] + 0.1, 2.2)
+        )
+        adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 8, 32))
+        reasons.append(
+            f"noisy_ref (snr_db={ref_quality.get('snr_db')}, "
+            f"active_ratio={ref_quality.get('active_ratio')})"
+        )
 
     if adaptive_cfg == cfg_value and adaptive_steps == inference_timesteps:
         return cfg_value, inference_timesteps, ""
@@ -6284,7 +6312,7 @@ async def synthesize_voxcpm(request):
     # about (e.g. a multi-speaker reference clip or reference with extreme
     # impulsive spikes). Keep the list focused to avoid confusing the downstream
     # QC classifier with generic low_snr etc.
-    _REFERENCE_ISSUES_TO_SURFACE = {"multi_speaker_reference", "reference_impulsive_spike"}
+    _REFERENCE_ISSUES_TO_SURFACE = {"multi_speaker_reference", "reference_impulsive_spike", "noisy_reference"}
     if ref_quality_profile and isinstance(ref_quality_profile, dict):
         for ref_issue in ref_quality_profile.get("issues") or []:
             if ref_issue in _REFERENCE_ISSUES_TO_SURFACE and ref_issue not in quality_issues:
