@@ -4845,7 +4845,8 @@ async def synthesize(request):
     logger.info(
         f"[{req_id}] synthesis finished in {elapsed}s, output_size={len(wav_bytes)} bytes, "
         f"audio_duration={audio_duration}s, duration_attempts={attempts_made}, "
-        f"quality_issues={quality_issues}, quality_retried={quality_retried}, severe_issues={severe_issues}"
+        f"quality_issues={quality_issues}, quality_retried={quality_retried}, severe_issues={severe_issues}, "
+        f"text={text[:200]!r}"
     )
 
     output_base64 = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
@@ -6028,7 +6029,8 @@ async def synthesize_voxcpm(request):
     logger.info(
         f"[{req_id}] voxcpm synthesis finished in {elapsed}s, audio_duration={audio_duration}s, "
         f"attempts={attempts}, quality_issues={quality_issues}, "
-        f"quality_retried={quality_retried}, severe_issues={severe_issues}"
+        f"quality_retried={quality_retried}, severe_issues={severe_issues}, "
+        f"text={text[:200]!r}"
     )
 
     output_base64 = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
