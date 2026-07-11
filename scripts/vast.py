@@ -20,7 +20,7 @@ BASE_URL = "https://console.vast.ai"
 DEFAULT_IMAGE = "liudunxu/omnivoice-api:vast-gpu"
 DEFAULT_LABEL_PREFIX = "omnivoice-api"
 DEFAULT_PORT = 8000
-DEFAULT_GPU_NAME = "RTX 3090"
+DEFAULT_GPU_NAME = "RTX 4090"
 EAST_ASIA = {"CN", "JP", "KR", "HK", "TW", "MO"}
 SOUTHEAST_ASIA = {"SG", "MY", "TH", "VN", "ID", "PH", "BN", "KH", "LA", "MM"}
 CENTRAL_WEST_ASIA = {
@@ -141,11 +141,12 @@ def _gpu_matches(gpu_name: str, wanted: Optional[str]) -> bool:
 
 
 def cmd_search(args: argparse.Namespace) -> None:
-    """Search for cheap RTX 3090 on-demand offers.
+    """Search for cheap RTX 4090 on-demand offers.
 
     Defaults follow the runbook: verified/rentable/ondemand, 1 GPU,
-    >= 20 GB VRAM, >= 80 GB disk, direct port, <= $0.25/hr,
+    >= 24 GB VRAM, >= 80 GB disk, direct port, <= $0.25/hr,
     East Asia / Southeast Asia / Central & West Asia first, then Americas.
+    Use --gpu-name to override (e.g. "RTX 3090" as a fallback).
     """
     payload = {
         "limit": 200,
@@ -154,7 +155,7 @@ def cmd_search(args: argparse.Namespace) -> None:
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
-        "gpu_ram": {"gte": 20000},
+        "gpu_ram": {"gte": 24000},
         "disk_space": {"gte": 80},
         "direct_port_count": {"gte": 1},
         "dph_total": {"lte": args.max_price},

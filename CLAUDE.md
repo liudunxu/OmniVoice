@@ -66,7 +66,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Use the reusable helper script `scripts/vast.py` for all Vast.ai operations. It reads the API key from the `VAST_API_KEY` environment variable.
   - Check balance/credit: `VAST_API_KEY=$KEY python scripts/vast.py balance`
   - List instances: `VAST_API_KEY=$KEY python scripts/vast.py list`
-  - Search RTX 3090 offers (Asia by default): `VAST_API_KEY=$KEY python scripts/vast.py search`
+  - Search RTX 4090 offers (Asia by default): `VAST_API_KEY=$KEY python scripts/vast.py search`
   - Search US/CA offers: `VAST_API_KEY=$KEY python scripts/vast.py search --region us`
   - Create instance: `VAST_API_KEY=$KEY python scripts/vast.py create <offer_id> [--image ... --label ...]`
   - Wait for ready URL: `VAST_API_KEY=$KEY python scripts/vast.py wait <instance_id>`
@@ -80,13 +80,13 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Use label prefix `omnivoice-api` for OmniVoice Vast.ai service instances.
 - When the user says "停止vast.ai实例" or asks to stop/pause Vast.ai instances, **stop** all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the instance list afterward.
 - When the user says "销毁vast.ai实例"/"关闭vast.ai实例" or asks to destroy/close Vast.ai instances, **destroy** all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the remaining instance list afterward.
-- When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, **launch two RTX 3090 instances** with:
+- When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, **launch two RTX 4090 instances** (fall back to RTX 3090 if RTX 4090 offers are unavailable) with:
   - image: `liudunxu/omnivoice-api:vast-gpu` unless the user specifies a fixed tag
   - label: `omnivoice-api-mvp-<short-tag-or-date>-<region>`
   - disk: `80`
   - runtype: `args`
   - env: `{"-p 8000:8000": "1", "PORT": "8000", "HOST": "0.0.0.0", "MODEL_DIR": "/workspace/models"}`
-- Prefer verified, rentable, on-demand, single RTX 3090 offers with at least 20GB GPU RAM, at least one direct port, and at least 80GB disk space. **Prioritize Southeast Asia for both instances.** If only one Southeast Asia offer is available, place the second instance in the next preferred region (East Asia, then Central/West Asia, then Americas US/CA). Verify the host can reach Docker Hub before committing; stalled `Pulling fs layer` or registry timeouts mean the offer should be abandoned.
+- Prefer verified, rentable, on-demand, single RTX 4090 offers with at least 24GB GPU RAM, at least one direct port, and at least 80GB disk space. RTX 3090 (24GB) is acceptable as a fallback if no suitable RTX 4090 offers are available. **Prioritize Southeast Asia for both instances.** If only one Southeast Asia offer is available, place the second instance in the next preferred region (East Asia, then Central/West Asia, then Americas US/CA). Verify the host can reach Docker Hub before committing; stalled `Pulling fs layer` or registry timeouts mean the offer should be abandoned.
 - After creating instances, wait for the public ports and verify `GET /` returns `ok` and `GET /health` returns `{"ok": true, ...}`. **Report the first instance that passes health checks immediately; do not wait for both instances to be ready.** Once both are verified, report the second URL as well.
 - Do not keep old and new Vast.ai instances running after a redeploy unless the user explicitly asks for overlap. Once the new instance is verified, destroy old `omnivoice-api*` instances.
 
@@ -97,6 +97,7 @@ Track instances that have successfully launched and run the OmniVoice API. When 
 | Machine ID | GPU        | Region        | Country | Image used                        | Commits / Notes                              |
 |------------|------------|---------------|---------|-----------------------------------|----------------------------------------------|
 | 140986     | RTX 3090   | East Asia     | TW      | `liudunxu/omnivoice-api:vast-gpu` | `5648d6c` (Return audio QC for synthesis)    |
+| 141336     | RTX 3090 Ti| Southeast Asia| TH      | `liudunxu/omnivoice-api:latest`   | `2026-07-10` (Latest image smoke test pass)  |
 
 Use this list to choose a preferred offer during `scripts/vast.py search`, but fall back to the next best offer if none of these machines are available.
 
