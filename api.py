@@ -2486,6 +2486,59 @@ def _trim_voxcpm_leading_silence(
     return trimmed, float(trim_samples / sampling_rate)
 
 
+def _trim_voxcpm_trailing_silence(
+    waveform,
+    sampling_rate: int,
+    max_trim_sec: float = 2.0,
+    fade_ms: float = 20.0,
+    keep_sec: float = 0.15,
+) -> tuple[np.ndarray, float]:
+    """Trim trailing silence from VoxCPM2 generated audio.
+
+    Uses the same active-interval detector as the reference-quality path to
+    locate the last speech segment, keeps a short natural tail (breath/reverb),
+    and applies a fade-out so the cut is not audible. This reduces the
+    ``too_much_silence`` QC flag and keeps the dubbed clip closer to the
+    actual speech duration.
+
+    Returns:
+        (trimmed_waveform, trimmed_seconds)
+    """
+    arr = _mono_float32(waveform)
+    if arr.size == 0:
+        return arr, 0.0
+
+    intervals = _active_intervals_from_rms(arr, sampling_rate)
+    if not intervals:
+        return arr, 0.0
+
+    duration = arr.size / sampling_rate
+    last_speech_end = float(intervals[-1][1])
+    end_sec = min(duration, last_speech_end + keep_sec)
+    if max_trim_sec is not None and max_trim_sec > 0:
+        # Do not trim more than max_trim_sec from the tail.
+        end_sec = max(end_sec, duration - max_trim_sec)
+    end_sec = max(end_sec, 0.0)
+    end_sec = min(end_sec, duration)
+
+    end_sample = min(arr.size, int(end_sec * sampling_rate))
+    if end_sample <= 0 or end_sample >= arr.size:
+        return arr, 0.0
+
+    trimmed = arr[:end_sample].copy()
+    fade_samples = min(
+        int(fade_ms / 1000.0 * sampling_rate),
+        trimmed.size // 4,
+        400,
+    )
+    if fade_samples > 1:
+        trimmed[-fade_samples:] *= np.linspace(
+            1.0, 0.0, fade_samples, dtype=np.float32
+        )
+
+    return trimmed, float((arr.size - end_sample) / sampling_rate)
+
+
 def _compute_rms(waveform) -> float:
     arr = np.asarray(waveform)
     if arr.size == 0:
@@ -6046,6 +6099,7 @@ async def synthesize_voxcpm(request):
 
     # Post-processing (reuse OmniVoice waveform helpers — all model-agnostic).
     leading_trim_sec = 0.0
+    trailing_trim_sec = 0.0
     if trim_leading_silence:
         audio_waveform, leading_trim_sec = _trim_voxcpm_leading_silence(
             audio_waveform,
@@ -6058,6 +6112,16 @@ async def synthesize_voxcpm(request):
                 f"[{req_id}] voxcpm trimmed {leading_trim_sec:.3f}s leading silence "
                 f"(max={max_leading_trim_sec}s, fade={leading_trim_fade_ms}ms)"
             )
+
+    # Trim trailing silence as well. VoxCPM2 often leaves a long quiet tail
+    # (room tone / decay) that inflates duration and triggers too_much_silence.
+    audio_waveform, trailing_trim_sec = _trim_voxcpm_trailing_silence(
+        audio_waveform, sample_rate
+    )
+    if trailing_trim_sec > 0.005:
+        logger.info(
+            f"[{req_id}] voxcpm trimmed {trailing_trim_sec:.3f}s trailing silence"
+        )
 
     audio_waveform, was_trimmed = _clamp_waveform_to_max_duration(
         audio_waveform, sample_rate, max_duration_sec
@@ -6263,6 +6327,7 @@ async def synthesize_voxcpm(request):
         f"adaptive_reason={voxcpm_adaptive_reason!r}, "
         f"language={language!r}, "
         f"target_duration_ms={target_duration_ms}, max_duration_ms={max_duration_ms}, "
+        f"leading_trim_sec={leading_trim_sec}, trailing_trim_sec={trailing_trim_sec}, "
         f"attempts={attempts}, quality_issues={quality_issues}, "
         f"quality_retried={quality_retried}, severe_issues={severe_issues}, "
         f"text={text[:200]!r}"
@@ -6309,6 +6374,7 @@ async def synthesize_voxcpm(request):
             "trim_silence_vad": trim_silence_vad,
             "trim_leading_silence": trim_leading_silence,
             "leading_trim_sec": leading_trim_sec,
+            "trailing_trim_sec": trailing_trim_sec,
         },
     })
 
