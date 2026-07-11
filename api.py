@@ -5253,21 +5253,26 @@ def _voxcpm_adaptive_params(
     # Weak reference: low-activity, low-snr, or flagged poor. Short refs alone
     # are not bumped unless they are also poor/low-snr; the short profile above
     # already handles them conservatively.
-    is_poor = bool(ref_quality and ref_quality.get("is_poor"))
+    ref_issues = set(ref_quality.get("issues") or []) if ref_quality else set()
+    is_poor = bool(ref_issues)
+    is_poor_excluding_noise = bool(ref_issues - {"noisy_reference"})
     ref_short = ref_duration is not None and ref_duration < 2.0
     low_snr = bool(
         ref_quality
         and ref_quality.get("snr_reliable")
         and (ref_quality.get("snr_db") or 999) < 10.0
     )
-    noisy_reference = bool(
-        ref_quality
-        and "noisy_reference" in (ref_quality.get("issues") or [])
-    )
+    noisy_reference = "noisy_reference" in ref_issues
     # Severe reference issues get a strong bump (higher cfg + more steps).
-    if is_poor or low_snr or (ref_short and is_poor):
-        adaptive_cfg = max(adaptive_cfg, 2.5)
-        adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 8, 32))
+    # Very short references are less stable, so cap the bump to avoid
+    # metallic/artifacted output.
+    if is_poor_excluding_noise or low_snr or (ref_short and is_poor_excluding_noise):
+        if ref_short:
+            adaptive_cfg = max(adaptive_cfg, 2.2)
+            adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 6, 28))
+        else:
+            adaptive_cfg = max(adaptive_cfg, 2.5)
+            adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 8, 32))
         reasons.append(f"weak_ref (poor={is_poor}, short={ref_short}, low_snr={low_snr})")
     # Noisy-but-active reference: the clip is mostly speech but contaminated by
     # background noise / hiss. Give it more diffusion steps to smooth artifacts,
