@@ -5264,11 +5264,11 @@ def _voxcpm_adaptive_params(
     )
     noisy_reference = "noisy_reference" in ref_issues
     # Severe reference issues get a strong bump (higher cfg + more steps).
-    # Very short references are less stable, so cap the bump to avoid
-    # metallic/artifacted output.
+    # Very short references are less stable; raising cfg makes timbre drift
+    # (male->female, metallic/sharp artifacts) more likely. Keep cfg at the
+    # short-profile level and only add diffusion steps for cleaner output.
     if is_poor_excluding_noise or low_snr or (ref_short and is_poor_excluding_noise):
         if ref_short:
-            adaptive_cfg = max(adaptive_cfg, 2.2)
             adaptive_steps = max(adaptive_steps, min(profile["num_step"] + 6, 28))
         else:
             adaptive_cfg = max(adaptive_cfg, 2.5)
