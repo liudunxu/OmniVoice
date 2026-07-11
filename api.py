@@ -5814,6 +5814,19 @@ async def synthesize_voxcpm(request):
         quality_retried = False
         attempts = 0
 
+        logger.info(
+            f"[{req_id}] voxcpm request profile: "
+            f"text_len={len(text)}, language={language!r}, "
+            f"ref_duration={ref_duration}, "
+            f"ref_quality={ref_quality_profile}, "
+            f"has_prompt={bool(prompt_audio_bytes)}, prompt_text_len={len(prompt_text)}, "
+            f"cfg={cfg_value}, steps={inference_timesteps}, "
+            f"denoise={denoise}, normalize={normalize}, "
+            f"adaptive_reason={voxcpm_adaptive_reason!r}, "
+            f"target_duration_ms={target_duration_ms}, max_duration_ms={max_duration_ms}, "
+            f"duration_cap_relaxed={duration_cap_relaxed}"
+        )
+
         async with _API_INFER_SEM:
             logger.info(f"[{req_id}] voxcpm synthesis started (cfg={cfg_value}, steps={inference_timesteps})")
             try:
@@ -6240,7 +6253,16 @@ async def synthesize_voxcpm(request):
                         "severe_issues": severe_issues}
 
     logger.info(
-        f"[{req_id}] voxcpm synthesis finished in {elapsed}s, audio_duration={audio_duration}s, "
+        f"[{req_id}] voxcpm synthesis finished in {elapsed}s, "
+        f"audio_duration={audio_duration}s, "
+        f"ref_duration={ref_duration}s, "
+        f"ref_quality_issues={ref_quality_profile.get('issues') if ref_quality_profile else None}, "
+        f"ref_speaker_count={ref_quality_profile.get('speaker_count') if ref_quality_profile else None}, "
+        f"cfg={cfg_value}, steps={inference_timesteps}, "
+        f"denoise={denoise}, normalize={normalize}, "
+        f"adaptive_reason={voxcpm_adaptive_reason!r}, "
+        f"language={language!r}, "
+        f"target_duration_ms={target_duration_ms}, max_duration_ms={max_duration_ms}, "
         f"attempts={attempts}, quality_issues={quality_issues}, "
         f"quality_retried={quality_retried}, severe_issues={severe_issues}, "
         f"text={text[:200]!r}"
