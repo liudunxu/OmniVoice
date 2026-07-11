@@ -6310,6 +6310,113 @@ async def synthesize_voxcpm(request):
         except Exception as exc:
             logger.warning(f"[{req_id}] voxcpm language-mismatch regenerate failed: {exc}")
 
+    # Text-incomplete retry: when Whisper still finds the output incomplete
+    # after all signal-level retries, try once more with a fresh seed and
+    # slightly stronger guidance. This catches cases like long inter-word
+    # silence or early truncation, especially in continuation mode.
+    text_regen = False
+    if (
+        output_path_for_response
+        and quality_retry
+        and text_completeness_qc is not None
+        and text_completeness_qc.get("status") == "incomplete"
+        and not lang_regen
+    ):
+        text_regen_kwargs = dict(gen_kwargs)
+        text_regen_kwargs["seed"] = ((seed or 0) + 11) % (2**31 - 1)
+        text_regen_kwargs["cfg_value"] = min(
+            float(text_regen_kwargs.get("cfg_value", cfg_value)) + 0.2, 2.8
+        )
+        text_regen_kwargs["inference_timesteps"] = min(
+            int(text_regen_kwargs.get("inference_timesteps", inference_timesteps)) + 4, 48
+        )
+        text_regen_new_seed = text_regen_kwargs["seed"]
+        logger.info(
+            f"[{req_id}] voxcpm text-incomplete retry "
+            f"(coverage={text_completeness_qc.get('coverage')}, "
+            f"new seed={text_regen_new_seed}, "
+            f"cfg={text_regen_kwargs['cfg_value']}, "
+            f"steps={text_regen_kwargs['inference_timesteps']})"
+        )
+        try:
+            async with _API_INFER_SEM:
+                text_regen_wav = await asyncio.to_thread(
+                    _generate_voxcpm_sync, model, text, **text_regen_kwargs
+                )
+            attempts += 1
+            text_regen = True
+            text_regen_wav, _ = _clamp_waveform_to_max_duration(
+                text_regen_wav, sample_rate, max_duration_sec
+            )
+            text_regen_wav, text_regen_peak_limited = _apply_peak_ceiling(
+                text_regen_wav, OUTPUT_PEAK_CEILING
+            )
+            text_regen_issues, text_regen_spikes = _check_audio_quality_after_ceiling(
+                text_regen_wav,
+                sample_rate,
+                target_duration=target_duration_sec,
+                duration_tolerance=duration_tolerance_sec,
+                ref_duration=None,
+            )
+            text_regen_signal_severe = [
+                issue
+                for issue in text_regen_issues
+                if issue in _SEVERE_ISSUE_LABELS
+                and not (duration_cap_relaxed and issue == "duration_off_target")
+            ]
+            current_signal_severe = [
+                issue
+                for issue in quality_issues
+                if issue in _SEVERE_ISSUE_LABELS
+                and issue not in {"text_incomplete", "source_script_residue"}
+                and not (duration_cap_relaxed and issue == "duration_off_target")
+            ]
+            text_regen_prompt_leak = False
+            if prompt_path is not None and prompt_audio_bytes is not None:
+                text_regen_prompt_leak, _ = _detect_prompt_leak(
+                    text_regen_wav, sample_rate, prompt_audio_bytes
+                )
+            text_regen_wav_bytes = _waveform_to_wav_bytes(text_regen_wav, sample_rate)
+            text_regen_path = out_dir / f"voxcpm2_{key}_textregen.wav"
+            try:
+                text_regen_path.write_bytes(text_regen_wav_bytes)
+                text_regen_qc = await _build_output_text_qc(
+                    str(text_regen_path.resolve()), text, language, data
+                )
+            finally:
+                _cleanup_temp_paths(text_regen_path)
+            if _should_accept_text_qc_candidate(
+                text_completeness_qc,
+                text_regen_qc,
+                len(current_signal_severe),
+                len(text_regen_signal_severe),
+                text_regen_prompt_leak,
+            ):
+                old_coverage = float(text_completeness_qc.get("coverage") or 0.0)
+                new_coverage = float(text_regen_qc.get("coverage") or 0.0)
+                audio_waveform = text_regen_wav
+                wav_bytes = text_regen_wav_bytes
+                out_path.write_bytes(wav_bytes)
+                quality_issues = list(text_regen_issues)
+                spike_locations = text_regen_spikes
+                peak_limited = text_regen_peak_limited
+                text_completeness_qc = text_regen_qc
+                logger.info(
+                    f"[{req_id}] voxcpm text-incomplete retry accepted "
+                    f"(coverage {old_coverage:.3f}->{new_coverage:.3f}, "
+                    f"issues={text_regen_issues})"
+                )
+            else:
+                logger.info(
+                    f"[{req_id}] voxcpm text-incomplete retry rejected "
+                    f"(coverage {float(text_completeness_qc.get('coverage') or 0):.3f}->"
+                    f"{float(text_regen_qc.get('coverage') or 0):.3f}, "
+                    f"signal_issues={text_regen_signal_severe}, "
+                    f"prompt_leak={text_regen_prompt_leak})"
+                )
+        except Exception as exc:
+            logger.warning(f"[{req_id}] voxcpm text-incomplete retry failed: {exc}")
+
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / sample_rate, 3)
 
@@ -6362,7 +6469,7 @@ async def synthesize_voxcpm(request):
         f"target_duration_ms={target_duration_ms}, max_duration_ms={max_duration_ms}, "
         f"leading_trim_sec={leading_trim_sec}, trailing_trim_sec={trailing_trim_sec}, "
         f"attempts={attempts}, quality_issues={quality_issues}, "
-        f"quality_retried={quality_retried}, severe_issues={severe_issues}, "
+        f"quality_retried={quality_retried}, text_regen={text_regen}, severe_issues={severe_issues}, "
         f"text={text[:200]!r}"
     )
 
@@ -6388,6 +6495,7 @@ async def synthesize_voxcpm(request):
         "quality_issues": quality_issues,
         "quality_retried": quality_retried,
         "language_regen": lang_regen,
+        "text_regen": text_regen,
         "severe_issues": severe_issues,
         "audio_qc": audio_qc or {},
         "duration_match": {
