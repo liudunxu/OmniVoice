@@ -35,6 +35,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import soundfile as sf
 import torch
+import librosa
 from aiohttp import web
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
@@ -343,6 +344,56 @@ def _bytes_audio_duration(audio_bytes: bytes) -> Optional[float]:
     return None
 
 
+def _estimate_reference_speaker_count(y: np.ndarray, sr: int) -> int:
+    """Heuristic estimate of whether the reference contains multiple speakers.
+
+    Uses librosa YIN to extract a per-frame fundamental frequency, then looks
+    for two prominent peaks in the voiced-F0 histogram that are far apart
+    (e.g. male + female). This is intentionally lightweight and CPU-only:
+    no heavy diarization model is required.
+
+    Returns 1 for a single speaker or inconclusive, 2 when multiple speakers
+    are suspected.
+    """
+    if y.size == 0:
+        return 1
+    try:
+        f0 = librosa.yin(
+            y,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C6"),
+            sr=sr,
+            frame_length=1024,
+        )
+    except Exception:
+        return 1
+    voiced = f0[f0 > 0.0]
+    if voiced.size < 40:
+        return 1
+
+    hist, bin_edges = np.histogram(voiced, bins=20)
+    # Light smoothing to reduce single-frame noise.
+    kernel = np.array([0.25, 0.5, 0.25])
+    smoothed = np.convolve(hist, kernel, mode="same")
+
+    peaks = []
+    for i in range(1, len(smoothed) - 1):
+        if smoothed[i] > smoothed[i - 1] and smoothed[i] > smoothed[i + 1]:
+            peak_freq = (bin_edges[i] + bin_edges[i + 1]) / 2.0
+            peaks.append((peak_freq, smoothed[i]))
+    if len(peaks) < 2:
+        return 1
+
+    # Keep the two most prominent peaks and check their separation.
+    peaks = sorted(peaks, key=lambda item: item[1], reverse=True)[:2]
+    freqs = sorted([p[0] for p in peaks])
+    ratio = freqs[-1] / max(freqs[0], 1.0)
+    # > ~1.5 octaves (ratio > 2.83) strongly suggests different speakers.
+    if ratio > 2.5:
+        return 2
+    return 1
+
+
 def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
     """Compute lightweight quality metrics for a reference audio clip.
 
@@ -399,6 +450,13 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         snr_reliable = False
 
     issues = []
+    speaker_count = 1
+    try:
+        speaker_count = _estimate_reference_speaker_count(y, sr)
+    except Exception:
+        pass
+    if speaker_count >= 2:
+        issues.append("multi_speaker_reference")
     if active_ratio is not None and active_ratio < 0.30:
         issues.append("low_activity")
     if active_speech_ratio < 0.20:
@@ -423,6 +481,7 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         "rms": _round_float(rms, 5),
         "snr_db": _round_float(snr, 2) if snr is not None else None,
         "snr_reliable": snr_reliable,
+        "speaker_count": speaker_count,
         "is_poor": bool(issues),
         "issues": issues,
     }
@@ -5999,6 +6058,14 @@ async def synthesize_voxcpm(request):
 
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / sample_rate, 3)
+
+    # Surface reference-quality issues that the dubbing pipeline should know
+    # about (e.g. a multi-speaker reference clip). Keep the list focused to
+    # avoid confusing the downstream QC classifier with generic low_snr etc.
+    if ref_quality_profile and isinstance(ref_quality_profile, dict):
+        for ref_issue in ref_quality_profile.get("issues") or []:
+            if ref_issue == "multi_speaker_reference" and ref_issue not in quality_issues:
+                quality_issues.append(ref_issue)
 
     severe_issues = sorted(
         {
