@@ -467,7 +467,11 @@ def _extract_dominant_speaker_reference(audio_bytes: Optional[bytes]) -> Optiona
         return None
 
 
-def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
+def _assess_reference_quality(
+    audio_bytes: Optional[bytes],
+    *,
+    enable_speaker_check: bool = False,
+) -> Dict[str, Any]:
     """Compute lightweight quality metrics for a reference audio clip.
 
     Returns a dict with duration/activity/peak/RMS/SNR and a list of issue
@@ -534,12 +538,13 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
 
     issues = []
     speaker_count = 1
-    try:
-        speaker_count = _estimate_reference_speaker_count(y, sr)
-    except Exception:
-        pass
-    if speaker_count >= 2:
-        issues.append("multi_speaker_reference")
+    if enable_speaker_check:
+        try:
+            speaker_count = _estimate_reference_speaker_count(y, sr)
+        except Exception:
+            pass
+        if speaker_count >= 2:
+            issues.append("multi_speaker_reference")
     if active_ratio is not None and active_ratio < 0.30:
         issues.append("low_activity")
     if active_speech_ratio < 0.20:
@@ -5548,18 +5553,28 @@ async def synthesize_voxcpm(request):
         max_duration_ms / 1000.0 if max_duration_ms and max_duration_ms > 0 else None
     )
 
+    enable_multi_speaker_check = _bool_option(
+        data.get("enable_multi_speaker_check"), False
+    )
+
     # Lightweight cfg/steps adaptation by reference quality. On by default;
     # a caller can disable it with ``voxcpm_adaptive=false``. Only nudges
     # values up (never downgrades), so user-specified higher values win.
     ref_quality_profile = None
     if ref_audio_bytes:
-        ref_quality_profile = _assess_reference_quality(ref_audio_bytes)
+        ref_quality_profile = _assess_reference_quality(
+            ref_audio_bytes,
+            enable_speaker_check=enable_multi_speaker_check,
+        )
 
         # If the reference contains multiple simultaneous speakers, try to keep
         # the original timing by extracting the dominant (largest-F0-group)
         # speaker. Only replace the reference when the extracted segment is clean
         # single-speaker audio.
-        if "multi_speaker_reference" in (ref_quality_profile.get("issues") or []):
+        if (
+            enable_multi_speaker_check
+            and "multi_speaker_reference" in (ref_quality_profile.get("issues") or [])
+        ):
             logger.info(
                 f"[{req_id}] multi-speaker reference detected; "
                 "attempting dominant-speaker extraction"
@@ -5571,7 +5586,10 @@ async def synthesize_voxcpm(request):
             except Exception:
                 extracted_bytes = None
             if extracted_bytes:
-                extracted_quality = _assess_reference_quality(extracted_bytes)
+                extracted_quality = _assess_reference_quality(
+                    extracted_bytes,
+                    enable_speaker_check=True,
+                )
                 if "multi_speaker_reference" not in (
                     extracted_quality.get("issues") or []
                 ):
