@@ -394,6 +394,79 @@ def _estimate_reference_speaker_count(y: np.ndarray, sr: int) -> int:
     return 1
 
 
+def _extract_dominant_speaker_reference(audio_bytes: Optional[bytes]) -> Optional[bytes]:
+    """Attempt to extract the dominant speaker from a multi-speaker reference.
+
+    Uses YIN F0 to split voiced frames into two groups by median F0, keeps the
+    larger group, and returns the longest contiguous clean segment. If the
+    extracted segment is too short or still looks multi-speaker, returns None.
+    """
+    if not audio_bytes:
+        return None
+    try:
+        y, sr = _decode_audio_bytes_mono(audio_bytes, 24000)
+    except Exception:
+        return None
+    if y.size == 0:
+        return None
+
+    try:
+        f0 = librosa.yin(
+            y,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C6"),
+            sr=sr,
+            frame_length=1024,
+        )
+    except Exception:
+        return None
+
+    voiced_idx = np.where(f0 > 0.0)[0]
+    if voiced_idx.size < 40:
+        return None
+    voiced_f0 = f0[voiced_idx]
+    median_f0 = float(np.median(voiced_f0))
+
+    low_count = int(np.sum(voiced_f0 < median_f0))
+    high_count = int(np.sum(voiced_f0 >= median_f0))
+    dominant_is_low = low_count >= high_count
+
+    frame_mask = np.zeros(len(f0), dtype=bool)
+    if dominant_is_low:
+        frame_mask[voiced_idx] = f0[voiced_idx] < median_f0
+    else:
+        frame_mask[voiced_idx] = f0[voiced_idx] >= median_f0
+
+    # librosa.yin default hop_length = frame_length // 4 = 256
+    hop_length = 256
+    sample_mask = np.repeat(frame_mask, hop_length)[: y.size]
+
+    runs = []
+    start = None
+    for i, val in enumerate(sample_mask):
+        if val and start is None:
+            start = i
+        elif not val and start is not None:
+            runs.append((start, i))
+            start = None
+    if start is not None:
+        runs.append((start, len(sample_mask)))
+    if not runs:
+        return None
+
+    longest_start, longest_end = max(runs, key=lambda r: r[1] - r[0])
+    segment = y[longest_start:longest_end]
+    segment_duration = segment.size / sr
+    if segment_duration < 0.8:
+        return None
+    if _estimate_reference_speaker_count(segment, sr) >= 2:
+        return None
+    try:
+        return _waveform_to_wav_bytes(segment, sr)
+    except Exception:
+        return None
+
+
 def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
     """Compute lightweight quality metrics for a reference audio clip.
 
@@ -426,6 +499,16 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
     intervals = _active_intervals_from_rms(y, sr)
     active_speech = sum(max(0.0, end - start) for start, end in intervals)
     active_speech_ratio = active_speech / duration if duration > 0 else 0.0
+
+    # Light plosive/spike check on the reference itself. Normal speech plosives
+    # are expected, so we only flag extreme impulsive spikes that usually come
+    # from edit clicks, separation artifacts, or clipped consonants.
+    ref_plosive_issues = []
+    ref_spike_locations = []
+    try:
+        ref_plosive_issues, ref_spike_locations = _detect_plosive_spikes(y, sr)
+    except Exception:
+        pass
 
     mean_db = profile.get("mean_volume_db")
     active_mean_db = profile.get("active_mean_volume_db")
@@ -471,6 +554,8 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         issues.append("low_rms")
     if snr_reliable and snr < 10.0:
         issues.append("low_snr")
+    if "impulsive_spike" in ref_plosive_issues:
+        issues.append("reference_impulsive_spike")
 
     return {
         "has_ref": True,
@@ -482,6 +567,7 @@ def _assess_reference_quality(audio_bytes: Optional[bytes]) -> Dict[str, Any]:
         "snr_db": _round_float(snr, 2) if snr is not None else None,
         "snr_reliable": snr_reliable,
         "speaker_count": speaker_count,
+        "spike_locations": ref_spike_locations,
         "is_poor": bool(issues),
         "issues": issues,
     }
@@ -5468,6 +5554,46 @@ async def synthesize_voxcpm(request):
     ref_quality_profile = None
     if ref_audio_bytes:
         ref_quality_profile = _assess_reference_quality(ref_audio_bytes)
+
+        # If the reference contains multiple simultaneous speakers, try to keep
+        # the original timing by extracting the dominant (largest-F0-group)
+        # speaker. Only replace the reference when the extracted segment is clean
+        # single-speaker audio.
+        if "multi_speaker_reference" in (ref_quality_profile.get("issues") or []):
+            logger.info(
+                f"[{req_id}] multi-speaker reference detected; "
+                "attempting dominant-speaker extraction"
+            )
+            try:
+                extracted_bytes = await asyncio.to_thread(
+                    _extract_dominant_speaker_reference, ref_audio_bytes
+                )
+            except Exception:
+                extracted_bytes = None
+            if extracted_bytes:
+                extracted_quality = _assess_reference_quality(extracted_bytes)
+                if "multi_speaker_reference" not in (
+                    extracted_quality.get("issues") or []
+                ):
+                    ref_audio_bytes = extracted_bytes
+                    ref_quality_profile = extracted_quality
+                    ref_duration = _bytes_audio_duration(ref_audio_bytes)
+                    logger.info(
+                        f"[{req_id}] dominant-speaker extraction succeeded: "
+                        f"duration={extracted_quality.get('duration')}s, "
+                        f"issues={extracted_quality.get('issues')}"
+                    )
+                else:
+                    logger.info(
+                        f"[{req_id}] extracted segment still multi-speaker; "
+                        "keeping original reference for dubbing fallback"
+                    )
+            else:
+                logger.info(
+                    f"[{req_id}] dominant-speaker extraction failed; "
+                    "keeping original reference for dubbing fallback"
+                )
+
         if _BLOCK_FATAL_REFERENCE:
             is_fatal, fatal_issues = _check_fatal_reference_quality(ref_quality_profile)
             if is_fatal:
@@ -6060,11 +6186,13 @@ async def synthesize_voxcpm(request):
     audio_duration = round(audio_waveform.shape[-1] / sample_rate, 3)
 
     # Surface reference-quality issues that the dubbing pipeline should know
-    # about (e.g. a multi-speaker reference clip). Keep the list focused to
-    # avoid confusing the downstream QC classifier with generic low_snr etc.
+    # about (e.g. a multi-speaker reference clip or reference with extreme
+    # impulsive spikes). Keep the list focused to avoid confusing the downstream
+    # QC classifier with generic low_snr etc.
+    _REFERENCE_ISSUES_TO_SURFACE = {"multi_speaker_reference", "reference_impulsive_spike"}
     if ref_quality_profile and isinstance(ref_quality_profile, dict):
         for ref_issue in ref_quality_profile.get("issues") or []:
-            if ref_issue == "multi_speaker_reference" and ref_issue not in quality_issues:
+            if ref_issue in _REFERENCE_ISSUES_TO_SURFACE and ref_issue not in quality_issues:
                 quality_issues.append(ref_issue)
 
     severe_issues = sorted(
