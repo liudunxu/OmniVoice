@@ -32,6 +32,12 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+# Librosa/numba may otherwise try to cache compiled helpers inside a read-only
+# virtualenv on containerized deployments.
+os.environ.setdefault(
+    "NUMBA_CACHE_DIR", os.environ.get("OMNIVOICE_NUMBA_CACHE_DIR", "/tmp/omnivoice-numba-cache")
+)
+
 import numpy as np
 import soundfile as sf
 import torch
@@ -165,6 +171,7 @@ _SEVERE_ISSUE_LABELS = frozenset({
     "empty", "clipping", "near_clipping", "harsh_high_freq",
     "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete",
     "source_script_residue", "duration_off_target", "duration_off_reference",
+    "gender_mismatch",
 })
 
 # Reference-quality issues that should block synthesis outright. Dubbing callers
@@ -1091,9 +1098,11 @@ def _decode_base64_audio_to_bytes(b64_data):
     return base64.b64decode(b64_data)
 
 
-def _reference_quality_legacy(audio_bytes):
+def _reference_quality_legacy(audio_bytes, *, enable_speaker_check: bool = False):
     """Return dubbing-compatible reference quality dict from raw WAV bytes."""
-    enhanced = _assess_reference_quality(audio_bytes)
+    enhanced = _assess_reference_quality(
+        audio_bytes, enable_speaker_check=enable_speaker_check
+    )
     try:
         buf = io.BytesIO(audio_bytes)
         with wave.open(buf, "rb") as wav:
@@ -1142,7 +1151,13 @@ def _reference_quality_legacy(audio_bytes):
         "rms_db": round(_dbfs(rms_value), 1),
         "active_ratio": round(active_ratio, 3),
     }
-    for key in ("issues", "snr_db", "snr_reliable", "active_speech_ratio"):
+    gender_profile = _segment_profile(samples, sample_rate, 0.0, duration)
+    result["gender"] = gender_profile.get("gender") or "unknown"
+    result["gender_confidence"] = round(float(gender_profile.get("confidence") or 0.0), 3)
+    result["median_f0_hz"] = _round_float(gender_profile.get("f0"), 1)
+    for key in (
+        "issues", "snr_db", "snr_reliable", "active_speech_ratio", "speaker_count"
+    ):
         if key in enhanced:
             result[key] = enhanced[key]
     return result
@@ -1692,7 +1707,7 @@ def _select_best_reference(primary_bytes, primary_quality, alternate_refs, alter
     for ref_b64, text in zip_longest(alternate_refs, alternate_texts, fillvalue=""):
         try:
             raw = _decode_base64_audio_bytes(ref_b64)
-            quality = _assess_reference_quality(raw)
+            quality = _assess_reference_quality(raw, enable_speaker_check=True)
             candidates.append((raw, quality, text or ""))
         except Exception:
             continue
@@ -2756,6 +2771,163 @@ def _feature_similarity(left: Optional[np.ndarray], right: Optional[np.ndarray])
     if left is None or right is None:
         return None
     return float(np.dot(left, right))
+
+
+def _speaker_feature_from_waveform(waveform: np.ndarray, sampling_rate: int) -> Optional[np.ndarray]:
+    y = _mono_float32(waveform)
+    intervals = _active_intervals_from_rms(y, sampling_rate)
+    active = _concat_intervals(y, sampling_rate, intervals) if intervals else y
+    return _voice_feature(active, sampling_rate)
+
+
+def _waveform_gender_profile(waveform: np.ndarray, sampling_rate: int) -> Dict[str, Any]:
+    y = np.clip(_mono_float32(waveform), -1.0, 1.0)
+    samples = (y * 32767.0).astype(np.int16).astype(int).tolist()
+    samples, profile_rate = _downsample_int16(samples, sampling_rate)
+    duration = len(samples) / float(profile_rate) if profile_rate > 0 else 0.0
+    profile = _segment_profile(samples, profile_rate, 0.0, duration)
+    return {
+        "gender": profile.get("gender") or "unknown",
+        "confidence": _round_float(profile.get("confidence"), 3) or 0.0,
+        "median_f0_hz": _round_float(profile.get("f0"), 1),
+    }
+
+
+def _compare_speaker_waveforms(
+    left: np.ndarray,
+    left_rate: int,
+    right: np.ndarray,
+    right_rate: int,
+) -> Dict[str, Any]:
+    left_feature = _speaker_feature_from_waveform(left, left_rate)
+    right_feature = _speaker_feature_from_waveform(right, right_rate)
+    similarity = _feature_similarity(left_feature, right_feature)
+    if similarity is None:
+        return {"ok": False, "error": "speaker_feature_unavailable", "backend": "mfcc_v1"}
+    return {
+        "ok": True,
+        "backend": "mfcc_v1",
+        "similarity": _round_float(similarity, 4),
+        "left_gender": _waveform_gender_profile(left, left_rate),
+        "right_gender": _waveform_gender_profile(right, right_rate),
+    }
+
+
+def _compare_speaker_audio(left_bytes: bytes, right_bytes: bytes) -> Dict[str, Any]:
+    try:
+        left, left_rate = _decode_audio_bytes_mono(left_bytes, 16000)
+        right, right_rate = _decode_audio_bytes_mono(right_bytes, 16000)
+    except Exception as exc:
+        return {"ok": False, "error": f"decode_failed:{exc}", "backend": "mfcc_v1"}
+    return _compare_speaker_waveforms(left, left_rate, right, right_rate)
+
+
+def _estimate_music_leakage(reference_bytes: bytes, background_bytes: bytes) -> Dict[str, Any]:
+    """Estimate shared time-frequency energy between vocal and background stems."""
+    try:
+        vocal, sample_rate = _decode_audio_bytes_mono(reference_bytes, 16000)
+        background, _ = _decode_audio_bytes_mono(background_bytes, 16000)
+        size = min(vocal.size, background.size)
+        if size < int(0.4 * sample_rate):
+            return {"ok": False, "error": "clips_too_short"}
+        vocal = vocal[:size]
+        background = background[:size]
+        vocal_spec = np.abs(librosa.stft(vocal, n_fft=512, hop_length=160))
+        background_spec = np.abs(librosa.stft(background, n_fft=512, hop_length=160))
+        vocal_log = np.log1p(vocal_spec).reshape(-1)
+        background_log = np.log1p(background_spec).reshape(-1)
+        if float(np.std(vocal_log)) <= 1e-8 or float(np.std(background_log)) <= 1e-8:
+            correlation = 0.0
+        else:
+            correlation = float(np.corrcoef(vocal_log, background_log)[0, 1])
+        correlation = max(0.0, min(1.0, correlation))
+        background_to_vocal_rms = _compute_rms(background) / max(_compute_rms(vocal), 1e-8)
+        energy_weight = max(0.0, min(1.0, background_to_vocal_rms / 0.35))
+        score = correlation * energy_weight
+        return {
+            "ok": True,
+            "method": "cross_stem_log_spectral_correlation_v1",
+            "score": _round_float(score, 4),
+            "spectral_correlation": _round_float(correlation, 4),
+            "background_to_vocal_rms": _round_float(background_to_vocal_rms, 4),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
+
+
+def _prosody_profile(waveform: np.ndarray, sampling_rate: int) -> Dict[str, Any]:
+    y = _mono_float32(waveform)
+    if y.size < int(0.35 * sampling_rate):
+        return {"ok": False, "error": "audio_too_short"}
+    try:
+        frame_length = min(2048, max(512, 2 ** int(np.floor(np.log2(y.size)))))
+        hop_length = max(128, int(0.010 * sampling_rate))
+        f0 = librosa.yin(
+            y,
+            fmin=70.0,
+            fmax=500.0,
+            sr=sampling_rate,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+        rms = librosa.feature.rms(
+            y=y, frame_length=frame_length, hop_length=hop_length
+        ).reshape(-1)
+        size = min(f0.size, rms.size)
+        f0 = f0[:size]
+        rms = rms[:size]
+        active_floor = max(0.003, float(np.percentile(rms, 80)) * 0.18)
+        active = rms >= active_floor
+        voiced_f0 = f0[active & np.isfinite(f0) & (f0 >= 70.0) & (f0 <= 500.0)]
+        active_rms = rms[active]
+        if voiced_f0.size < 4 or active_rms.size < 4:
+            return {"ok": False, "error": "insufficient_voiced_audio"}
+        energy_db = 20.0 * np.log10(np.maximum(active_rms, 1e-8))
+        return {
+            "ok": True,
+            "median_f0_hz": _round_float(float(np.median(voiced_f0)), 2),
+            "f0_range_octaves": _round_float(
+                float(np.log2(np.percentile(voiced_f0, 90) / max(np.percentile(voiced_f0, 10), 1e-6))),
+                3,
+            ),
+            "energy_range_db": _round_float(
+                float(np.percentile(energy_db, 90) - np.percentile(energy_db, 10)), 2
+            ),
+            "activity_ratio": _round_float(float(np.mean(active)), 3),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
+
+
+def _compare_prosody(
+    reference: np.ndarray,
+    reference_rate: int,
+    candidate: np.ndarray,
+    candidate_rate: int,
+) -> Dict[str, Any]:
+    source = _prosody_profile(reference, reference_rate)
+    output = _prosody_profile(candidate, candidate_rate)
+    if not source.get("ok") or not output.get("ok"):
+        return {"ok": False, "source": source, "output": output}
+    pitch_range_error = abs(
+        float(source["f0_range_octaves"]) - float(output["f0_range_octaves"])
+    )
+    energy_range_error = abs(
+        float(source["energy_range_db"]) - float(output["energy_range_db"])
+    ) / 18.0
+    activity_error = abs(
+        float(source["activity_ratio"]) - float(output["activity_ratio"])
+    )
+    score = float(
+        np.exp(-1.25 * pitch_range_error - 0.8 * energy_range_error - 0.7 * activity_error)
+    )
+    return {
+        "ok": True,
+        "method": "f0_energy_activity_v1",
+        "similarity": _round_float(score, 4),
+        "source": source,
+        "output": output,
+    }
 
 
 def _edge_trim_min_keep_duration(
@@ -4110,7 +4282,27 @@ async def audio_qc_reference(request):
     run_guard = str(data.get("run_endpoint_guard", "true")).strip().lower() not in {"0", "false", "no", "off"}
     trim_on_guard = str(data.get("trim_on_guard", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
-    quality = _reference_quality_legacy(audio_bytes)
+    enable_speaker_check = _bool_option(data.get("enable_speaker_check"), True)
+    quality = _reference_quality_legacy(
+        audio_bytes, enable_speaker_check=enable_speaker_check
+    )
+    background_b64 = data.get("background_audio_base64")
+    if background_b64:
+        try:
+            background_bytes = _decode_base64_audio_to_bytes(background_b64)
+            leakage = await asyncio.to_thread(
+                _estimate_music_leakage, audio_bytes, background_bytes
+            )
+            quality["music_leakage"] = leakage
+            if leakage.get("ok"):
+                quality["music_leakage_score"] = leakage.get("score")
+                if float(leakage.get("score") or 0.0) >= 0.60:
+                    issues = list(quality.get("issues") or [])
+                    if "music_leakage_high" not in issues:
+                        issues.append("music_leakage_high")
+                    quality["issues"] = issues
+        except Exception as exc:
+            quality["music_leakage"] = {"ok": False, "error": str(exc)[:300]}
     guard = {}
     trimmed_b64 = None
     if run_guard and quality.get("ok"):
@@ -4121,7 +4313,9 @@ async def audio_qc_reference(request):
                     audio_bytes, guard.get("start_trim", 0.0), guard.get("end_trim", 0.0)
                 )
                 trimmed_b64 = base64.b64encode(trimmed_bytes).decode("ascii")
-                quality_after = _reference_quality_legacy(trimmed_bytes)
+                quality_after = _reference_quality_legacy(
+                    trimmed_bytes, enable_speaker_check=enable_speaker_check
+                )
                 if quality_after.get("ok"):
                     quality = quality_after
             except Exception as exc:
@@ -4131,6 +4325,33 @@ async def audio_qc_reference(request):
     if trimmed_b64:
         payload["trimmed_audio_base64"] = f"data:audio/wav;base64,{trimmed_b64}"
     return _json_response(payload)
+
+
+@routes.post("/api/speaker/compare")
+async def speaker_compare(request):
+    """Compare two short speech clips and return low-cost identity/gender signals.
+
+    The response contract is intentionally backend-neutral so production can
+    replace the MFCC fallback with a cached ECAPA/WavLM embedding model without
+    changing dubbing callers.
+    """
+    req_id = uuid.uuid4().hex[:8]
+    logger.info(f"[{req_id}] [{request.method}] {request.path} from {request.remote or '-'}")
+    try:
+        data = await request.json()
+    except Exception as exc:
+        return _error(f"Invalid JSON body: {exc}", status=400)
+    left_b64 = data.get("left_audio_base64") or data.get("reference_audio_base64")
+    right_b64 = data.get("right_audio_base64") or data.get("candidate_audio_base64")
+    if not left_b64 or not right_b64:
+        return _error("left_audio_base64 and right_audio_base64 are required", status=400)
+    try:
+        left_bytes = _decode_base64_audio_to_bytes(left_b64)
+        right_bytes = _decode_base64_audio_to_bytes(right_b64)
+    except Exception as exc:
+        return _error(f"Failed to decode audio: {exc}", status=400)
+    comparison = await asyncio.to_thread(_compare_speaker_audio, left_bytes, right_bytes)
+    return _json_response({"ok": bool(comparison.get("ok")), "comparison": comparison})
 
 
 @routes.post("/api/audio_qc/loudness")
@@ -4500,7 +4721,10 @@ async def synthesize(request):
             return _error(f"Failed to decode prompt_wav_base64: {exc}\n{tb}")
 
     # Assess reference audio quality before choosing generation profile.
-    ref_quality = _assess_reference_quality(ref_audio_bytes or prompt_audio_bytes)
+    ref_quality = _assess_reference_quality(
+        ref_audio_bytes or prompt_audio_bytes,
+        enable_speaker_check=_bool_option(data.get("enable_speaker_check"), True),
+    )
     if ref_quality.get("is_poor"):
         logger.warning(
             f"[{req_id}] Reference quality issues: {ref_quality.get('issues')}, "
@@ -5034,6 +5258,55 @@ async def synthesize(request):
     elapsed = round(time.time() - start_time, 3)
     audio_duration = round(audio_waveform.shape[-1] / model.sampling_rate, 3)
     audio_qc = None
+    identity_qc = None
+    prosody_qc = None
+    reference_for_identity = ref_audio_bytes or prompt_audio_bytes
+    if reference_for_identity:
+        try:
+            ref_waveform, ref_rate = _decode_audio_bytes_mono(reference_for_identity, 16000)
+            identity_qc = _compare_speaker_waveforms(
+                ref_waveform,
+                ref_rate,
+                audio_waveform,
+                model.sampling_rate,
+            )
+            prosody_qc = _compare_prosody(
+                ref_waveform,
+                ref_rate,
+                audio_waveform,
+                model.sampling_rate,
+            )
+            declared_gender = str(data.get("declared_gender") or "").strip().lower()
+            output_gender = (identity_qc.get("right_gender") or {}).get("gender")
+            output_gender_confidence = float(
+                (identity_qc.get("right_gender") or {}).get("confidence") or 0.0
+            )
+            normalized_declared = {
+                "m": "male", "man": "male", "男": "male", "男性": "male",
+                "f": "female", "woman": "female", "女": "female", "女性": "female",
+            }.get(declared_gender, declared_gender)
+            if (
+                normalized_declared in {"male", "female"}
+                and output_gender in {"male", "female"}
+                and output_gender != normalized_declared
+                and output_gender_confidence >= 0.60
+            ):
+                quality_issues = list(quality_issues or [])
+                if "gender_mismatch" not in quality_issues:
+                    quality_issues.append("gender_mismatch")
+            emotion_threshold = float(
+                os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
+            )
+            if (
+                prosody_qc.get("ok")
+                and float(prosody_qc.get("similarity") or 0.0) < emotion_threshold
+            ):
+                quality_issues = list(quality_issues or [])
+                if "emotion_mismatch" not in quality_issues:
+                    quality_issues.append("emotion_mismatch")
+        except Exception as exc:
+            logger.warning(f"[{req_id}] Speaker identity QC failed: {exc}")
+            identity_qc = {"ok": False, "error": str(exc)[:500], "backend": "mfcc_v1"}
     severe_issues = sorted({i for i in (quality_issues or []) if i in _SEVERE_ISSUE_LABELS})
     if _bool_option(data.get("include_audio_qc"), True):
         try:
@@ -5045,6 +5318,17 @@ async def synthesize(request):
             )
             if text_completeness_qc is not None:
                 audio_qc["text_completeness"] = text_completeness_qc
+            if identity_qc is not None:
+                audio_qc["speaker_identity"] = identity_qc
+                if identity_qc.get("similarity") is not None:
+                    audio_qc["speaker_similarity_to_reference"] = identity_qc["similarity"]
+                    # Dubbing currently uses one selected speaker anchor/reference;
+                    # keep this alias stable when a canonical anchor is supplied.
+                    audio_qc["speaker_similarity_to_anchor"] = identity_qc["similarity"]
+            if prosody_qc is not None:
+                audio_qc["prosody_match"] = prosody_qc
+                if prosody_qc.get("similarity") is not None:
+                    audio_qc["emotion_similarity_to_reference"] = prosody_qc["similarity"]
             audio_qc["peak_limited"] = peak_limited
             audio_qc["peak_ceiling"] = OUTPUT_PEAK_CEILING
             audio_qc["severe_issues"] = severe_issues

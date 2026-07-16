@@ -6,6 +6,8 @@
 
 - `POST /api/synthesize` / `POST /api/voxcpm/synthesize`：OmniVoice TTS
 - `POST /api/separate`：人声/背景音分离，使用 Audio Separator / RoFormer 的 `vocals_mel_band_roformer.ckpt`
+- `POST /api/audio_qc/reference`：reference 响度、多人、性别和可选跨 stem 音乐泄漏检查
+- `POST /api/speaker/compare`：两个短语音片段的低成本音色相似度和性别比较
 
 `docker/Dockerfile.vast` 构建阶段会同时预下载 OmniVoice TTS 权重和默认分离模型。启动后如果 `/workspace/models/audio-separator` 已经有 `vocals_mel_band_roformer.ckpt` 及其 yaml 配置，运行时不会再访问网络下载分离模型。
 
@@ -132,3 +134,8 @@ curl -fsS -X POST "http://<public_ip>:<public_port>/api/synthesize" \
 ```
 
 首次合成会加载模型到 GPU，耗时会明显高于健康检查。
+
+`/api/synthesize` 可传 `declared_gender` 和 `enable_speaker_check=true`。返回的
+`audio_qc` 包含 `speaker_identity`、`speaker_similarity_to_reference`、
+`prosody_match` 和 `emotion_similarity_to_reference`；高置信度男女声冲突会增加
+`gender_mismatch` quality issue，交由调用方换 seed/reference 或保留原声。
