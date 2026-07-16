@@ -312,49 +312,49 @@ def cmd_health(args: argparse.Namespace) -> None:
 
 
 def cmd_smoke(args: argparse.Namespace) -> None:
-    """Run a minimal OmniVoice synthesis smoke test."""
+    """Run a lightweight smoke test against the running OmniVoice API.
+
+    Hits ``GET /`` and ``GET /api/health`` only. Intentionally avoids
+    ``/api/synthesize`` (OmniVoice) and ``/api/voxcpm/synthesize`` (needs
+    reference audio), both of which would trigger model lazy-load and
+    pollute production VRAM. Use this to verify the container is up and
+    the routes are wired; real synthesis is verified by the dubbing
+    backend's own traffic.
+    """
     base = args.url.rstrip("/")
-    url = f"{base}/api/synthesize"
-    payload = json.dumps({
-        "text": args.text,
-        "language": args.language,
-    }).encode()
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    results = []
+    for path in ("/", "/api/health"):
+        url = f"{base}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                body = resp.read().decode(errors="replace")
+                results.append({"url": url, "status": resp.status, "body": body.strip()})
+        except urllib.error.HTTPError as exc:
+            sys.exit(f"{url} -> HTTP {exc.code}: {exc.read().decode(errors='replace')}")
+        except Exception as exc:  # noqa: BLE001
+            sys.exit(f"{url} -> error: {exc}")
+
+    for r in results:
+        if r["status"] != 200:
+            sys.exit(f"{r['url']} -> status {r['status']} (expected 200)")
+        if r["url"].endswith("/"):
+            if r["body"] != "ok":
+                sys.exit(f"{r['url']} -> body {r['body']!r} (expected 'ok')")
+        else:  # /api/health
+            try:
+                parsed = json.loads(r["body"])
+            except json.JSONDecodeError as exc:
+                sys.exit(f"{r['url']} -> invalid JSON: {exc}")
+            if parsed.get("ok") is not True:
+                sys.exit(f"{r['url']} -> expected JSON ok=true")
+
+    print(
+        json.dumps(
+            {"ok": True, "checks": [{"url": r["url"], "status": r["status"]} for r in results]},
+            indent=2,
+            ensure_ascii=False,
+        )
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            print(f"{url} -> {resp.status}")
-            body = resp.read()
-            print(f"Response bytes: {len(body)}")
-            data = json.loads(body.decode(errors="replace"))
-            if data.get("ok") is not True:
-                sys.exit(f"{url} -> expected JSON ok=true")
-            audio_base64 = str(data.get("audio_base64") or "")
-            if not audio_base64.startswith("data:audio/wav;base64,"):
-                sys.exit(f"{url} -> missing audio_base64 wav payload")
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "elapsed_seconds": data.get("elapsed_seconds"),
-                        "audio_duration_seconds": data.get("audio_duration_seconds"),
-                        "audio_base64_chars": len(audio_base64),
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
-    except urllib.error.HTTPError as exc:
-        text = exc.read().decode(errors="replace")
-        sys.exit(f"{url} -> HTTP {exc.code}: {text}")
-    except json.JSONDecodeError as exc:
-        sys.exit(f"{url} -> invalid JSON: {exc}")
-    except Exception as exc:  # noqa: BLE001
-        sys.exit(f"{url} -> error: {exc}")
 
 
 def cmd_destroy(args: argparse.Namespace) -> None:
