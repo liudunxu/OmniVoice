@@ -37,6 +37,7 @@ COPY pyproject.toml uv.lock README.md /app/
 COPY omnivoice/ /app/omnivoice/
 COPY voxcpm/ /app/voxcpm/
 COPY api.py /app/api.py
+COPY speaker_embedding.py /app/speaker_embedding.py
 COPY docker/entrypoint.sh /usr/local/bin/omnivoice-api-entrypoint
 
 RUN uv sync --frozen --no-dev \
