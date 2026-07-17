@@ -5169,8 +5169,9 @@ async def synthesize(request):
                     raise RuntimeError("Generated audio is empty after quality retry")
             except Exception as first_exc:
                 logger.warning(
-                    f"[{req_id}] first synthesis attempt failed: {first_exc}; "
-                    "trying last-resort conservative retry"
+                    f"[{req_id}] first synthesis attempt failed: {first_exc!r}; "
+                    "trying last-resort conservative retry",
+                    exc_info=True,
                 )
                 try:
                     (
@@ -5192,7 +5193,7 @@ async def synthesize(request):
                     )
                 except Exception as retry_exc:
                     raise RuntimeError(
-                        f"Synthesis failed after last-resort retry: {retry_exc}"
+                        f"Synthesis failed after last-resort retry: {retry_exc!r}"
                     ) from retry_exc
 
             if "empty" in quality_issues:
@@ -5348,8 +5349,15 @@ async def synthesize(request):
             emotion_threshold = float(
                 os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
             )
+            # F0/energy ranges on very short outputs are too noisy for a
+            # meaningful prosody comparison; skip flagging below this floor.
+            emotion_min_output_sec = float(
+                os.environ.get("OMNIVOICE_EMOTION_MIN_OUTPUT_SEC", "1.0")
+            )
+            output_duration_sec = audio_waveform.shape[-1] / model.sampling_rate
             if (
                 prosody_qc.get("ok")
+                and output_duration_sec >= emotion_min_output_sec
                 and float(prosody_qc.get("similarity") or 0.0) < emotion_threshold
             ):
                 quality_issues = list(quality_issues or [])
@@ -6061,7 +6069,7 @@ async def synthesize_voxcpm(request):
     auto_denoise = False
     if denoise_value is None and ref_quality_profile:
         issues = set(ref_quality_profile.get("issues") or [])
-        if "low_snr" in issues or "too_quiet" in issues:
+        if issues & {"low_snr", "too_quiet", "noisy_reference"}:
             if VOXCPM_LOAD_DENOISER and _voxcpm_denoise_available():
                 denoise_value = True
                 auto_denoise = True
@@ -6254,8 +6262,9 @@ async def synthesize_voxcpm(request):
                 audio_waveform = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **gen_kwargs)
             except Exception as first_exc:
                 logger.warning(
-                    f"[{req_id}] first voxcpm synthesis attempt failed: {first_exc}; "
-                    "trying last-resort conservative retry"
+                    f"[{req_id}] first voxcpm synthesis attempt failed: {first_exc!r}; "
+                    "trying last-resort conservative retry",
+                    exc_info=True,
                 )
                 try:
                     audio_waveform = await _last_resort_voxcpm_retry_async(
@@ -6263,7 +6272,7 @@ async def synthesize_voxcpm(request):
                     )
                 except Exception as retry_exc:
                     raise RuntimeError(
-                        f"VoxCPM synthesis failed after last-resort retry: {retry_exc}"
+                        f"VoxCPM synthesis failed after last-resort retry: {retry_exc!r}"
                     ) from retry_exc
             attempts = 1
             _issues, spike_locations = _check_audio_quality_after_ceiling(
@@ -6792,8 +6801,15 @@ async def synthesize_voxcpm(request):
             emotion_threshold = float(
                 os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
             )
+            # F0/energy ranges on very short outputs are too noisy for a
+            # meaningful prosody comparison; skip flagging below this floor.
+            emotion_min_output_sec = float(
+                os.environ.get("OMNIVOICE_EMOTION_MIN_OUTPUT_SEC", "1.0")
+            )
+            output_duration_sec = audio_waveform.shape[-1] / sample_rate
             if (
                 prosody_qc.get("ok")
+                and output_duration_sec >= emotion_min_output_sec
                 and float(prosody_qc.get("similarity") or 0.0) < emotion_threshold
             ):
                 quality_issues = list(quality_issues or [])
