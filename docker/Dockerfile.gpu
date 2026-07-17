@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1 \
     WHISPER_MODEL_DIR=/workspace/models/whisper \
     OMNIVOICE_MODEL_ID=k2-fsa/OmniVoice \
     VOXCPM_LOAD_DENOISER=1 \
-    VOXCPM_OPTIMIZE=1 \
+    VOXCPM_OPTIMIZE=0 \
     VOXCPM_TRIM_LEADING_SILENCE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
