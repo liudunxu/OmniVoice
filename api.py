@@ -92,6 +92,10 @@ from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_NAME_TO_ID
 
+# Lazy WavLM speaker-embedding backend for speaker comparison; importing it
+# loads nothing (model weights download on first compare request).
+import speaker_embedding
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -2793,12 +2797,46 @@ def _waveform_gender_profile(waveform: np.ndarray, sampling_rate: int) -> Dict[s
     }
 
 
+_speaker_compare_fallback_warned = False
+
+
+def _warn_speaker_compare_fallback_once(reason: str) -> None:
+    global _speaker_compare_fallback_warned
+    if _speaker_compare_fallback_warned:
+        return
+    _speaker_compare_fallback_warned = True
+    logger.warning(f"speaker compare: {reason}; falling back to mfcc_v1")
+
+
 def _compare_speaker_waveforms(
     left: np.ndarray,
     left_rate: int,
     right: np.ndarray,
     right_rate: int,
 ) -> Dict[str, Any]:
+    backend = (os.environ.get("SPEAKER_COMPARE_BACKEND") or "wavlm").strip().lower()
+    if backend != "mfcc":
+        try:
+            if speaker_embedding.available():
+                left_embedding = speaker_embedding.embedding(left, left_rate)
+                right_embedding = speaker_embedding.embedding(right, right_rate)
+                if left_embedding is not None and right_embedding is not None:
+                    return {
+                        "ok": True,
+                        "backend": speaker_embedding.backend_name(),
+                        "similarity": _round_float(
+                            speaker_embedding.cosine(left_embedding, right_embedding), 4
+                        ),
+                        "left_gender": _waveform_gender_profile(left, left_rate),
+                        "right_gender": _waveform_gender_profile(right, right_rate),
+                    }
+                _warn_speaker_compare_fallback_once(
+                    "wavlm embedding unavailable (clips too short?)"
+                )
+            else:
+                _warn_speaker_compare_fallback_once("wavlm backend unavailable")
+        except Exception as exc:
+            _warn_speaker_compare_fallback_once(f"wavlm backend error: {exc}")
     left_feature = _speaker_feature_from_waveform(left, left_rate)
     right_feature = _speaker_feature_from_waveform(right, right_rate)
     similarity = _feature_similarity(left_feature, right_feature)
@@ -2811,6 +2849,34 @@ def _compare_speaker_waveforms(
         "left_gender": _waveform_gender_profile(left, left_rate),
         "right_gender": _waveform_gender_profile(right, right_rate),
     }
+
+
+def _append_gender_mismatch_issue(
+    quality_issues: Optional[list],
+    declared_gender: Any,
+    identity_qc: Optional[Dict[str, Any]],
+) -> Optional[list]:
+    """Append `gender_mismatch` when the output gender confidently contradicts
+    the caller-declared gender. Shared by the OmniVoice and VoxCPM synth paths."""
+    declared = str(declared_gender or "").strip().lower()
+    normalized_declared = {
+        "m": "male", "man": "male", "男": "male", "男性": "male",
+        "f": "female", "woman": "female", "女": "female", "女性": "female",
+    }.get(declared, declared)
+    right_gender = (identity_qc or {}).get("right_gender") or {}
+    output_gender = right_gender.get("gender")
+    output_gender_confidence = float(right_gender.get("confidence") or 0.0)
+    if (
+        normalized_declared in {"male", "female"}
+        and output_gender in {"male", "female"}
+        and output_gender != normalized_declared
+        and output_gender_confidence >= 0.60
+    ):
+        issues = list(quality_issues or [])
+        if "gender_mismatch" not in issues:
+            issues.append("gender_mismatch")
+        return issues
+    return quality_issues
 
 
 def _compare_speaker_audio(left_bytes: bytes, right_bytes: bytes) -> Dict[str, Any]:
@@ -5276,24 +5342,9 @@ async def synthesize(request):
                 audio_waveform,
                 model.sampling_rate,
             )
-            declared_gender = str(data.get("declared_gender") or "").strip().lower()
-            output_gender = (identity_qc.get("right_gender") or {}).get("gender")
-            output_gender_confidence = float(
-                (identity_qc.get("right_gender") or {}).get("confidence") or 0.0
+            quality_issues = _append_gender_mismatch_issue(
+                quality_issues, data.get("declared_gender"), identity_qc
             )
-            normalized_declared = {
-                "m": "male", "man": "male", "男": "male", "男性": "male",
-                "f": "female", "woman": "female", "女": "female", "女性": "female",
-            }.get(declared_gender, declared_gender)
-            if (
-                normalized_declared in {"male", "female"}
-                and output_gender in {"male", "female"}
-                and output_gender != normalized_declared
-                and output_gender_confidence >= 0.60
-            ):
-                quality_issues = list(quality_issues or [])
-                if "gender_mismatch" not in quality_issues:
-                    quality_issues.append("gender_mismatch")
             emotion_threshold = float(
                 os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
             )
@@ -6714,6 +6765,44 @@ async def synthesize_voxcpm(request):
             if ref_issue in _REFERENCE_ISSUES_TO_SURFACE and ref_issue not in quality_issues:
                 quality_issues.append(ref_issue)
 
+    # Post-synthesis speaker identity / prosody QC (same signals as the
+    # OmniVoice path). Runs before severe_issues so a confident gender
+    # mismatch is classified severe there too. Fail-open: QC errors only log.
+    identity_qc = None
+    prosody_qc = None
+    reference_for_identity = ref_audio_bytes or prompt_audio_bytes
+    if reference_for_identity and _bool_option(os.environ.get("VOXCPM_IDENTITY_QC"), True):
+        try:
+            ref_waveform, ref_rate = _decode_audio_bytes_mono(reference_for_identity, 16000)
+            identity_qc = _compare_speaker_waveforms(
+                ref_waveform,
+                ref_rate,
+                audio_waveform,
+                sample_rate,
+            )
+            prosody_qc = _compare_prosody(
+                ref_waveform,
+                ref_rate,
+                audio_waveform,
+                sample_rate,
+            )
+            quality_issues = _append_gender_mismatch_issue(
+                quality_issues, data.get("declared_gender"), identity_qc
+            )
+            emotion_threshold = float(
+                os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
+            )
+            if (
+                prosody_qc.get("ok")
+                and float(prosody_qc.get("similarity") or 0.0) < emotion_threshold
+            ):
+                quality_issues = list(quality_issues or [])
+                if "emotion_mismatch" not in quality_issues:
+                    quality_issues.append("emotion_mismatch")
+        except Exception as exc:
+            logger.warning(f"[{req_id}] voxcpm speaker identity QC failed: {exc}")
+            identity_qc = {"ok": False, "error": str(exc)[:500], "backend": "mfcc_v1"}
+
     severe_issues = sorted(
         {
             i
@@ -6732,6 +6821,17 @@ async def synthesize_voxcpm(request):
             )
             if text_completeness_qc is not None:
                 audio_qc["text_completeness"] = text_completeness_qc
+            if identity_qc is not None:
+                audio_qc["speaker_identity"] = identity_qc
+                if identity_qc.get("similarity") is not None:
+                    audio_qc["speaker_similarity_to_reference"] = identity_qc["similarity"]
+                    # Dubbing currently uses one selected speaker anchor/reference;
+                    # keep this alias stable when a canonical anchor is supplied.
+                    audio_qc["speaker_similarity_to_anchor"] = identity_qc["similarity"]
+            if prosody_qc is not None:
+                audio_qc["prosody_match"] = prosody_qc
+                if prosody_qc.get("similarity") is not None:
+                    audio_qc["emotion_similarity_to_reference"] = prosody_qc["similarity"]
             audio_qc["peak_limited"] = peak_limited
             audio_qc["peak_ceiling"] = OUTPUT_PEAK_CEILING
             audio_qc["severe_issues"] = severe_issues

@@ -7,7 +7,7 @@
 - `POST /api/synthesize` / `POST /api/voxcpm/synthesize`：OmniVoice TTS
 - `POST /api/separate`：人声/背景音分离，使用 Audio Separator / RoFormer 的 `vocals_mel_band_roformer.ckpt`
 - `POST /api/audio_qc/reference`：reference 响度、多人、性别和可选跨 stem 音乐泄漏检查
-- `POST /api/speaker/compare`：两个短语音片段的低成本音色相似度和性别比较
+- `POST /api/speaker/compare`：两个短语音片段的音色相似度和性别比较。默认使用 WavLM speaker embedding（`backend="wavlm_base_sv"`，首次请求时懒加载 `microsoft/wavlm-base-plus-sv`，可用 `SPEAKER_EMBED_MODEL` / `SPEAKER_EMBED_DEVICE` 调整）；加载失败或设 `SPEAKER_COMPARE_BACKEND=mfcc` 时回落 MFCC 启发式（`backend="mfcc_v1"`）。响应字段不变，`backend` 标识实际使用的实现
 
 `docker/Dockerfile.vast` 构建阶段会同时预下载 OmniVoice TTS 权重和默认分离模型。启动后如果 `/workspace/models/audio-separator` 已经有 `vocals_mel_band_roformer.ckpt` 及其 yaml 配置，运行时不会再访问网络下载分离模型。
 
@@ -139,3 +139,7 @@ curl -fsS -X POST "http://<public_ip>:<public_port>/api/synthesize" \
 `audio_qc` 包含 `speaker_identity`、`speaker_similarity_to_reference`、
 `prosody_match` 和 `emotion_similarity_to_reference`；高置信度男女声冲突会增加
 `gender_mismatch` quality issue，交由调用方换 seed/reference 或保留原声。
+
+VoxCPM 路径（`/api/voxcpm/synthesize`）现在也会在有 reference/prompt 音频时产出同样的
+identity/prosody QC 字段（含 `gender_mismatch`、`emotion_mismatch` quality issue），
+可用环境变量 `VOXCPM_IDENTITY_QC=0` 关闭；整个 QC fail-open，异常只记日志不影响合成。
