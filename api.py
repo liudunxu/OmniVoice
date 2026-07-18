@@ -212,7 +212,15 @@ VOXCPM_MAX_LEADING_TRIM_SEC = float(
     os.environ.get("VOXCPM_MAX_LEADING_TRIM_SEC", "1.0")
 )
 VOXCPM_LEADING_TRIM_FADE_MS = float(
-    os.environ.get("VOXCPM_LEADING_TRIM_FADE_MS", "5.0")
+    os.environ.get("VOXCPM_LEADING_TRIM_FADE_MS", "12.0")
+)
+# Headroom kept before the detected speech onset when trimming leading silence.
+# Dubbing clients splice segments onto a silent voice track; a 5–10 ms vertical
+# edge at the cue boundary is audible as a pop/abrupt start (worst on name-initial
+# plosives). ~40 ms of pre-onset room + a slightly longer fade-in keeps the splice
+# point natural without delaying the speech itself.
+VOXCPM_LEADING_TRIM_KEEP_SEC = float(
+    os.environ.get("VOXCPM_LEADING_TRIM_KEEP_SEC", "0.04")
 )
 # When true, loading one TTS engine unloads the other to free VRAM (single 24GB
 # GPU coexistence). Default 0: both may stay resident lazily.
@@ -2465,15 +2473,17 @@ def _trim_voxcpm_leading_silence(
     waveform,
     sampling_rate: int,
     max_trim_sec: float = 1.0,
-    fade_ms: float = 5.0,
+    fade_ms: float = 12.0,
+    keep_sec: float = 0.0,
 ) -> tuple[np.ndarray, float]:
     """Trim leading silence from VoxCPM2 generated audio to align speech start.
 
     VoxCPM2 sometimes emits a short leading gap/room-tone before the first
     phoneme, which makes the dubbed voice start later than the source cue.
     This helper detects the first active frame with an adaptive RMS threshold
-    (10% of the 90th percentile, floor at ~-60 dBFS), keeps 10 ms of pre-onset
-    audio to preserve plosives, and applies a short fade-in.
+    (10% of the 90th percentile, floor at ~-60 dBFS), keeps ``keep_sec`` of
+    pre-onset audio (default fallback: one frame) to preserve plosives and give
+    downstream splices a soft edge, and applies a short fade-in.
 
     Returns:
         (trimmed_waveform, trimmed_seconds)
@@ -2500,16 +2510,26 @@ def _trim_voxcpm_leading_silence(
     if first_speech_idx is None:
         return arr, 0.0
 
-    # Look back one frame to preserve attack/plosive onset.
-    onset_idx = max(0, first_speech_idx - 1)
-    onset_sample = int(frames[onset_idx][0] * sampling_rate)
+    if keep_sec > 0:
+        onset_sample = int(frames[first_speech_idx][0] * sampling_rate)
+        onset_sample = max(0, onset_sample - int(keep_sec * sampling_rate))
+    else:
+        # Look back one frame to preserve attack/plosive onset.
+        onset_idx = max(0, first_speech_idx - 1)
+        onset_sample = int(frames[onset_idx][0] * sampling_rate)
     max_samples = int(max_trim_sec * sampling_rate)
     trim_samples = min(onset_sample, max_samples)
     if trim_samples <= 0:
         return arr, 0.0
 
     trimmed = arr[trim_samples:].copy()
-    fade_samples = min(int(fade_ms / 1000.0 * sampling_rate), trimmed.size // 4, 200)
+    # Cap by actual sample rate: a hard 200-sample cap is only ~4 ms at 48 kHz
+    # and silently shrank any requested fade longer than that.
+    fade_samples = min(
+        int(fade_ms / 1000.0 * sampling_rate),
+        trimmed.size // 4,
+        int(0.05 * sampling_rate),
+    )
     if fade_samples > 1:
         trimmed[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
 
@@ -2556,10 +2576,12 @@ def _trim_voxcpm_trailing_silence(
         return arr, 0.0
 
     trimmed = arr[:end_sample].copy()
+    # Same sample-rate-relative cap as the leading trim (a hard 400-sample cap is
+    # only ~8 ms at 48 kHz and silently shrank the requested 20 ms fade).
     fade_samples = min(
         int(fade_ms / 1000.0 * sampling_rate),
         trimmed.size // 4,
-        400,
+        int(0.05 * sampling_rate),
     )
     if fade_samples > 1:
         trimmed[-fade_samples:] *= np.linspace(
@@ -6102,6 +6124,9 @@ async def synthesize_voxcpm(request):
     leading_trim_fade_ms = float(
         data.get("leading_trim_fade_ms", VOXCPM_LEADING_TRIM_FADE_MS)
     )
+    leading_trim_keep_sec = float(
+        data.get("leading_trim_keep_sec", VOXCPM_LEADING_TRIM_KEEP_SEC)
+    )
     # control_instruction is accepted for API parity but VoxCPM2 has no
     # instruction-following mode, so it is ignored.
     _ = data.get("control_instruction") or data.get("instruct")
@@ -6483,11 +6508,13 @@ async def synthesize_voxcpm(request):
             sample_rate,
             max_trim_sec=max_leading_trim_sec,
             fade_ms=leading_trim_fade_ms,
+            keep_sec=leading_trim_keep_sec,
         )
         if leading_trim_sec > 0.005:
             logger.info(
                 f"[{req_id}] voxcpm trimmed {leading_trim_sec:.3f}s leading silence "
-                f"(max={max_leading_trim_sec}s, fade={leading_trim_fade_ms}ms)"
+                f"(max={max_leading_trim_sec}s, fade={leading_trim_fade_ms}ms, "
+                f"keep={leading_trim_keep_sec}s)"
             )
 
     # Trim trailing silence as well. VoxCPM2 often leaves a long quiet tail
