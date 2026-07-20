@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -112,6 +113,7 @@ MAX_REQUEST_MB = int(os.environ.get("VOXCPM_MAX_REQUEST_MB", os.environ.get("OMN
 MAX_REQUEST_SIZE = MAX_REQUEST_MB * 1024 * 1024
 OMNIVOICE_SEED_MOD = 2**31 - 1
 DEFAULT_SEPARATOR_MODEL = os.environ.get("SEPARATION_MODEL", "vocals_mel_band_roformer.ckpt")
+_SEPARATOR_MODEL_DOWNLOAD_LOCK = threading.Lock()
 SEPARATION_MODEL_DIR = Path(
     os.environ.get(
         "AUDIO_SEPARATOR_MODEL_DIR",
@@ -1466,9 +1468,14 @@ def _audio_separator_config_candidates(model):
 
 
 def _separator_model_files_present(model_dir, model):
-    required = [Path(model_dir) / model]
-    required.extend(Path(model_dir) / name for name in _audio_separator_config_candidates(model))
-    return all(path.exists() for path in required)
+    model_dir = Path(model_dir)
+    model_path = model_dir / model
+    if not model_path.is_file() or model_path.stat().st_size == 0:
+        return False
+    return all(
+        path.is_file() and bool(path.read_text(encoding="utf-8").strip())
+        for path in (model_dir / name for name in _audio_separator_config_candidates(model))
+    )
 
 
 def _find_audio_stem(root, names, excludes=()):
@@ -1536,19 +1543,38 @@ def _run_cmd(cmd, *, env=None, check=True):
 
 def _prepare_separator_model(audio_separator_cli, model_dir, model):
     model_dir.mkdir(parents=True, exist_ok=True)
-    if _separator_model_files_present(model_dir, model):
-        logger.info("Audio Separator model files already present for %s in %s", model, model_dir)
-        return
-    _run_cmd(
-        [
-            audio_separator_cli,
-            "--model_filename",
-            model,
-            "--model_file_dir",
-            model_dir,
-            "--download_model_only",
-        ],
-    )
+    with _SEPARATOR_MODEL_DOWNLOAD_LOCK:
+        if _separator_model_files_present(model_dir, model):
+            logger.info("Audio Separator model files already present for %s in %s", model, model_dir)
+            return
+
+        # audio-separator only checks whether a file exists. Remove empty files
+        # left by an interrupted or concurrent first download so it retries them.
+        required = [model_dir / model]
+        required.extend(model_dir / name for name in _audio_separator_config_candidates(model))
+        for path in required:
+            is_empty = path.is_file() and (
+                path.stat().st_size == 0
+                or (path.suffix == ".yaml" and not path.read_text(encoding="utf-8").strip())
+            )
+            if is_empty:
+                logger.warning("Removing empty Audio Separator model file before retry: %s", path)
+                path.unlink()
+
+        _run_cmd(
+            [
+                audio_separator_cli,
+                "--model_filename",
+                model,
+                "--model_file_dir",
+                model_dir,
+                "--download_model_only",
+            ],
+        )
+        if not _separator_model_files_present(model_dir, model):
+            raise RuntimeError(
+                f"Audio Separator model download completed with missing or empty files in {model_dir}"
+            )
 
 
 def _separate_audio_sync(input_path, output_dir, options):
