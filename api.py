@@ -146,6 +146,15 @@ OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN
 OUTPUT_TEXT_QC_MIN_AUDIO_DURATION = float(
     os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_AUDIO_DURATION", "1.0")
 )
+OUTPUT_TEXT_QC_PROMPT_LEAK_DURATION_RATIO = float(
+    os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_PROMPT_LEAK_DURATION_RATIO", "1.6")
+)
+OUTPUT_TEXT_QC_PROMPT_LEAK_MIN_SURPLUS_TOKENS = int(
+    os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_PROMPT_LEAK_MIN_SURPLUS_TOKENS", "2")
+)
+OUTPUT_TEXT_QC_PROMPT_LEAK_MIN_OVERLAP = float(
+    os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_PROMPT_LEAK_MIN_OVERLAP", "0.35")
+)
 OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.94"))
 
 # Non-speech emotional-vocalization event detection (crying/screaming/etc.).
@@ -4346,22 +4355,23 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
         or _default_whisper_compute_type(device)
     ).strip()
     model = await _ensure_whisper_model(model_name, device, compute_type)
+    whisper_options = {
+        "language": whisper_code or None,
+        "beam_size": data.get("output_text_qc_beam_size") or 3,
+        "vad_filter": data.get("output_text_qc_vad_filter", True),
+        "word_timestamps": False,
+        "condition_on_previous_text": False,
+        "vad_threshold": 0.35,
+        "vad_min_silence_ms": 250,
+        "vad_speech_pad_ms": 120,
+        "no_speech_threshold": 0.5,
+        "initial_prompt": expected_text[:200],
+    }
     result = await asyncio.to_thread(
         _transcribe_whisper_sync,
         model,
         audio_path,
-        {
-            "language": whisper_code or None,
-            "beam_size": data.get("output_text_qc_beam_size") or 3,
-            "vad_filter": data.get("output_text_qc_vad_filter", True),
-            "word_timestamps": False,
-            "condition_on_previous_text": False,
-            "vad_threshold": 0.35,
-            "vad_min_silence_ms": 250,
-            "vad_speech_pad_ms": 120,
-            "no_speech_threshold": 0.5,
-            "initial_prompt": expected_text[:200],
-        },
+        whisper_options,
     )
     actual_text = " ".join(
         str(segment.get("text") or "").strip()
@@ -4379,7 +4389,7 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
     )
     if source_script_residue:
         status = "incomplete"
-    return {
+    qc = {
         "version": 1,
         "status": status,
         "language": code,
@@ -4394,6 +4404,71 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
         "whisper_language_probability": result.get("language_probability"),
         "source_script_residue": source_script_residue,
     }
+
+    # A target-language-forced Whisper pass is intentionally recall-oriented:
+    # it can transliterate/translate a Chinese emotion prompt and still find the
+    # requested target words later in an overlong clip. For suspicious
+    # cross-language continuation outputs, run one unprompted auto-language pass
+    # and compare it with the supplied prompt transcript.
+    prompt_text = re.sub(r"\s+", " ", str(data.get("prompt_text") or "").strip())
+    try:
+        target_duration = float(
+            data.get("qc_target_duration_ms")
+            or data.get("target_duration_ms")
+            or 0.0
+        ) / 1000.0
+    except (TypeError, ValueError):
+        target_duration = 0.0
+    try:
+        audio_duration = float(result.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        audio_duration = 0.0
+    token_surplus = max(0, len(actual_tokens) - len(expected_tokens))
+    suspicious_duration = (
+        target_duration > 0
+        and audio_duration >= target_duration * OUTPUT_TEXT_QC_PROMPT_LEAK_DURATION_RATIO
+    )
+    should_audit_prompt = (
+        bool(prompt_text)
+        and _CJK_SCRIPT_RE.search(prompt_text) is not None
+        and not _language_allows_cjk_prompt(code)
+        and (
+            suspicious_duration
+            or token_surplus >= OUTPUT_TEXT_QC_PROMPT_LEAK_MIN_SURPLUS_TOKENS
+        )
+    )
+    if should_audit_prompt:
+        auto_options = dict(whisper_options)
+        auto_options["language"] = None
+        auto_options.pop("initial_prompt", None)
+        auto_result = await asyncio.to_thread(
+            _transcribe_whisper_sync, model, audio_path, auto_options
+        )
+        auto_text = " ".join(
+            str(segment.get("text") or "").strip()
+            for segment in auto_result.get("segments") or []
+            if isinstance(segment, dict)
+        ).strip()
+        prompt_overlap = _lcs_coverage(
+            _text_qc_tokens(prompt_text), _text_qc_tokens(auto_text)
+        )
+        prompt_leak_detected = (
+            _CJK_SCRIPT_RE.search(auto_text) is not None
+            and prompt_overlap >= OUTPUT_TEXT_QC_PROMPT_LEAK_MIN_OVERLAP
+        )
+        qc["prompt_leak_audit"] = {
+            "ran": True,
+            "actual_text": auto_text[:500],
+            "language": auto_result.get("language"),
+            "language_probability": auto_result.get("language_probability"),
+            "prompt_overlap": _round_float(prompt_overlap, 3),
+            "detected": prompt_leak_detected,
+        }
+        if prompt_leak_detected:
+            qc["source_script_residue"] = True
+            qc["prompt_leak_detected"] = True
+            qc["status"] = "incomplete"
+    return qc
 
 
 def _qc_language_mismatch_triggers_retry(
@@ -4433,11 +4508,17 @@ def _should_accept_text_qc_candidate(
 ) -> bool:
     current_coverage = float((current_qc or {}).get("coverage") or 0.0)
     candidate_coverage = float((candidate_qc or {}).get("coverage") or 0.0)
+    current_contaminated = bool(
+        (current_qc or {}).get("source_script_residue")
+        or (current_qc or {}).get("prompt_leak_detected")
+    )
     return (
         candidate_coverage >= OUTPUT_TEXT_QC_MIN_COVERAGE
-        and candidate_coverage >= current_coverage + 0.05
+        and (current_contaminated or candidate_coverage >= current_coverage + 0.05)
         and candidate_signal_severe_count <= current_signal_severe_count
         and not prompt_leak
+        and not bool((candidate_qc or {}).get("source_script_residue"))
+        and not bool((candidate_qc or {}).get("prompt_leak_detected"))
     )
 
 
@@ -4868,7 +4949,6 @@ async def synthesize(request):
             f"text length ({len(text)}) exceeds MAX_TEXT_LEN ({MAX_TEXT_LEN}); split the input into shorter cues.",
             status=400,
         )
-
     language = (
         data.get("language")
         or data.get("target_lang")
@@ -5965,6 +6045,29 @@ def _build_voxcpm_prompt_cache_sync(
     return model.tts_model.build_prompt_cache(**kwargs)
 
 
+async def _voxcpm_reference_only_retry_kwargs(model, gen_kwargs, ref_path):
+    """Drop continuation prompt state before a content/text retry.
+
+    Reusing a prompt cache after Whisper found source-language residue simply
+    asks VoxCPM to repeat the same failure with a stronger cfg. Rebuild a
+    reference-only cache so the retry keeps timbre but cannot continue the
+    source utterance.
+    """
+    retry_kwargs = dict(gen_kwargs)
+    retry_kwargs["prompt_path"] = None
+    retry_kwargs["prompt_text"] = ""
+    retry_kwargs["retry_badcase_max_times"] = 1
+    retry_kwargs["prompt_cache"] = await asyncio.to_thread(
+        _build_voxcpm_prompt_cache_sync,
+        model,
+        ref_path,
+        None,
+        "",
+        bool(retry_kwargs.get("trim_silence_vad", True)),
+    )
+    return retry_kwargs
+
+
 def _generate_voxcpm_sync(model, text, **kwargs):
     """Run VoxCPM.generate in a worker thread. Returns a 1-D numpy waveform.
 
@@ -6057,6 +6160,11 @@ async def synthesize_voxcpm(request):
             f"text length ({len(text)}) exceeds MAX_TEXT_LEN ({MAX_TEXT_LEN}); split the input into shorter cues.",
             status=400,
         )
+    request_context = ""
+    if data.get("cue_index") is not None:
+        request_context = f" cue={data.get('cue_index')}"
+    if data.get("speaker"):
+        request_context += f" speaker={str(data.get('speaker'))[:80]}"
 
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -6440,7 +6548,7 @@ async def synthesize_voxcpm(request):
         attempts = 0
 
         logger.info(
-            f"[{req_id}] voxcpm request profile: "
+            f"[{req_id}]{request_context} voxcpm request profile: "
             f"text_len={len(text)}, language={language!r}, "
             f"ref_duration={ref_duration}, "
             f"ref_quality={ref_quality_profile}, "
@@ -6505,6 +6613,7 @@ async def synthesize_voxcpm(request):
                 retry_kwargs = dict(gen_kwargs)
                 retry_kwargs["cfg_value"] = retry_cfg
                 retry_kwargs["inference_timesteps"] = retry_steps
+                retry_kwargs["retry_badcase_max_times"] = 1
                 if retry_disable_normalize:
                     retry_kwargs["normalize"] = False
                 logger.info(
@@ -6560,6 +6669,7 @@ async def synthesize_voxcpm(request):
                 and not duration_cap_relaxed
             ):
                 duration_kwargs = dict(gen_kwargs)
+                duration_kwargs["retry_badcase_max_times"] = 1
                 duration_kwargs["seed"] = ((_normalize_seed(seed) or 0) + 13) % OMNIVOICE_SEED_MOD
                 duration_new_seed = duration_kwargs["seed"]
                 logger.info(
@@ -6624,6 +6734,7 @@ async def synthesize_voxcpm(request):
                 )
                 if leak_detected:
                     leak_kwargs = dict(gen_kwargs)
+                    leak_kwargs["retry_badcase_max_times"] = 1
                     leak_kwargs["seed"] = ((_normalize_seed(seed) or 0) + 1) % OMNIVOICE_SEED_MOD
                     leak_kwargs["inference_timesteps"] = min(
                         gen_kwargs["inference_timesteps"] + 2, 64
@@ -6771,6 +6882,9 @@ async def synthesize_voxcpm(request):
                 if output_dur >= OUTPUT_TEXT_QC_MIN_AUDIO_DURATION:
                     if "text_incomplete" not in quality_issues:
                         quality_issues.append("text_incomplete")
+            if text_completeness_qc.get("source_script_residue"):
+                if "source_script_residue" not in quality_issues:
+                    quality_issues.append("source_script_residue")
         except Exception as exc:
             logger.warning(f"[{req_id}] voxcpm output text QC failed: {exc}")
             text_completeness_qc = {"version": 1, "status": "error", "error": str(exc)[:500]}
@@ -6786,6 +6900,7 @@ async def synthesize_voxcpm(request):
         and quality_retry
         and _qc_language_mismatch_triggers_retry(text_completeness_qc, language)
     ):
+        regen_promptless = bool(prompt_path is not None and prompt_audio_bytes is not None)
         regen_kwargs = dict(gen_kwargs)
         regen_kwargs["seed"] = ((seed or 0) + 7) % (2**31 - 1)  # fresh seed, offset from leak retry
         regen_new_seed = regen_kwargs["seed"]
@@ -6793,9 +6908,14 @@ async def synthesize_voxcpm(request):
             f"[{req_id}] voxcpm language-mismatch regenerate "
             f"(detected={text_completeness_qc.get('whisper_language')} "
             f"expected={_whisper_language_code(language)}, "
-            f"coverage={text_completeness_qc.get('coverage')}, new seed={regen_new_seed})"
+            f"coverage={text_completeness_qc.get('coverage')}, new seed={regen_new_seed}, "
+            f"promptless={regen_promptless})"
         )
         try:
+            if regen_promptless:
+                regen_kwargs = await _voxcpm_reference_only_retry_kwargs(
+                    model, regen_kwargs, ref_path
+                )
             async with _API_INFER_SEM:
                 regen_wav = await asyncio.to_thread(_generate_voxcpm_sync, model, text, **regen_kwargs)
             attempts += 1
@@ -6880,23 +7000,30 @@ async def synthesize_voxcpm(request):
         and text_completeness_qc.get("status") == "incomplete"
         and not lang_regen
     ):
+        text_regen_promptless = bool(prompt_path is not None and prompt_audio_bytes is not None)
         text_regen_kwargs = dict(gen_kwargs)
         text_regen_kwargs["seed"] = ((seed or 0) + 11) % (2**31 - 1)
-        text_regen_kwargs["cfg_value"] = min(
-            float(text_regen_kwargs.get("cfg_value", cfg_value)) + 0.2, 2.8
-        )
-        text_regen_kwargs["inference_timesteps"] = min(
-            int(text_regen_kwargs.get("inference_timesteps", inference_timesteps)) + 4, 48
-        )
+        if not text_regen_promptless:
+            text_regen_kwargs["cfg_value"] = min(
+                float(text_regen_kwargs.get("cfg_value", cfg_value)) + 0.2, 2.8
+            )
+            text_regen_kwargs["inference_timesteps"] = min(
+                int(text_regen_kwargs.get("inference_timesteps", inference_timesteps)) + 4, 48
+            )
         text_regen_new_seed = text_regen_kwargs["seed"]
         logger.info(
             f"[{req_id}] voxcpm text-incomplete retry "
             f"(coverage={text_completeness_qc.get('coverage')}, "
             f"new seed={text_regen_new_seed}, "
             f"cfg={text_regen_kwargs['cfg_value']}, "
-            f"steps={text_regen_kwargs['inference_timesteps']})"
+            f"steps={text_regen_kwargs['inference_timesteps']}, "
+            f"promptless={text_regen_promptless})"
         )
         try:
+            if text_regen_promptless:
+                text_regen_kwargs = await _voxcpm_reference_only_retry_kwargs(
+                    model, text_regen_kwargs, ref_path
+                )
             async with _API_INFER_SEM:
                 text_regen_wav = await asyncio.to_thread(
                     _generate_voxcpm_sync, model, text, **text_regen_kwargs
@@ -7059,7 +7186,7 @@ async def synthesize_voxcpm(request):
                         "severe_issues": severe_issues}
 
     logger.info(
-        f"[{req_id}] voxcpm synthesis finished in {elapsed}s, "
+        f"[{req_id}]{request_context} voxcpm synthesis finished in {elapsed}s, "
         f"audio_duration={audio_duration}s, "
         f"ref_duration={ref_duration}s, "
         f"ref_quality_issues={ref_quality_profile.get('issues') if ref_quality_profile else None}, "
@@ -7080,6 +7207,7 @@ async def synthesize_voxcpm(request):
 
     return _json_response({
         "ok": True,
+        "request_id": req_id,
         "engine": "voxcpm2",
         "audio_base64": output_base64,
         "output_path": output_path_for_response,

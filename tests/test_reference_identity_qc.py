@@ -1,5 +1,6 @@
 import io
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import soundfile as sf
@@ -89,6 +90,74 @@ class ReferenceIdentityQcTest(unittest.TestCase):
         edge = {"gender": "female", "confidence": 0.9, "f0": 240.0}
 
         self.assertFalse(api._reference_endpoint_gender_conflict(body, edge))
+
+    def test_contaminated_current_text_qc_can_be_replaced_at_equal_coverage(self):
+        current = {"coverage": 1.0, "source_script_residue": True}
+        candidate = {"coverage": 1.0, "source_script_residue": False}
+
+        self.assertTrue(
+            api._should_accept_text_qc_candidate(current, candidate, 0, 0, False)
+        )
+
+
+class OutputTextQcTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cross_language_prompt_leak_uses_unbiased_second_pass(self):
+        forced = {
+            "duration": 11.43,
+            "language": "tl",
+            "language_probability": 1.0,
+            "segments": [{"text": "Kuya anong nangyari"}],
+        }
+        automatic = {
+            "duration": 11.43,
+            "language": "zh",
+            "language_probability": 0.99,
+            "segments": [{"text": "大师兄你怎么了"}],
+        }
+        with (
+            patch.object(api, "_ensure_whisper_model", new=AsyncMock(return_value=object())),
+            patch.object(api, "_transcribe_whisper_sync", side_effect=[forced, automatic]),
+        ):
+            result = await api._build_output_text_qc(
+                "/tmp/not-read-by-mock.wav",
+                "Kuya, anong nangyari?",
+                "fil",
+                {
+                    "prompt_text": "大师兄。你怎么了？",
+                    "target_duration_ms": 2580,
+                },
+            )
+
+        self.assertEqual(result["status"], "incomplete")
+        self.assertTrue(result["source_script_residue"])
+        self.assertTrue(result["prompt_leak_detected"])
+        self.assertEqual(result["prompt_leak_audit"]["language"], "zh")
+
+    async def test_reference_only_retry_drops_continuation_prompt_cache(self):
+        class FakeTtsModel:
+            def build_prompt_cache(self, **kwargs):
+                return kwargs
+
+        class FakeModel:
+            tts_model = FakeTtsModel()
+
+        result = await api._voxcpm_reference_only_retry_kwargs(
+            FakeModel(),
+            {
+                "prompt_path": "/tmp/source.wav",
+                "prompt_text": "大师兄。你怎么了？",
+                "prompt_cache": {"continuation": True},
+                "trim_silence_vad": True,
+            },
+            "/tmp/reference.wav",
+        )
+
+        self.assertIsNone(result["prompt_path"])
+        self.assertEqual(result["prompt_text"], "")
+        self.assertEqual(
+            result["prompt_cache"],
+            {"trim_silence_vad": True, "reference_wav_path": "/tmp/reference.wav"},
+        )
 
 
 if __name__ == "__main__":

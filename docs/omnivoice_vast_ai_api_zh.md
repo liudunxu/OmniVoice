@@ -149,3 +149,5 @@ reference 音频只作为音色锚点，其时长不再参与输出句子的 wav
 VoxCPM 路径（`/api/voxcpm/synthesize`）现在也会在有 reference/prompt 音频时产出同样的
 identity/prosody QC 字段（含 `gender_mismatch`、`emotion_mismatch` quality issue），
 可用环境变量 `VOXCPM_IDENTITY_QC=0` 关闭。`emotion_mismatch` 不再由单个综合相似度直接触发：默认要求 F0 范围、能量范围、语音活跃度至少两个维度同时明显偏离，可用 `OMNIVOICE_PROSODY_MISMATCH_MIN_AXES` 调整。整个 QC fail-open，异常只记日志不影响合成。
+
+跨语言 continuation/emotion prompt 的可疑超长或 token surplus 输出会追加一次不带 initial prompt 的自动语言 Whisper。若自动转写与中文 prompt 重合（默认 ≥0.35），返回 `source_script_residue`，文本重试会丢弃 continuation prompt、重建 reference-only cache，而不是用更高 CFG 继续复述源文。调用方可传 `qc_target_duration_ms` 仅供这项检测使用，不参与生成时长控制；`cue_index` / `speaker` 会写入日志，响应返回 `request_id`。针对性 promptless、duration、prompt-leak、signal retry 的模型内部 badcase 次数均限制为 1。
