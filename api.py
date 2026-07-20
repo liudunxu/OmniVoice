@@ -182,6 +182,22 @@ _SEVERE_ISSUE_LABELS = frozenset({
 GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT = float(
     os.environ.get("GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT", "1.25")
 )
+PROSODY_MISMATCH_MIN_OUTPUT_SEC = float(
+    os.environ.get("OMNIVOICE_EMOTION_MIN_OUTPUT_SEC", "1.0")
+)
+PROSODY_MISMATCH_SIMILARITY_THRESHOLD = float(
+    os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
+)
+PROSODY_MISMATCH_MIN_AXES = int(os.environ.get("OMNIVOICE_PROSODY_MISMATCH_MIN_AXES", "2"))
+PROSODY_MISMATCH_PITCH_RANGE_OCTAVES = float(
+    os.environ.get("OMNIVOICE_PROSODY_MISMATCH_PITCH_RANGE_OCTAVES", "0.65")
+)
+PROSODY_MISMATCH_ENERGY_RANGE_DB = float(
+    os.environ.get("OMNIVOICE_PROSODY_MISMATCH_ENERGY_RANGE_DB", "8.0")
+)
+PROSODY_MISMATCH_ACTIVITY_RATIO = float(
+    os.environ.get("OMNIVOICE_PROSODY_MISMATCH_ACTIVITY_RATIO", "0.25")
+)
 
 # Reference-quality issues that should block synthesis outright. Dubbing callers
 # can then fall back to Edge TTS or a stronger same-speaker anchor reference.
@@ -1108,6 +1124,20 @@ def _opposite_gender(left, right):
     return {left, right} == {"male", "female"}
 
 
+def _reference_endpoint_gender_conflict(body, edge):
+    if edge.get("confidence", 0.0) < 0.60 or not _opposite_gender(
+        body.get("gender"), edge.get("gender")
+    ):
+        return False
+    body_f0 = float(body.get("f0") or 0.0)
+    edge_f0 = float(edge.get("f0") or 0.0)
+    if body_f0 > 0 and edge_f0 > 0:
+        harmonic_ratio = max(body_f0, edge_f0) / min(body_f0, edge_f0)
+        if 1.75 <= harmonic_ratio <= 2.25:
+            return False
+    return True
+
+
 def _decode_base64_audio_to_bytes(b64_data):
     b64_data = str(b64_data or "").strip()
     if b64_data.startswith("data:"):
@@ -1225,10 +1255,8 @@ def _reference_endpoint_guard(audio_bytes):
         return {"trimmed": False, "reason": "body_uncertain", "duration": duration, "body": body}
     start_profile = _segment_profile(samples, sample_rate, 0.0, edge)
     end_profile = _segment_profile(samples, sample_rate, duration - edge, duration)
-    start_polluted = (
-        start_profile["confidence"] >= 0.60 and _opposite_gender(body["gender"], start_profile["gender"])
-    )
-    end_polluted = end_profile["confidence"] >= 0.60 and _opposite_gender(body["gender"], end_profile["gender"])
+    start_polluted = _reference_endpoint_gender_conflict(body, start_profile)
+    end_polluted = _reference_endpoint_gender_conflict(body, end_profile)
     if not start_polluted and not end_polluted:
         return {
             "trimmed": False,
@@ -3092,6 +3120,47 @@ def _compare_prosody(
     }
 
 
+def _prosody_mismatch_is_corroborated(
+    prosody_qc: Optional[Dict[str, Any]], output_duration_sec: float
+) -> bool:
+    """Require multiple independent prosody deviations before warning.
+
+    Different text and language naturally change one aggregate dimension (most
+    often F0 range). Calling that an emotion mismatch from one scalar alone
+    creates noisy labels, so at least two dimensions must be materially off.
+    """
+    if not isinstance(prosody_qc, dict) or not prosody_qc.get("ok"):
+        return False
+    source = prosody_qc.get("source") or {}
+    output = prosody_qc.get("output") or {}
+    try:
+        similarity = float(prosody_qc.get("similarity") or 0.0)
+        pitch_error = abs(float(source["f0_range_octaves"]) - float(output["f0_range_octaves"]))
+        energy_error = abs(float(source["energy_range_db"]) - float(output["energy_range_db"]))
+        activity_error = abs(float(source["activity_ratio"]) - float(output["activity_ratio"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    axes = {
+        "pitch_range": pitch_error >= PROSODY_MISMATCH_PITCH_RANGE_OCTAVES,
+        "energy_range": energy_error >= PROSODY_MISMATCH_ENERGY_RANGE_DB,
+        "activity": activity_error >= PROSODY_MISMATCH_ACTIVITY_RATIO,
+    }
+    corroborated = (
+        output_duration_sec >= PROSODY_MISMATCH_MIN_OUTPUT_SEC
+        and similarity < PROSODY_MISMATCH_SIMILARITY_THRESHOLD
+        and sum(bool(value) for value in axes.values()) >= max(1, PROSODY_MISMATCH_MIN_AXES)
+    )
+    prosody_qc["mismatch_assessment"] = {
+        "corroborated": corroborated,
+        "deviant_axes": [name for name, value in axes.items() if value],
+        "pitch_range_error_octaves": _round_float(pitch_error, 3),
+        "energy_range_error_db": _round_float(energy_error, 2),
+        "activity_ratio_error": _round_float(activity_error, 3),
+        "min_deviant_axes": max(1, PROSODY_MISMATCH_MIN_AXES),
+    }
+    return corroborated
+
+
 def _edge_trim_min_keep_duration(
     original_duration: float,
     text: str,
@@ -3931,6 +4000,29 @@ def _check_audio_quality(
     spike_locations.extend(pulse_locations)
     issues.extend(_detect_harsh_high_frequency_artifact(arr, sampling_rate))
     return issues, spike_locations
+
+
+_WAVEFORM_QUALITY_ISSUES = frozenset({
+    "empty",
+    "too_much_silence",
+    "clipping",
+    "near_clipping",
+    "too_quiet",
+    "duration_off_target",
+    "duration_off_reference",
+    "plosive",
+    "impulsive_spike",
+    "periodic_pulse",
+    "harsh_high_freq",
+})
+
+
+def _refresh_waveform_quality_issues(existing, fresh):
+    """Replace stale waveform labels after retry/trim while preserving semantic QC."""
+    preserved = {
+        issue for issue in (existing or []) if issue not in _WAVEFORM_QUALITY_ISSUES
+    }
+    return sorted(preserved | set(fresh or []))
 
 
 def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dict[str, Any]:
@@ -5245,7 +5337,9 @@ async def synthesize(request):
                     target_duration=effective_duration,
                     duration_tolerance=duration_tolerance_sec,
                     voice_clone_prompt=voice_clone_prompt,
-                    ref_duration=ref_duration,
+                    # Reference audio is a timbre anchor; its duration is not a
+                    # target for the translated sentence.
+                    ref_duration=None,
                     max_duration=max_duration_sec,
                     enable_quality_retry=_bool_option(
                         data.get("quality_retry"), True
@@ -5282,7 +5376,7 @@ async def synthesize(request):
                         target_duration=effective_duration,
                         duration_tolerance=duration_tolerance_sec,
                         voice_clone_prompt=voice_clone_prompt,
-                        ref_duration=ref_duration,
+                        ref_duration=None,
                         max_duration=max_duration_sec,
                         base_seed=seed,
                         **gen_kwargs,
@@ -5304,10 +5398,9 @@ async def synthesize(request):
                 model.sampling_rate,
                 target_duration=effective_duration,
                 duration_tolerance=duration_tolerance_sec,
-                ref_duration=ref_duration,
+                ref_duration=None,
             )
-            # Preserve any issues already flagged by quality retry.
-            quality_issues = sorted(set(quality_issues) | set(_final_issues))
+            quality_issues = _refresh_waveform_quality_issues(quality_issues, _final_issues)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] Synthesis failed: {exc}\n{tb}")
@@ -5362,10 +5455,26 @@ async def synthesize(request):
             quality_issues.append("duration_off_target")
 
     audio_waveform, peak_limited = _apply_peak_ceiling(audio_waveform, OUTPUT_PEAK_CEILING)
+
     if peak_limited:
         logger.info(
             f"[{req_id}] output peak ceiling applied: ceiling={OUTPUT_PEAK_CEILING:.3f}"
         )
+
+    # Trimming and peak limiting can resolve a first-pass signal warning. Re-QC
+    # the actual returned waveform so stale labels do not trigger client retries.
+    final_waveform_issues, spike_locations = _check_audio_quality(
+        audio_waveform,
+        model.sampling_rate,
+        target_duration=effective_duration,
+        duration_tolerance=duration_tolerance_sec,
+        ref_duration=None,
+    )
+    quality_issues = _refresh_waveform_quality_issues(
+        quality_issues, final_waveform_issues
+    )
+    if was_trimmed and "duration_off_target" not in quality_issues:
+        quality_issues.append("duration_off_target")
 
     try:
         wav_bytes = _waveform_to_wav_bytes(audio_waveform, model.sampling_rate)
@@ -5442,20 +5551,8 @@ async def synthesize(request):
             quality_issues = _append_gender_mismatch_issue(
                 quality_issues, data.get("declared_gender"), identity_qc
             )
-            emotion_threshold = float(
-                os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
-            )
-            # F0/energy ranges on very short outputs are too noisy for a
-            # meaningful prosody comparison; skip flagging below this floor.
-            emotion_min_output_sec = float(
-                os.environ.get("OMNIVOICE_EMOTION_MIN_OUTPUT_SEC", "1.0")
-            )
             output_duration_sec = audio_waveform.shape[-1] / model.sampling_rate
-            if (
-                prosody_qc.get("ok")
-                and output_duration_sec >= emotion_min_output_sec
-                and float(prosody_qc.get("similarity") or 0.0) < emotion_threshold
-            ):
+            if _prosody_mismatch_is_corroborated(prosody_qc, output_duration_sec):
                 quality_issues = list(quality_issues or [])
                 if "emotion_mismatch" not in quality_issues:
                     quality_issues.append("emotion_mismatch")
@@ -6613,6 +6710,22 @@ async def synthesize_voxcpm(request):
 
     audio_waveform, peak_limited = _apply_peak_ceiling(audio_waveform, OUTPUT_PEAK_CEILING)
 
+    # Leading/trailing trim and peak limiting operate after candidate selection.
+    # Refresh signal labels against the waveform that will actually be returned,
+    # while preserving semantic flags such as prompt_leak.
+    final_waveform_issues, spike_locations = _check_audio_quality(
+        audio_waveform,
+        sample_rate,
+        target_duration=target_duration_sec,
+        duration_tolerance=duration_tolerance_sec,
+        ref_duration=None,
+    )
+    quality_issues = _refresh_waveform_quality_issues(
+        quality_issues, final_waveform_issues
+    )
+    if was_trimmed and "duration_off_target" not in quality_issues:
+        quality_issues.append("duration_off_target")
+
     try:
         wav_bytes = _waveform_to_wav_bytes(audio_waveform, sample_rate)
     except Exception as exc:
@@ -6899,20 +7012,8 @@ async def synthesize_voxcpm(request):
             quality_issues = _append_gender_mismatch_issue(
                 quality_issues, data.get("declared_gender"), identity_qc
             )
-            emotion_threshold = float(
-                os.environ.get("OMNIVOICE_EMOTION_SIMILARITY_WARN_THRESHOLD", "0.25")
-            )
-            # F0/energy ranges on very short outputs are too noisy for a
-            # meaningful prosody comparison; skip flagging below this floor.
-            emotion_min_output_sec = float(
-                os.environ.get("OMNIVOICE_EMOTION_MIN_OUTPUT_SEC", "1.0")
-            )
             output_duration_sec = audio_waveform.shape[-1] / sample_rate
-            if (
-                prosody_qc.get("ok")
-                and output_duration_sec >= emotion_min_output_sec
-                and float(prosody_qc.get("similarity") or 0.0) < emotion_threshold
-            ):
+            if _prosody_mismatch_is_corroborated(prosody_qc, output_duration_sec):
                 quality_issues = list(quality_issues or [])
                 if "emotion_mismatch" not in quality_issues:
                     quality_issues.append("emotion_mismatch")

@@ -143,6 +143,9 @@ curl -fsS -X POST "http://<public_ip>:<public_port>/api/synthesize" \
 F0 漂移不足 1.25 倍（`GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT`），会记录 assessment 但不报
 `gender_mismatch`，避免男声二次谐波被误判为女声。
 
+reference 音频只作为音色锚点，其时长不再参与输出句子的 waveform 时长 QC；候选音频经过首尾裁剪和限峰后，服务端会对最终返回波形重新检查并替换旧的信号类标签，避免已经解决的
+`too_much_silence`、`harsh_high_freq` 等问题继续触发客户端重试。reference 端点的男女声判断若正好呈约 2 倍 F0，也视为基频/二次谐波歧义，不自动裁掉端点。
+
 VoxCPM 路径（`/api/voxcpm/synthesize`）现在也会在有 reference/prompt 音频时产出同样的
 identity/prosody QC 字段（含 `gender_mismatch`、`emotion_mismatch` quality issue），
-可用环境变量 `VOXCPM_IDENTITY_QC=0` 关闭；整个 QC fail-open，异常只记日志不影响合成。
+可用环境变量 `VOXCPM_IDENTITY_QC=0` 关闭。`emotion_mismatch` 不再由单个综合相似度直接触发：默认要求 F0 范围、能量范围、语音活跃度至少两个维度同时明显偏离，可用 `OMNIVOICE_PROSODY_MISMATCH_MIN_AXES` 调整。整个 QC fail-open，异常只记日志不影响合成。

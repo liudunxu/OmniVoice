@@ -48,6 +48,48 @@ class ReferenceIdentityQcTest(unittest.TestCase):
         self.assertTrue(comparison["ok"])
         self.assertGreater(comparison["similarity"], 0.99)
 
+    def test_prosody_warning_requires_multiple_deviant_axes(self):
+        one_axis = {
+            "ok": True,
+            "similarity": 0.10,
+            "source": {
+                "f0_range_octaves": 0.2,
+                "energy_range_db": 10.0,
+                "activity_ratio": 0.6,
+            },
+            "output": {
+                "f0_range_octaves": 1.2,
+                "energy_range_db": 11.0,
+                "activity_ratio": 0.58,
+            },
+        }
+        two_axes = {
+            **one_axis,
+            "source": dict(one_axis["source"]),
+            "output": {**one_axis["output"], "activity_ratio": 0.2},
+        }
+
+        self.assertFalse(api._prosody_mismatch_is_corroborated(one_axis, 3.0))
+        self.assertTrue(api._prosody_mismatch_is_corroborated(two_axes, 3.0))
+        self.assertEqual(
+            two_axes["mismatch_assessment"]["deviant_axes"],
+            ["pitch_range", "activity"],
+        )
+
+    def test_refresh_waveform_qc_drops_resolved_signal_issue(self):
+        refreshed = api._refresh_waveform_quality_issues(
+            ["too_much_silence", "prompt_leak", "duration_off_reference"],
+            [],
+        )
+
+        self.assertEqual(refreshed, ["prompt_leak"])
+
+    def test_reference_endpoint_guard_ignores_octave_gender_flip(self):
+        body = {"gender": "male", "confidence": 0.9, "f0": 120.0}
+        edge = {"gender": "female", "confidence": 0.9, "f0": 240.0}
+
+        self.assertFalse(api._reference_endpoint_gender_conflict(body, edge))
+
 
 if __name__ == "__main__":
     unittest.main()
