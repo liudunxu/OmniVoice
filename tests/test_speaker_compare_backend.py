@@ -106,6 +106,68 @@ class AppendGenderMismatchIssueTest(unittest.TestCase):
         self.assertEqual(issues, ["gender_mismatch"])
         self.assertIsNone(api._append_gender_mismatch_issue(None, "male", None))
 
+    def test_suppresses_harmonic_false_positive_without_relative_shift(self):
+        identity_qc = {
+            "left_gender": {
+                "gender": "unknown",
+                "confidence": 0.0,
+                "median_f0_hz": 178.1,
+            },
+            "right_gender": {
+                "gender": "female",
+                "confidence": 0.687,
+                "median_f0_hz": 200.0,
+            },
+        }
+
+        issues = api._append_gender_mismatch_issue([], "male", identity_qc)
+
+        self.assertEqual(issues, [])
+        assessment = identity_qc["gender_mismatch_assessment"]
+        self.assertFalse(assessment["corroborated"])
+        self.assertEqual(assessment["reason"], "insufficient_reference_relative_f0_shift")
+
+    def test_keeps_mismatch_when_relative_shift_is_large(self):
+        identity_qc = {
+            "left_gender": {
+                "gender": "unknown",
+                "confidence": 0.0,
+                "median_f0_hz": 178.1,
+            },
+            "right_gender": {
+                "gender": "female",
+                "confidence": 0.863,
+                "median_f0_hz": 266.7,
+            },
+        }
+
+        issues = api._append_gender_mismatch_issue([], "male", identity_qc)
+
+        self.assertEqual(issues, ["gender_mismatch"])
+        self.assertTrue(identity_qc["gender_mismatch_assessment"]["corroborated"])
+
+    def test_suppresses_when_reference_has_same_absolute_observation(self):
+        identity_qc = {
+            "left_gender": {
+                "gender": "female",
+                "confidence": 0.74,
+                "median_f0_hz": 233.8,
+            },
+            "right_gender": {
+                "gender": "female",
+                "confidence": 0.65,
+                "median_f0_hz": 235.3,
+            },
+        }
+
+        issues = api._append_gender_mismatch_issue([], "male", identity_qc)
+
+        self.assertEqual(issues, [])
+        self.assertEqual(
+            identity_qc["gender_mismatch_assessment"]["reason"],
+            "reference_has_same_absolute_gender_observation",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

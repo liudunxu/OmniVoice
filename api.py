@@ -179,6 +179,9 @@ _SEVERE_ISSUE_LABELS = frozenset({
     "source_script_residue", "duration_off_target", "duration_off_reference",
     "gender_mismatch",
 })
+GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT = float(
+    os.environ.get("GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT", "1.25")
+)
 
 # Reference-quality issues that should block synthesis outright. Dubbing callers
 # can then fall back to Edge TTS or a stronger same-speaker anchor reference.
@@ -2911,6 +2914,7 @@ def _append_gender_mismatch_issue(
         "m": "male", "man": "male", "男": "male", "男性": "male",
         "f": "female", "woman": "female", "女": "female", "女性": "female",
     }.get(declared, declared)
+    left_gender = (identity_qc or {}).get("left_gender") or {}
     right_gender = (identity_qc or {}).get("right_gender") or {}
     output_gender = right_gender.get("gender")
     output_gender_confidence = float(right_gender.get("confidence") or 0.0)
@@ -2920,10 +2924,54 @@ def _append_gender_mismatch_issue(
         and output_gender != normalized_declared
         and output_gender_confidence >= 0.60
     ):
-        issues = list(quality_issues or [])
-        if "gender_mismatch" not in issues:
-            issues.append("gender_mismatch")
-        return issues
+        reference_gender = str(left_gender.get("gender") or "unknown").strip().lower()
+        reference_confidence = float(left_gender.get("confidence") or 0.0)
+        try:
+            reference_f0 = float(
+                left_gender.get("median_f0_hz") or left_gender.get("f0") or 0.0
+            )
+            output_f0 = float(
+                right_gender.get("median_f0_hz") or right_gender.get("f0") or 0.0
+            )
+        except (TypeError, ValueError):
+            reference_f0 = output_f0 = 0.0
+
+        # Absolute F0 frequently locks to a male voice's second harmonic. If
+        # reference and output receive the same opposite-gender observation, or
+        # the output has not shifted materially from an ambiguous reference,
+        # this is not evidence that synthesis changed the speaker's gender.
+        corroborated = True
+        reason = "confident_absolute_output_gender"
+        relative_shift = None
+        if reference_gender == output_gender and reference_confidence >= 0.55:
+            corroborated = False
+            reason = "reference_has_same_absolute_gender_observation"
+        elif reference_f0 > 0 and output_f0 > 0 and reference_gender != normalized_declared:
+            if normalized_declared == "male":
+                relative_shift = output_f0 / reference_f0
+            else:
+                relative_shift = reference_f0 / output_f0
+            if relative_shift < max(1.01, GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT):
+                corroborated = False
+                reason = "insufficient_reference_relative_f0_shift"
+
+        if isinstance(identity_qc, dict):
+            identity_qc["gender_mismatch_assessment"] = {
+                "corroborated": corroborated,
+                "reason": reason,
+                "declared_gender": normalized_declared,
+                "reference_gender": reference_gender,
+                "output_gender": output_gender,
+                "reference_f0_hz": _round_float(reference_f0, 1),
+                "output_f0_hz": _round_float(output_f0, 1),
+                "relative_f0_shift": _round_float(relative_shift, 3),
+                "min_relative_f0_shift": GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT,
+            }
+        if corroborated:
+            issues = list(quality_issues or [])
+            if "gender_mismatch" not in issues:
+                issues.append("gender_mismatch")
+            return issues
     return quality_issues
 
 

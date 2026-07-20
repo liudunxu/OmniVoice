@@ -138,7 +138,10 @@ curl -fsS -X POST "http://<public_ip>:<public_port>/api/synthesize" \
 `/api/synthesize` 可传 `declared_gender` 和 `enable_speaker_check=true`。返回的
 `audio_qc` 包含 `speaker_identity`、`speaker_similarity_to_reference`、
 `prosody_match` 和 `emotion_similarity_to_reference`；高置信度男女声冲突会增加
-`gender_mismatch` quality issue，交由调用方换 seed/reference 或保留原声。
+`gender_mismatch` quality issue，交由调用方换 seed/reference。男女声判断会把输出的绝对 F0
+与 reference 一起复核：reference 和输出若同样被观察为相反性别，或输出相对 reference 的
+F0 漂移不足 1.25 倍（`GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT`），会记录 assessment 但不报
+`gender_mismatch`，避免男声二次谐波被误判为女声。
 
 VoxCPM 路径（`/api/voxcpm/synthesize`）现在也会在有 reference/prompt 音频时产出同样的
 identity/prosody QC 字段（含 `gender_mismatch`、`emotion_mismatch` quality issue），
