@@ -4790,7 +4790,7 @@ def _qc_language_mismatch_triggers_retry(
     expected = _whisper_language_code(expected_language)
     if not expected:
         return False
-    return str(detected).lower() != expected.lower()
+    return _normalize_language_code(detected) != _normalize_language_code(expected)
 
 
 def _should_accept_text_qc_candidate(
