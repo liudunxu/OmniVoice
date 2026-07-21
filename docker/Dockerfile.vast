@@ -13,6 +13,7 @@ ENV PYTHONUNBUFFERED=1 \
     MODEL_DIR=/workspace/models \
     AUDIO_SEPARATOR_MODEL_DIR=/workspace/models/audio-separator \
     WHISPER_MODEL_DIR=/workspace/models/whisper \
+    OMNIVOICE_ASR_BACKEND=whisper \
     OMNIVOICE_MAX_REQUEST_MB=512 \
     SEPARATION_MODEL=vocals_mel_band_roformer.ckpt \
     OMNIVOICE_MODEL_ID=${OMNIVOICE_MODEL_ID} \

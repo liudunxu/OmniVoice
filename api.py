@@ -128,6 +128,10 @@ WHISPER_MODEL_DIR = Path(
     )
 )
 WHISPER_MAX_MODELS = int(os.environ.get("WHISPER_MAX_MODELS", "2"))
+QWEN_ASR_MODEL = os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+QWEN_ASR_ALIGNER_MODEL = os.environ.get(
+    "QWEN_ASR_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B"
+)
 MIN_REFERENCE_DURATION_FOR_DURATION_RATIO = float(
     os.environ.get("OMNIVOICE_MIN_REFERENCE_DURATION_FOR_DURATION_RATIO", "1.5")
 )
@@ -262,9 +266,12 @@ _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
 _API_DEVICE = None
 _API_LOAD_ASR = False
+_ASR_BACKEND = os.environ.get("OMNIVOICE_ASR_BACKEND", "whisper").strip().lower() or "whisper"
 _MODEL_LOAD_LOCK = asyncio.Lock()
 _WHISPER_MODELS: OrderedDict[Tuple[str, str, str], Any] = OrderedDict()
 _WHISPER_MODEL_LOCK = asyncio.Lock()
+_QWEN3_ASR_MODELS: OrderedDict[str, Any] = OrderedDict()
+_QWEN3_ASR_MODEL_LOCK = asyncio.Lock()
 # Inference concurrency is gated by a semaphore (not a lock) so multi-GPU or
 # high-VRAM GPUs can serve requests in parallel. Default 1 preserves the
 # previous serialized behaviour. Set OMNIVOICE_MAX_CONCURRENCY > 1 to enable.
@@ -4307,6 +4314,158 @@ def _whisper_language_code(value) -> str:
     return code
 
 
+# Qwen3-ASR-1.7B supported languages: normalized ISO code -> full English name
+# (the qwen-asr API takes and returns English names). Codes follow
+# _normalize_language_code conventions (fil, not tl).
+_QWEN3_ASR_LANGUAGES = {
+    "zh": "Chinese",
+    "en": "English",
+    "yue": "Cantonese",
+    "ar": "Arabic",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "id": "Indonesian",
+    "it": "Italian",
+    "ko": "Korean",
+    "ru": "Russian",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "ja": "Japanese",
+    "tr": "Turkish",
+    "hi": "Hindi",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "pl": "Polish",
+    "cs": "Czech",
+    "fil": "Filipino",
+    "fa": "Persian",
+    "el": "Greek",
+    "hu": "Hungarian",
+    "mk": "Macedonian",
+    "ro": "Romanian",
+}
+_QWEN3_ASR_NAME_TO_CODE = {name.lower(): code for code, name in _QWEN3_ASR_LANGUAGES.items()}
+# Qwen3-ForcedAligner-0.6B only produces timestamps for these languages.
+_QWEN3_ALIGNER_CODES = {"zh", "en", "yue", "fr", "de", "it", "ja", "ko", "pt", "ru", "es"}
+# Silence gap (seconds) that splits aligner items into a new whisper-like segment.
+_QWEN3_SEGMENT_GAP_S = 0.6
+
+
+def _qwen3_language_name(value) -> Optional[str]:
+    return _QWEN3_ASR_LANGUAGES.get(_normalize_language_code(value))
+
+
+def _qwen3_language_code(name) -> str:
+    return _QWEN3_ASR_NAME_TO_CODE.get(str(name or "").strip().lower(), "")
+
+
+def _load_qwen3_asr_model_sync(device):
+    # qwen-asr 0.0.6 imports check_model_inputs from transformers.utils.generic,
+    # which transformers 5.x removed (v5 handles model-input kwargs natively, so
+    # a no-op fallback is equivalent). Shim it before importing qwen_asr.
+    import transformers.utils.generic as _transformers_generic
+
+    if not hasattr(_transformers_generic, "check_model_inputs"):
+        def check_model_inputs(func=None, **_kwargs):
+            return func if func is not None else (lambda f: f)
+
+        _transformers_generic.check_model_inputs = check_model_inputs
+
+    from qwen_asr import Qwen3ASRModel
+
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    logger.info(
+        "loading Qwen3-ASR model=%s aligner=%s device=%s",
+        QWEN_ASR_MODEL,
+        QWEN_ASR_ALIGNER_MODEL,
+        device,
+    )
+    return Qwen3ASRModel.from_pretrained(
+        QWEN_ASR_MODEL,
+        dtype=dtype,
+        device_map=device,
+        forced_aligner=QWEN_ASR_ALIGNER_MODEL,
+        forced_aligner_kwargs=dict(dtype=dtype, device_map=device),
+        max_inference_batch_size=8,
+        max_new_tokens=256,
+    )
+
+
+async def _ensure_qwen3_asr_model(device):
+    model = _QWEN3_ASR_MODELS.get(device)
+    if model is not None:
+        _QWEN3_ASR_MODELS.move_to_end(device)
+        return model
+    async with _QWEN3_ASR_MODEL_LOCK:
+        model = _QWEN3_ASR_MODELS.get(device)
+        if model is not None:
+            _QWEN3_ASR_MODELS.move_to_end(device)
+            return model
+        model = await asyncio.to_thread(_load_qwen3_asr_model_sync, device)
+        _QWEN3_ASR_MODELS[device] = model
+        while len(_QWEN3_ASR_MODELS) > max(1, WHISPER_MAX_MODELS):
+            _QWEN3_ASR_MODELS.popitem(last=False)
+    return model
+
+
+def _qwen3_time_stamps_to_segments(time_stamps, code, gap_s=_QWEN3_SEGMENT_GAP_S):
+    """Group aligner word/char items into whisper-like segments on silence gaps."""
+    joiner = "" if code in ("zh", "ja", "yue") else " "
+    segments = []
+    for item in time_stamps or []:
+        text = str(getattr(item, "text", "") or "").strip()
+        try:
+            start = float(item.start_time)
+            end = float(item.end_time)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not text or end <= start:
+            continue
+        if not segments or start - segments[-1]["end"] > gap_s:
+            segments.append({"start": start, "end": end, "text": "", "words": []})
+        segment = segments[-1]
+        segment["words"].append({"start": start, "end": end, "word": text})
+        segment["end"] = end
+    for segment in segments:
+        segment["text"] = joiner.join(word["word"] for word in segment["words"])
+    return segments
+
+
+def _transcribe_qwen3_sync(model, audio_path, options):
+    language_name = _qwen3_language_name(options.get("language"))
+    try:
+        results = model.transcribe(
+            audio=str(audio_path),
+            language=language_name or None,
+            return_time_stamps=True,
+        )
+    except Exception as exc:
+        logger.info("Qwen3-ASR alignment failed (%s); retrying without timestamps", exc)
+        results = model.transcribe(
+            audio=str(audio_path),
+            language=language_name or None,
+            return_time_stamps=False,
+        )
+    result = results[0]
+    code = _qwen3_language_code(getattr(result, "language", None))
+    if not code:
+        code = _normalize_language_code(options.get("language"))
+    segments = []
+    if code in _QWEN3_ALIGNER_CODES:
+        segments = _qwen3_time_stamps_to_segments(getattr(result, "time_stamps", None), code)
+    return {
+        "language": code,
+        "language_probability": None,
+        "duration": _audio_duration_seconds(audio_path),
+        "segments": segments,
+    }
+
+
 def _text_qc_tokens(text: str) -> list[str]:
     normalized = str(text or "").lower()
     # Whisper often changes whitespace for CJK/Thai, so compare those scripts at
@@ -4349,29 +4508,40 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
     code = _normalize_language_code(language)
     whisper_code = _whisper_language_code(language)
     model_name = str(data.get("output_text_qc_model") or OUTPUT_TEXT_QC_MODEL).strip()
-    device = _whisper_device(data.get("output_text_qc_device") or "auto")
-    compute_type = str(
-        data.get("output_text_qc_compute_type")
-        or _default_whisper_compute_type(device)
-    ).strip()
-    model = await _ensure_whisper_model(model_name, device, compute_type)
-    whisper_options = {
-        "language": whisper_code or None,
-        "beam_size": data.get("output_text_qc_beam_size") or 3,
-        "vad_filter": data.get("output_text_qc_vad_filter", True),
-        "word_timestamps": False,
-        "condition_on_previous_text": False,
-        "vad_threshold": 0.35,
-        "vad_min_silence_ms": 250,
-        "vad_speech_pad_ms": 120,
-        "no_speech_threshold": 0.5,
-        "initial_prompt": expected_text[:200],
-    }
+    use_qwen3 = _ASR_BACKEND == "qwen3"
+    if use_qwen3 and code not in _QWEN3_ASR_LANGUAGES:
+        logger.info("output text QC: language %s not supported by Qwen3-ASR, using whisper", code)
+        use_qwen3 = False
+    if use_qwen3:
+        model_name = QWEN_ASR_MODEL
+        model = await _ensure_qwen3_asr_model(_whisper_device("auto"))
+        transcribe_sync = _transcribe_qwen3_sync
+        transcribe_options = {"language": code}
+    else:
+        device = _whisper_device(data.get("output_text_qc_device") or "auto")
+        compute_type = str(
+            data.get("output_text_qc_compute_type")
+            or _default_whisper_compute_type(device)
+        ).strip()
+        model = await _ensure_whisper_model(model_name, device, compute_type)
+        transcribe_sync = _transcribe_whisper_sync
+        transcribe_options = {
+            "language": whisper_code or None,
+            "beam_size": data.get("output_text_qc_beam_size") or 3,
+            "vad_filter": data.get("output_text_qc_vad_filter", True),
+            "word_timestamps": False,
+            "condition_on_previous_text": False,
+            "vad_threshold": 0.35,
+            "vad_min_silence_ms": 250,
+            "vad_speech_pad_ms": 120,
+            "no_speech_threshold": 0.5,
+            "initial_prompt": expected_text[:200],
+        }
     result = await asyncio.to_thread(
-        _transcribe_whisper_sync,
+        transcribe_sync,
         model,
         audio_path,
-        whisper_options,
+        transcribe_options,
     )
     actual_text = " ".join(
         str(segment.get("text") or "").strip()
@@ -4393,6 +4563,7 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
         "version": 1,
         "status": status,
         "language": code,
+        "asr_backend": "qwen3" if use_qwen3 else "whisper",
         "whisper_requested_language": whisper_code,
         "model": model_name,
         "coverage": _round_float(coverage, 3),
@@ -4438,11 +4609,11 @@ async def _build_output_text_qc(audio_path: str, expected_text: str, language, d
         )
     )
     if should_audit_prompt:
-        auto_options = dict(whisper_options)
+        auto_options = dict(transcribe_options)
         auto_options["language"] = None
         auto_options.pop("initial_prompt", None)
         auto_result = await asyncio.to_thread(
-            _transcribe_whisper_sync, model, audio_path, auto_options
+            transcribe_sync, model, audio_path, auto_options
         )
         auto_text = " ".join(
             str(segment.get("text") or "").strip()
@@ -7361,25 +7532,52 @@ async def whisper_transcribe(request):
     start_time = time.time()
     try:
         input_path, options = await _read_separation_request(request, req_id, request_dir)
-        model_name = str(options.get("model") or DEFAULT_WHISPER_MODEL).strip() or DEFAULT_WHISPER_MODEL
-        device = _whisper_device(options.get("device") or "auto")
-        compute_type = str(options.get("compute_type") or _default_whisper_compute_type(device)).strip()
-        logger.info(
-            "[%s] whisper started: input=%s model=%s device=%s compute_type=%s",
-            req_id,
-            input_path,
-            model_name,
-            device,
-            compute_type,
-        )
-        model = await _ensure_whisper_model(model_name, device, compute_type)
-        async with _WHISPER_INFER_SEM:
-            result = await asyncio.to_thread(
-                _transcribe_whisper_sync,
-                model,
+        use_qwen3 = _ASR_BACKEND == "qwen3"
+        if use_qwen3:
+            req_code = _normalize_language_code(options.get("language"))
+            if req_code and req_code not in _QWEN3_ASR_LANGUAGES:
+                logger.info(
+                    "[%s] language %s not supported by Qwen3-ASR, using whisper",
+                    req_id,
+                    req_code,
+                )
+                use_qwen3 = False
+        if use_qwen3:
+            model_name = QWEN_ASR_MODEL
+            logger.info(
+                "[%s] qwen3-asr started: input=%s model=%s",
+                req_id,
                 input_path,
-                options,
+                model_name,
             )
+            model = await _ensure_qwen3_asr_model(_whisper_device("auto"))
+            async with _WHISPER_INFER_SEM:
+                result = await asyncio.to_thread(
+                    _transcribe_qwen3_sync,
+                    model,
+                    input_path,
+                    options,
+                )
+        else:
+            model_name = str(options.get("model") or DEFAULT_WHISPER_MODEL).strip() or DEFAULT_WHISPER_MODEL
+            device = _whisper_device(options.get("device") or "auto")
+            compute_type = str(options.get("compute_type") or _default_whisper_compute_type(device)).strip()
+            logger.info(
+                "[%s] whisper started: input=%s model=%s device=%s compute_type=%s",
+                req_id,
+                input_path,
+                model_name,
+                device,
+                compute_type,
+            )
+            model = await _ensure_whisper_model(model_name, device, compute_type)
+            async with _WHISPER_INFER_SEM:
+                result = await asyncio.to_thread(
+                    _transcribe_whisper_sync,
+                    model,
+                    input_path,
+                    options,
+                )
         if _bool_option(options.get("include_audio_qc"), True):
             try:
                 result["audio_qc"] = await asyncio.to_thread(
@@ -7411,6 +7609,7 @@ async def whisper_transcribe(request):
     return _json_response({
         "ok": True,
         "model": model_name,
+        "asr_backend": "qwen3" if use_qwen3 else "whisper",
         "elapsed_seconds": elapsed,
         **result,
     })
@@ -7518,7 +7717,16 @@ def main(argv=None):
     parser.add_argument("--ip", default="0.0.0.0", help="服务器 IP")
     parser.add_argument("--port", type=int, default=6006, help="服务器端口")
     parser.add_argument("--load-asr", action="store_true", help="启动时加载 ASR（默认不加载）")
+    parser.add_argument(
+        "--asr-backend",
+        choices=("whisper", "qwen3"),
+        default=os.environ.get("OMNIVOICE_ASR_BACKEND", "whisper"),
+        help="转写/QC 的 ASR 后端（默认读 OMNIVOICE_ASR_BACKEND，回退 whisper）",
+    )
     args = parser.parse_args(argv)
+
+    global _ASR_BACKEND
+    _ASR_BACKEND = args.asr_backend
 
     device = args.device or get_best_device()
     _set_api_model(None, args.model, device, args.load_asr)

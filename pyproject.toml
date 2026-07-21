@@ -44,6 +44,7 @@ dependencies = [
     "aiohttp",
     "audio-separator>=0.44.1",
     "faster-whisper>=1.1",
+    "qwen-asr>=0.0.6",
     "onnxruntime>=1.22; sys_platform != 'linux' and sys_platform != 'win32'",
     "onnxruntime-gpu>=1.22,<1.23; sys_platform == 'linux' or sys_platform == 'win32'",
     # Vendored VoxCPM2 inference (voxcpm/) top-level imports. These are already
@@ -113,6 +114,11 @@ explicit = true
 constraint-dependencies = [
     "torch==2.8.0",
     "torchaudio==2.8.0",
+]
+# qwen-asr pins transformers==4.57.6, but the vendored VoxCPM2 stack requires
+# transformers>=5.3.0; the override keeps transformers on 5.x for both.
+override-dependencies = [
+    "transformers>=5.3.0",
 ]
 
 [tool.hatch.build.targets.sdist]
