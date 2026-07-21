@@ -133,7 +133,7 @@ QWEN_ASR_ALIGNER_MODEL = os.environ.get(
     "QWEN_ASR_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 )
 PYANNOTE_MODEL_ID = os.environ.get(
-    "PYANNOTE_MODEL_ID", "pyannote/speaker-diarization-community-1"
+    "PYANNOTE_MODEL_ID", "pyannote/speaker-diarization-3.1"
 )
 PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_AUTH_TOKEN") or os.environ.get("HF_TOKEN")
 MIN_REFERENCE_DURATION_FOR_DURATION_RATIO = float(
