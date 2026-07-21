@@ -128,10 +128,14 @@ WHISPER_MODEL_DIR = Path(
     )
 )
 WHISPER_MAX_MODELS = int(os.environ.get("WHISPER_MAX_MODELS", "2"))
-QWEN_ASR_MODEL = os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+QWEN_ASR_MODEL = os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B-hf")
 QWEN_ASR_ALIGNER_MODEL = os.environ.get(
-    "QWEN_ASR_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B"
+    "QWEN_ASR_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 )
+PYANNOTE_MODEL_ID = os.environ.get(
+    "PYANNOTE_MODEL_ID", "pyannote/speaker-diarization-community-1"
+)
+PYANNOTE_AUTH_TOKEN = os.environ.get("PYANNOTE_AUTH_TOKEN") or os.environ.get("HF_TOKEN")
 MIN_REFERENCE_DURATION_FOR_DURATION_RATIO = float(
     os.environ.get("OMNIVOICE_MIN_REFERENCE_DURATION_FOR_DURATION_RATIO", "1.5")
 )
@@ -266,12 +270,14 @@ _API_MODEL = None
 _API_MODEL_ID = "k2-fsa/OmniVoice"
 _API_DEVICE = None
 _API_LOAD_ASR = False
-_ASR_BACKEND = os.environ.get("OMNIVOICE_ASR_BACKEND", "whisper").strip().lower() or "whisper"
+_ASR_BACKEND = os.environ.get("OMNIVOICE_ASR_BACKEND", "qwen3").strip().lower() or "qwen3"
 _MODEL_LOAD_LOCK = asyncio.Lock()
 _WHISPER_MODELS: OrderedDict[Tuple[str, str, str], Any] = OrderedDict()
 _WHISPER_MODEL_LOCK = asyncio.Lock()
 _QWEN3_ASR_MODELS: OrderedDict[str, Any] = OrderedDict()
 _QWEN3_ASR_MODEL_LOCK = asyncio.Lock()
+_PYANNOTE_PIPELINES: OrderedDict[str, Any] = OrderedDict()
+_PYANNOTE_PIPELINE_LOCK = asyncio.Lock()
 # Inference concurrency is gated by a semaphore (not a lock) so multi-GPU or
 # high-VRAM GPUs can serve requests in parallel. Default 1 preserves the
 # previous serialized behaviour. Set OMNIVOICE_MAX_CONCURRENCY > 1 to enable.
@@ -280,6 +286,9 @@ _API_INFER_SEM = asyncio.Semaphore(
 )
 _WHISPER_INFER_SEM = asyncio.Semaphore(
     int(os.environ.get("WHISPER_MAX_CONCURRENCY", "1"))
+)
+_PYANNOTE_INFER_SEM = asyncio.Semaphore(
+    int(os.environ.get("PYANNOTE_MAX_CONCURRENCY", "2"))
 )
 # Non-speech event detection is numpy-only (no NN model), so it can run with
 # higher concurrency than the GPU-bound synthesize/whisper paths.
@@ -4315,8 +4324,9 @@ def _whisper_language_code(value) -> str:
 
 
 # Qwen3-ASR-1.7B supported languages: normalized ISO code -> full English name
-# (the qwen-asr API takes and returns English names). Codes follow
-# _normalize_language_code conventions (fil, not tl).
+# (apply_transcription_request accepts ISO codes; parsed decode and the forced
+# aligner use English names). Codes follow _normalize_language_code conventions
+# (fil, not tl).
 _QWEN3_ASR_LANGUAGES = {
     "zh": "Chinese",
     "en": "English",
@@ -4356,57 +4366,38 @@ _QWEN3_ALIGNER_CODES = {"zh", "en", "yue", "fr", "de", "it", "ja", "ko", "pt", "
 _QWEN3_SEGMENT_GAP_S = 0.6
 
 
-def _qwen3_language_name(value) -> Optional[str]:
-    return _QWEN3_ASR_LANGUAGES.get(_normalize_language_code(value))
-
-
 def _qwen3_language_code(name) -> str:
     return _QWEN3_ASR_NAME_TO_CODE.get(str(name or "").strip().lower(), "")
 
 
 def _load_qwen3_asr_model_sync(device):
-    # qwen-asr 0.0.6 decorates model classes with @check_model_inputs() from
-    # transformers.utils.generic. transformers 5.3 removed that symbol, and
-    # some other versions ship it with an incompatible signature that requires
-    # a positional func (it is input-validation only, so a no-op fallback is
-    # equivalent for inference). Shim it unless the installed one can be
-    # called with zero args.
-    import inspect
-
-    import transformers.utils.generic as _transformers_generic
-
-    def _check_model_inputs_noop(func=None, **_kwargs):
-        return func if func is not None else (lambda f: f)
-
-    _existing = getattr(_transformers_generic, "check_model_inputs", None)
-    _compatible = False
-    if _existing is not None:
-        try:
-            _first = next(iter(inspect.signature(_existing).parameters.values()))
-            _compatible = _first.default is not inspect.Parameter.empty
-        except (StopIteration, TypeError, ValueError):
-            _compatible = False
-    if not _compatible:
-        _transformers_generic.check_model_inputs = _check_model_inputs_noop
-
-    from qwen_asr import Qwen3ASRModel
+    from transformers import (
+        AutoModelForMultimodalLM,
+        AutoModelForTokenClassification,
+        AutoProcessor,
+    )
 
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    device_map = "cuda:0" if device == "cuda" else "cpu"
     logger.info(
         "loading Qwen3-ASR model=%s aligner=%s device=%s",
         QWEN_ASR_MODEL,
         QWEN_ASR_ALIGNER_MODEL,
         device,
     )
-    return Qwen3ASRModel.from_pretrained(
+    asr_processor = AutoProcessor.from_pretrained(QWEN_ASR_MODEL)
+    asr_model = AutoModelForMultimodalLM.from_pretrained(
         QWEN_ASR_MODEL,
         dtype=dtype,
-        device_map=device,
-        forced_aligner=QWEN_ASR_ALIGNER_MODEL,
-        forced_aligner_kwargs=dict(dtype=dtype, device_map=device),
-        max_inference_batch_size=8,
-        max_new_tokens=256,
+        device_map=device_map,
     )
+    aligner_processor = AutoProcessor.from_pretrained(QWEN_ASR_ALIGNER_MODEL)
+    aligner_model = AutoModelForTokenClassification.from_pretrained(
+        QWEN_ASR_ALIGNER_MODEL,
+        dtype=dtype,
+        device_map=device_map,
+    )
+    return asr_processor, asr_model, aligner_processor, aligner_model
 
 
 async def _ensure_qwen3_asr_model(device):
@@ -4431,11 +4422,11 @@ def _qwen3_time_stamps_to_segments(time_stamps, code, gap_s=_QWEN3_SEGMENT_GAP_S
     joiner = "" if code in ("zh", "ja", "yue") else " "
     segments = []
     for item in time_stamps or []:
-        text = str(getattr(item, "text", "") or "").strip()
+        text = str(item.get("text") or "").strip()
         try:
-            start = float(item.start_time)
-            end = float(item.end_time)
-        except (AttributeError, TypeError, ValueError):
+            start = float(item.get("start_time"))
+            end = float(item.get("end_time"))
+        except (TypeError, ValueError):
             continue
         if not text or end <= start:
             continue
@@ -4449,34 +4440,153 @@ def _qwen3_time_stamps_to_segments(time_stamps, code, gap_s=_QWEN3_SEGMENT_GAP_S
     return segments
 
 
-def _transcribe_qwen3_sync(model, audio_path, options):
-    language_name = _qwen3_language_name(options.get("language"))
-    try:
-        results = model.transcribe(
-            audio=str(audio_path),
-            language=language_name or None,
-            return_time_stamps=True,
-        )
-    except Exception as exc:
-        logger.info("Qwen3-ASR alignment failed (%s); retrying without timestamps", exc)
-        results = model.transcribe(
-            audio=str(audio_path),
-            language=language_name or None,
-            return_time_stamps=False,
-        )
-    result = results[0]
-    code = _qwen3_language_code(getattr(result, "language", None))
-    if not code:
-        code = _normalize_language_code(options.get("language"))
+def _transcribe_qwen3_sync(bundle, audio_path, options):
+    asr_processor, asr_model, aligner_processor, aligner_model = bundle
+    code = _normalize_language_code(options.get("language"))
+    inputs = asr_processor.apply_transcription_request(
+        audio=str(audio_path),
+        language=code or None,
+    ).to(asr_model.device, asr_model.dtype)
+    with torch.inference_mode():
+        output_ids = asr_model.generate(**inputs, max_new_tokens=256)
+    generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+    parsed = asr_processor.decode(generated_ids, return_format="parsed")[0] or {}
+    text = str(parsed.get("transcription") or "").strip()
+    detected = _qwen3_language_code(parsed.get("language"))
+    if detected:
+        code = detected
+    duration = _audio_duration_seconds(audio_path) or 0.0
     segments = []
-    if code in _QWEN3_ALIGNER_CODES:
-        segments = _qwen3_time_stamps_to_segments(getattr(result, "time_stamps", None), code)
+    if text and code in _QWEN3_ALIGNER_CODES:
+        try:
+            aligner_inputs, word_lists = aligner_processor.prepare_forced_aligner_inputs(
+                audio=str(audio_path),
+                transcript=text,
+                language=_QWEN3_ASR_LANGUAGES[code],
+            )
+            aligner_inputs = aligner_inputs.to(aligner_model.device, aligner_model.dtype)
+            with torch.inference_mode():
+                outputs = aligner_model(**aligner_inputs)
+            time_stamps = aligner_processor.decode_forced_alignment(
+                logits=outputs.logits,
+                input_ids=aligner_inputs["input_ids"],
+                word_lists=word_lists,
+                timestamp_token_id=aligner_model.config.timestamp_token_id,
+            )[0]
+            segments = _qwen3_time_stamps_to_segments(time_stamps, code)
+        except Exception as exc:
+            logger.info("Qwen3 forced alignment failed (%s); no word timestamps", exc)
+    if text and not segments:
+        # No aligner coverage for this language (or alignment failed): keep the
+        # transcript as one full-clip segment (mirrors whisper's
+        # word_timestamps=False shape) so text QC still has text to compare.
+        segments = [{"start": 0.0, "end": duration, "text": text, "words": []}]
     return {
         "language": code,
         "language_probability": None,
-        "duration": _audio_duration_seconds(audio_path),
+        "duration": duration,
         "segments": segments,
     }
+
+
+def _load_pyannote_pipeline_sync(device):
+    from pyannote.audio import Pipeline
+
+    logger.info(
+        "loading pyannote diarization pipeline model=%s device=%s",
+        PYANNOTE_MODEL_ID,
+        device,
+    )
+    pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL_ID, token=PYANNOTE_AUTH_TOKEN)
+    if device == "cuda":
+        pipeline.to(torch.device("cuda"))
+    return pipeline
+
+
+async def _ensure_pyannote_pipeline(device):
+    pipeline = _PYANNOTE_PIPELINES.get(device)
+    if pipeline is not None:
+        _PYANNOTE_PIPELINES.move_to_end(device)
+        return pipeline
+    async with _PYANNOTE_PIPELINE_LOCK:
+        pipeline = _PYANNOTE_PIPELINES.get(device)
+        if pipeline is not None:
+            _PYANNOTE_PIPELINES.move_to_end(device)
+            return pipeline
+        pipeline = await asyncio.to_thread(_load_pyannote_pipeline_sync, device)
+        _PYANNOTE_PIPELINES[device] = pipeline
+        while len(_PYANNOTE_PIPELINES) > max(1, WHISPER_MAX_MODELS):
+            _PYANNOTE_PIPELINES.popitem(last=False)
+    return pipeline
+
+
+def _best_overlap_speaker(start, end, turns):
+    """Speaker label of the turn with maximum temporal overlap; None on no
+    overlap or an exact tie between different speakers."""
+    try:
+        start = float(start)
+        end = float(end)
+    except (TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+    best = 0.0
+    speaker = None
+    for turn in turns or []:
+        overlap = min(end, float(turn["end"])) - max(start, float(turn["start"]))
+        if overlap > best:
+            best = overlap
+            speaker = turn.get("speaker")
+        elif overlap == best and overlap > 0 and turn.get("speaker") != speaker:
+            speaker = None
+    return speaker
+
+
+def _assign_speakers(segments, turns):
+    """Assign each ASR segment/word a speaker from diarization turns.
+
+    Words are assigned by max temporal overlap; the segment speaker is the
+    dominant (most frequent) speaker among its words, falling back to the
+    segment's own max-overlap turn. Mutates and returns segments.
+    """
+    for segment in segments or []:
+        words = segment.get("words") or []
+        for word in words:
+            word["speaker"] = _best_overlap_speaker(word.get("start"), word.get("end"), turns)
+        counts = {}
+        for word in words:
+            label = word.get("speaker")
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        segment["speaker"] = (
+            max(counts, key=counts.get)
+            if counts
+            else _best_overlap_speaker(segment.get("start"), segment.get("end"), turns)
+        )
+    return segments
+
+
+def _diarize_sync(pipeline, audio_path, options):
+    data, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
+    data = data.T
+    if data.shape[0] > 1:
+        data = np.mean(data, axis=0, keepdims=True)
+    if sr != 16000:
+        data = torchaudio.functional.resample(
+            torch.from_numpy(data), orig_freq=sr, new_freq=16000
+        ).numpy()
+        sr = 16000
+    waveform = torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32))
+    kwargs = {}
+    for key in ("num_speakers", "min_speakers", "max_speakers"):
+        value = options.get(f"diarize_{key}")
+        if value not in (None, ""):
+            kwargs[key] = int(float(value))
+    output = pipeline({"waveform": waveform, "sample_rate": sr}, **kwargs)
+    return [
+        {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
+        for turn, _, speaker in output.speaker_diarization.itertracks(yield_label=True)
+    ]
 
 
 def _text_qc_tokens(text: str) -> list[str]:
@@ -7600,6 +7710,28 @@ async def whisper_transcribe(request):
                 )
             except Exception as exc:
                 result["audio_qc"] = {"version": 1, "status": "error", "error": str(exc)[:500]}
+        if _bool_option(options.get("diarize"), False):
+            try:
+                pipeline = await _ensure_pyannote_pipeline(_whisper_device("auto"))
+                async with _PYANNOTE_INFER_SEM:
+                    turns = await asyncio.to_thread(
+                        _diarize_sync, pipeline, input_path, options
+                    )
+                _assign_speakers(result.get("segments") or [], turns)
+                speakers = sorted({turn["speaker"] for turn in turns if turn.get("speaker")})
+                result["speakers"] = speakers
+                result["diarization"] = {
+                    "backend": "pyannote",
+                    "model": PYANNOTE_MODEL_ID,
+                    "num_speakers": len(speakers),
+                }
+            except Exception as exc:
+                logger.warning("[%s] diarization failed: %s", req_id, exc)
+                result["diarization"] = {
+                    "backend": "pyannote",
+                    "model": PYANNOTE_MODEL_ID,
+                    "error": str(exc)[:300],
+                }
     except ValueError as exc:
         tb = traceback.format_exc()
         logger.warning(f"[{req_id}] Invalid whisper request: {exc}\n{tb}")
@@ -7733,8 +7865,8 @@ def main(argv=None):
     parser.add_argument(
         "--asr-backend",
         choices=("whisper", "qwen3"),
-        default=os.environ.get("OMNIVOICE_ASR_BACKEND", "whisper"),
-        help="转写/QC 的 ASR 后端（默认读 OMNIVOICE_ASR_BACKEND，回退 whisper）",
+        default=os.environ.get("OMNIVOICE_ASR_BACKEND", "qwen3"),
+        help="转写/QC 的 ASR 后端（默认读 OMNIVOICE_ASR_BACKEND，回退 qwen3）",
     )
     args = parser.parse_args(argv)
 

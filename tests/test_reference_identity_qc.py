@@ -115,6 +115,7 @@ class OutputTextQcTest(unittest.IsolatedAsyncioTestCase):
             "segments": [{"text": "大师兄你怎么了"}],
         }
         with (
+            patch.object(api, "_ASR_BACKEND", "whisper"),
             patch.object(api, "_ensure_whisper_model", new=AsyncMock(return_value=object())),
             patch.object(api, "_transcribe_whisper_sync", side_effect=[forced, automatic]),
         ):

@@ -28,4 +28,4 @@ exec python /app/api.py \
   --model "${MODEL_ID}" \
   --ip "${HOST}" \
   --port "${PORT}" \
-  --asr-backend "${OMNIVOICE_ASR_BACKEND:-whisper}"
+  --asr-backend "${OMNIVOICE_ASR_BACKEND:-qwen3}"
