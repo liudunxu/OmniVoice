@@ -89,6 +89,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ### Vast.ai Instance Operations
 
 - The `VAST_API_KEY` is stored in `~/.zshrc` (line 162). Load it from there or export it explicitly; do not hard-code tokens in this repository.
+- Speaker diarization (`diarize=true` on `/api/whisper/transcribe`) uses the gated `pyannote/speaker-diarization-community-1` model, so every new instance needs an HF token: read `HF_TOKEN` from `~/.zshrc` or the environment (never hard-code it, never put it in the Dockerfile/image) and pass it at creation time: `VAST_API_KEY=$KEY python scripts/vast.py create <offer_id> --env HF_TOKEN="$HF_TOKEN"`. The token's HF account must have accepted the model's terms on its HuggingFace page, otherwise diarization degrades to `diarization.error` (transcription itself is unaffected).
 - Use the reusable helper script `scripts/vast.py` for all Vast.ai operations. It reads the API key from the `VAST_API_KEY` environment variable; do not hard-code tokens.
   - Check balance/credit: `VAST_API_KEY=$KEY python scripts/vast.py balance`
   - List instances: `VAST_API_KEY=$KEY python scripts/vast.py list`
@@ -106,17 +107,16 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Use label prefix `omnivoice-api` for OmniVoice Vast.ai service instances.
 - When the user says "停止vast.ai实例" or asks to stop/pause Vast.ai instances, **stop** all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the instance list afterward.
 - When the user says "销毁vast.ai实例"/"关闭vast.ai实例" or asks to destroy/close Vast.ai instances, **destroy** all Vast.ai instances whose `label` starts with `omnivoice-api` and whose state is running/loading/active. Confirm the remaining instance list afterward.
-- When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, **launch two RTX 4090 instances** (fall back to RTX 3090 if RTX 4090 offers are unavailable; only use RTX 5090 / RTX 6000 Ada when both 4090 and 3090 are out of stock) with:
+- When the user says "开启vast.ai实例" or asks to start/open a Vast.ai instance, **launch two RTX 5090-or-better instances** (fall back to RTX 4090 / RTX 3090 only when no ≥30GB offers are available) with:
   - image: `liudunxu/omnivoice-api:vast-gpu` unless the user specifies a fixed tag
   - label: `omnivoice-api-mvp-<short-tag-or-date>-<region>`
   - disk: `80`
   - runtype: `args`
   - env: `{"-p 8000:8000": "1", "PORT": "8000", "HOST": "0.0.0.0", "MODEL_DIR": "/workspace/models"}`
-- Prefer verified, rentable, on-demand, single-GPU offers with **at least 24GB GPU RAM**, at least one direct port, and at least 80GB disk space. **GPU preference order (always try the next tier down only if the current tier has no available offers):**
-  1. **RTX 4090 (24GB)** — preferred default; pick first whenever available.
-  2. RTX 3090 / RTX 3090 Ti (24GB) — first fallback if no 4090 offers.
-  3. RTX 5090 (32GB) / RTX 6000 Ada (48GB) — only when no 24GB-class offers; the extra VRAM is unnecessary for OmniVoice/VoxCPM and adds cost without benefit.
-  Use `--gpu-name "RTX 4090"` with `scripts/vast.py search` (the default) and only fall back to other names when the search returns an empty list. VoxCPM occupies ~22 GiB on a single 24GB card, so run the OmniVoice and VoxCPM engines exclusively (call `POST /api/unload` before switching engines) and keep `VAST_GPU` host-side flows on the same engine the smoke test exercises. The `scripts/vast.py smoke` helper intentionally only probes `/health` and `/api/health` — it does **not** call `/api/synthesize` or `/api/voxcpm/synthesize`, so it will not lazy-load either engine onto the GPU. **Prioritize Southeast Asia for both instances.** If only one Southeast Asia offer is available, place the second instance in the next preferred region (East Asia, then Central/West Asia, then Americas US/CA). Verify the host can reach Docker Hub before committing; stalled `Pulling fs layer` or registry timeouts mean the offer should be abandoned.
+- Prefer verified, rentable, on-demand, single-GPU offers with **at least 30GB GPU RAM**, at least one direct port, and at least 80GB disk space. **GPU preference order (always try the next tier down only if the current tier has no available offers):**
+  1. **≥30GB VRAM tier** — preferred default. Includes RTX 5090 (32GB), RTX 6000 Ada (48GB), RTX PRO 5000, A100, H100, etc. Pick the cheapest available ≥30GB offer first.
+  2. RTX 4090 / RTX 3090 / RTX 3090 Ti (24GB) — fallback only when no ≥30GB offers are available; RTX 4090 does **not** have 30GB VRAM.
+  Use `scripts/vast.py search --gpu-name "RTX 5090"` first and only fall back to `RTX 4090` (or `RTX 3090`) when the ≥30GB search returns an empty list. VoxCPM occupies ~22 GiB on a single 24GB card, so run the OmniVoice and VoxCPM engines exclusively (call `POST /api/unload` before switching engines) and keep `VAST_GPU` host-side flows on the same engine the smoke test exercises. The `scripts/vast.py smoke` helper intentionally only probes `/health` and `/api/health` — it does **not** call `/api/synthesize` or `/api/voxcpm/synthesize`, so it will not lazy-load either engine onto the GPU. **Prioritize Southeast Asia for both instances.** If only one Southeast Asia offer is available, place the second instance in the next preferred region (East Asia, then Central/West Asia, then Americas US/CA). Verify the host can reach Docker Hub before committing; stalled `Pulling fs layer` or registry timeouts mean the offer should be abandoned.
 - After creating instances, wait for the public ports and verify `GET /` returns `ok` and `GET /health` returns `{"ok": true, ...}`. **Report the first instance that passes health checks immediately; do not wait for both instances to be ready.** Once both are verified, report the second URL as well.
 - Do not keep old and new Vast.ai instances running after a redeploy unless the user explicitly asks for overlap. Once the new instance is verified, destroy old `omnivoice-api*` instances.
 

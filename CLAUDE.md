@@ -63,6 +63,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ## 5. Vast.ai Instance Operations
 
 - The `VAST_API_KEY` is stored in `~/.zshrc` (line 162). Load it from there or export it explicitly; do not hard-code tokens in this repository.
+- Speaker diarization (`diarize=true` on `/api/whisper/transcribe`) uses the gated `pyannote/speaker-diarization-community-1` model, so every new instance needs an HF token: read `HF_TOKEN` from `~/.zshrc` or the environment (never hard-code it, never put it in the Dockerfile/image) and pass it at creation time: `VAST_API_KEY=$KEY python scripts/vast.py create <offer_id> --env HF_TOKEN="$HF_TOKEN"`. The token's HF account must have accepted the model's terms on its HuggingFace page, otherwise diarization degrades to `diarization.error` (transcription itself is unaffected).
 - Use the reusable helper script `scripts/vast.py` for all Vast.ai operations. It reads the API key from the `VAST_API_KEY` environment variable.
   - Check balance/credit: `VAST_API_KEY=$KEY python scripts/vast.py balance`
   - List instances: `VAST_API_KEY=$KEY python scripts/vast.py list`
