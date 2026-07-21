@@ -4365,16 +4365,29 @@ def _qwen3_language_code(name) -> str:
 
 
 def _load_qwen3_asr_model_sync(device):
-    # qwen-asr 0.0.6 imports check_model_inputs from transformers.utils.generic,
-    # which transformers 5.x removed (v5 handles model-input kwargs natively, so
-    # a no-op fallback is equivalent). Shim it before importing qwen_asr.
+    # qwen-asr 0.0.6 decorates model classes with @check_model_inputs() from
+    # transformers.utils.generic. transformers 5.3 removed that symbol, and
+    # some other versions ship it with an incompatible signature that requires
+    # a positional func (it is input-validation only, so a no-op fallback is
+    # equivalent for inference). Shim it unless the installed one can be
+    # called with zero args.
+    import inspect
+
     import transformers.utils.generic as _transformers_generic
 
-    if not hasattr(_transformers_generic, "check_model_inputs"):
-        def check_model_inputs(func=None, **_kwargs):
-            return func if func is not None else (lambda f: f)
+    def _check_model_inputs_noop(func=None, **_kwargs):
+        return func if func is not None else (lambda f: f)
 
-        _transformers_generic.check_model_inputs = check_model_inputs
+    _existing = getattr(_transformers_generic, "check_model_inputs", None)
+    _compatible = False
+    if _existing is not None:
+        try:
+            _first = next(iter(inspect.signature(_existing).parameters.values()))
+            _compatible = _first.default is not inspect.Parameter.empty
+        except (StopIteration, TypeError, ValueError):
+            _compatible = False
+    if not _compatible:
+        _transformers_generic.check_model_inputs = _check_model_inputs_noop
 
     from qwen_asr import Qwen3ASRModel
 
