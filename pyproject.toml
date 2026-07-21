@@ -118,6 +118,9 @@ explicit = true
 constraint-dependencies = [
     "torch==2.8.0",
     "torchaudio==2.8.0",
+    # torchcodec 0.8+ requires torch>=2.9; 0.7 is the newest release
+    # compatible with torch 2.8 (pyannote.audio needs torchcodec>=0.7).
+    "torchcodec==0.7.0",
 ]
 
 [tool.hatch.build.targets.sdist]
