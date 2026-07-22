@@ -51,7 +51,9 @@ dependencies = [
     "pyannote.audio",
     "onnxruntime>=1.22; sys_platform != 'linux' and sys_platform != 'win32'",
     # >=1.23: first release with Blackwell (sm_120, RTX 50 series) CUDA kernels.
-    "onnxruntime-gpu>=1.23; sys_platform == 'linux' or sys_platform == 'win32'",
+    # <1.24: 1.24 wheels switched to CUDA 13 (libcudart.so.13), incompatible
+    # with the CUDA 12.8 runtime shipped by the torch cu128 wheels.
+    "onnxruntime-gpu>=1.23,<1.24; sys_platform == 'linux' or sys_platform == 'win32'",
     # Vendored VoxCPM2 inference (voxcpm/) top-level imports. These are already
     # pulled in transitively by transformers/audio-separator; listed explicitly
     # so the vendored package's imports resolve without the heavy voxcpm pip pkg.
