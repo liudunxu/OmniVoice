@@ -128,6 +128,9 @@ Track instances that have successfully launched and run the OmniVoice API. When 
 |------------|------------|---------------|---------|-----------------------------------|----------------------------------------------|
 | 140986     | RTX 3090   | East Asia     | TW      | `liudunxu/omnivoice-api:vast-gpu` | `5648d6c` (Return audio QC for synthesis)    |
 | 141336     | RTX 3090 Ti| Southeast Asia| TH      | `liudunxu/omnivoice-api:latest`   | `2026-07-10` (Latest image smoke test pass)  |
+| 136815     | RTX 5090   | Southeast Asia| TH      | `liudunxu/omnivoice-api:vast-gpu` | `6c748fe` (cu128 + ort 1.23; /api/separate verified on sm_120) |
+
+Hosts observed stalling on Docker Hub image pulls (avoid when possible): machine 57952 / 91308 (both on public IP 209.146.116.50, US). A pull whose `status_msg` shows no newly completed layer for 10+ minutes should be abandoned.
 
 Use this list to choose a preferred offer during `scripts/vast.py search`, but fall back to the next best offer if none of these machines are available.
 
