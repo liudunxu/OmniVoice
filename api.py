@@ -6548,6 +6548,7 @@ async def synthesize_voxcpm(request):
     retry_badcase_max_times = int(data.get("retry_badcase_max_times", 3))
     retry_badcase_ratio_threshold = float(data.get("retry_badcase_ratio_threshold", 6.0))
     trim_silence_vad = _bool_option(data.get("trim_silence_vad"), True)
+    user_speed = float(data.get("speed", 1.0))
 
     target_duration_ms = data.get("target_duration_ms")
     duration_tolerance_ms = data.get("duration_tolerance_ms")
@@ -7102,6 +7103,23 @@ async def synthesize_voxcpm(request):
         logger.info(
             f"[{req_id}] voxcpm trimmed {trailing_trim_sec:.3f}s trailing silence"
         )
+
+    # Pre-synthesis speed fit: time-stretch the waveform without pitch change.
+    if abs(user_speed - 1.0) >= 0.01:
+        try:
+            stretched = librosa.effects.time_stretch(
+                np.asarray(audio_waveform, dtype=np.float32).reshape(-1),
+                rate=user_speed,
+            )
+            original_dur = len(audio_waveform) / sample_rate
+            new_dur = len(stretched) / sample_rate
+            audio_waveform = stretched
+            logger.info(
+                f"[{req_id}] voxcpm speed={user_speed:.3f} applied: "
+                f"{original_dur:.3f}s -> {new_dur:.3f}s"
+            )
+        except Exception as exc:
+            logger.warning(f"[{req_id}] voxcpm speed stretch failed (keeping original): {exc}")
 
     audio_waveform, was_trimmed = _clamp_waveform_to_max_duration(
         audio_waveform, sample_rate, max_duration_sec
