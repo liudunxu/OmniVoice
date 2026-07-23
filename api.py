@@ -3949,8 +3949,8 @@ def _apply_peak_ceiling(waveform, ceiling: float = OUTPUT_PEAK_CEILING):
     peak = float(np.max(np.abs(arr)))
     if peak <= ceiling:
         return waveform, False
-    scaled = arr * (ceiling / max(peak, 1e-9))
-    return scaled.astype(np.float32), True
+    limited = ceiling * np.tanh(arr / ceiling)
+    return limited.astype(np.float32), True
 
 
 def _check_audio_quality_after_ceiling(
