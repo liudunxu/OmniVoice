@@ -6384,45 +6384,57 @@ def _generate_voxcpm_sync(model, text, **kwargs):
     seed = kwargs.get("seed")
     prompt_cache = kwargs.get("prompt_cache")
 
-    if prompt_cache is not None:
-        if normalize:
-            if model.text_normalizer is None:
-                from voxcpm.utils.text_normalize import TextNormalizer
-                model.text_normalizer = TextNormalizer()
-            text = model.text_normalizer.normalize(text)
-        wav, _, _ = model.tts_model.generate_with_prompt_cache(
-            target_text=text,
-            prompt_cache=prompt_cache,
-            cfg_value=cfg_value,
-            inference_timesteps=inference_timesteps,
-            min_len=min_len,
-            max_len=max_len,
-            retry_badcase=retry_badcase,
-            retry_badcase_max_times=retry_badcase_max_times,
-            retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
-            seed=seed,
-        )
-    else:
-        gen_kwargs = {
-            "text": text,
-            "cfg_value": cfg_value,
-            "inference_timesteps": inference_timesteps,
-            "min_len": min_len,
-            "max_len": max_len,
-            "normalize": normalize,
-            "denoise": denoise,
-            "retry_badcase": retry_badcase,
-            "retry_badcase_max_times": retry_badcase_max_times,
-            "retry_badcase_ratio_threshold": retry_badcase_ratio_threshold,
-            "trim_silence_vad": trim_silence_vad,
-            "seed": seed,
-        }
-        if ref_path is not None:
-            gen_kwargs["reference_wav_path"] = ref_path
-        if prompt_path is not None and prompt_text:
-            gen_kwargs["prompt_wav_path"] = prompt_path
-            gen_kwargs["prompt_text"] = prompt_text
-        wav = model.generate(**gen_kwargs)
+    def _run():
+        if prompt_cache is not None:
+            _text = text
+            if normalize:
+                if model.text_normalizer is None:
+                    from voxcpm.utils.text_normalize import TextNormalizer
+                    model.text_normalizer = TextNormalizer()
+                _text = model.text_normalizer.normalize(_text)
+            wav, _, _ = model.tts_model.generate_with_prompt_cache(
+                target_text=_text,
+                prompt_cache=prompt_cache,
+                cfg_value=cfg_value,
+                inference_timesteps=inference_timesteps,
+                min_len=min_len,
+                max_len=max_len,
+                retry_badcase=retry_badcase,
+                retry_badcase_max_times=retry_badcase_max_times,
+                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+                seed=seed,
+            )
+            return wav
+        else:
+            gen_kwargs = {
+                "text": text,
+                "cfg_value": cfg_value,
+                "inference_timesteps": inference_timesteps,
+                "min_len": min_len,
+                "max_len": max_len,
+                "normalize": normalize,
+                "denoise": denoise,
+                "retry_badcase": retry_badcase,
+                "retry_badcase_max_times": retry_badcase_max_times,
+                "retry_badcase_ratio_threshold": retry_badcase_ratio_threshold,
+                "trim_silence_vad": trim_silence_vad,
+                "seed": seed,
+            }
+            if ref_path is not None:
+                gen_kwargs["reference_wav_path"] = ref_path
+            if prompt_path is not None and prompt_text:
+                gen_kwargs["prompt_wav_path"] = prompt_path
+                gen_kwargs["prompt_text"] = prompt_text
+            return model.generate(**gen_kwargs)
+
+    try:
+        wav = _run()
+    except torch.cuda.OutOfMemoryError:
+        import gc
+        logger.warning("VoxCPM CUDA OOM detected; reclaiming VRAM and retrying once")
+        gc.collect()
+        torch.cuda.empty_cache()
+        wav = _run()
     arr = np.asarray(wav).reshape(-1).astype(np.float32)
     return arr
 
