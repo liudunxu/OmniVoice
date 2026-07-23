@@ -246,6 +246,17 @@ VOXCPM_VOICES_CACHE_SIZE = int(os.environ.get("VOXCPM_VOICES_CACHE_SIZE", "64"))
 VOXCPM_TRIM_LEADING_SILENCE = str(
     os.environ.get("VOXCPM_TRIM_LEADING_SILENCE", "1")
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Output noise gate: attenuates low-energy frames to suppress VoxCPM broadband
+# hiss in pauses. The threshold is adaptive (relative to each clip's speech RMS),
+# so on high-dynamic or quiet clips it can land inside the speech range and gate
+# out soft consonants / breathy / short phrases ("some TTS not audible"). Default
+# OFF; enable only if hiss is a problem, and tune the floor down if speech is cut.
+VOXCPM_NOISE_GATE_ENABLED = str(
+    os.environ.get("VOXCPM_NOISE_GATE_ENABLED", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
+VOXCPM_NOISE_GATE_FLOOR_DB = float(os.environ.get("VOXCPM_NOISE_GATE_FLOOR_DB", "-45.0"))
+VOXCPM_NOISE_GATE_GAIN = float(os.environ.get("VOXCPM_NOISE_GATE_GAIN", "0.08"))
+VOXCPM_NOISE_GATE_FADE_MS = float(os.environ.get("VOXCPM_NOISE_GATE_FADE_MS", "8.0"))
 VOXCPM_MAX_LEADING_TRIM_SEC = float(
     os.environ.get("VOXCPM_MAX_LEADING_TRIM_SEC", "1.0")
 )
@@ -3957,7 +3968,7 @@ def _detect_harsh_high_frequency_artifact(
     return issues
 
 
-def _apply_noise_gate(waveform, sample_rate: int, floor_db: float = -45.0, fade_ms: float = 8.0):
+def _apply_noise_gate(waveform, sample_rate: int, floor_db: float = -45.0, fade_ms: float = 8.0, gate_floor: float = 0.08):
     """Attenuate low-energy frames to suppress broadband hiss in non-speech segments."""
     arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
     if arr.size < sample_rate // 50:
@@ -3972,7 +3983,6 @@ def _apply_noise_gate(waveform, sample_rate: int, floor_db: float = -45.0, fade_
     if speech_rms < 1e-6:
         return waveform
     threshold = speech_rms * (10.0 ** (floor_db / 20.0))
-    gate_floor = 0.08
     gain = np.where(rms < threshold, gate_floor, 1.0).astype(np.float32)
     fade_frames = max(2, int(fade_ms / 10.0))
     if fade_frames > 1 and num_frames > fade_frames:
@@ -7187,7 +7197,14 @@ async def synthesize_voxcpm(request):
         if "duration_off_target" not in quality_issues:
             quality_issues.append("duration_off_target")
 
-    audio_waveform = _apply_noise_gate(audio_waveform, sample_rate)
+    if VOXCPM_NOISE_GATE_ENABLED:
+        audio_waveform = _apply_noise_gate(
+            audio_waveform,
+            sample_rate,
+            floor_db=VOXCPM_NOISE_GATE_FLOOR_DB,
+            fade_ms=VOXCPM_NOISE_GATE_FADE_MS,
+            gate_floor=VOXCPM_NOISE_GATE_GAIN,
+        )
     audio_waveform, peak_limited = _apply_peak_ceiling(audio_waveform, OUTPUT_PEAK_CEILING)
 
     # Leading/trailing trim and peak limiting operate after candidate selection.
