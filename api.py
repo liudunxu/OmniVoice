@@ -1706,6 +1706,14 @@ def _separate_audio_sync(input_path, output_dir, options):
 
     result = _run_cmd(cmd, check=False)
     vocals, background = _locate_separator_stems(output_dir)
+
+    if (not vocals or not background) and _is_cuda_oom(result.stderr):
+        logger.warning("Audio Separator CUDA OOM detected; reclaiming VRAM and retrying once")
+        _release_memory()
+        _clean_separator_outputs(output_dir, keep={input_audio})
+        result = _run_cmd(cmd, check=False)
+        vocals, background = _locate_separator_stems(output_dir)
+
     if (not vocals or not background or not vocals.exists() or not background.exists()) and model.lower().endswith(".ckpt"):
         _clean_separator_outputs(output_dir, keep={input_audio})
         result = _run_cmd([*cmd, "--mdxc_override_model_segment_size"], check=False)
@@ -2058,6 +2066,13 @@ def _release_memory():
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+
+def _is_cuda_oom(stderr: str) -> bool:
+    if not stderr:
+        return False
+    lower = stderr.lower()
+    return "cuda out of memory" in lower or "cuda error: out of memory" in lower
 
 
 def _voxcpm_optional_available(name: str) -> bool:
