@@ -170,10 +170,11 @@ OUTPUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUTPUT_PEAK_CEILING", "0.9
 # impulses, because injected events preserve the original vocal and a short
 # spike gated on/off at mix time pops.
 EVENT_DETECT_MIN_DURATION_S = float(os.environ.get("OMNIVOICE_EVENT_MIN_DURATION", "0.35"))
+EVENT_DETECT_MAX_DURATION_S = float(os.environ.get("OMNIVOICE_EVENT_MAX_DURATION", "2.5"))
 EVENT_DETECT_MERGE_GAP_S = float(os.environ.get("OMNIVOICE_EVENT_MERGE_GAP", "0.25"))
 EVENT_DETECT_MIN_GAP_S = float(os.environ.get("OMNIVOICE_EVENT_MIN_GAP", "0.12"))
 EVENT_DETECT_MAX_EVENTS = int(os.environ.get("OMNIVOICE_EVENT_MAX_EVENTS", "60"))
-EVENT_DETECT_MIN_CONF = float(os.environ.get("OMNIVOICE_EVENT_MIN_CONF", "0.55"))
+EVENT_DETECT_MIN_CONF = float(os.environ.get("OMNIVOICE_EVENT_MIN_CONF", "0.62"))
 EVENT_DETECT_TARGET_SR = int(os.environ.get("OMNIVOICE_EVENT_TARGET_SR", "16000"))
 EVENT_BOUNDARY_SEARCH_S = float(os.environ.get("OMNIVOICE_EVENT_BOUNDARY_SEARCH", "0.06"))
 
@@ -3593,6 +3594,10 @@ def _classify_event(stats, f0_list, spikes, duration, global_rms) -> Optional[tu
         return None
     if spike_count > 0 and duration < 0.5 and voiced_ratio < 0.3:
         return None
+    # Real laughs/gasps/screams are short bursts; a sustained vocalization is far
+    # more likely to be actual speech mislabeled as an event.
+    if duration > EVENT_DETECT_MAX_DURATION_S:
+        return None
 
     label = None
     conf = 0.0
@@ -3609,10 +3614,11 @@ def _classify_event(stats, f0_list, spikes, duration, global_rms) -> Optional[tu
         label = "screaming"
         conf = 0.3 * min(1.0, rms_rel / 2) + 0.3 * min(1.0, centroid / 6000) \
             + 0.2 * min(1.0, high_ratio / 0.4) + 0.2 * voiced_ratio
-    elif 0.15 <= voiced_ratio <= 0.6 and median_f0 >= 150 \
-            and (stats["rms_std"] / max(rms_mean, 1e-6)) >= 0.5 and centroid < 4500:
+    elif 0.25 <= voiced_ratio <= 0.6 and median_f0 >= 150 and duration <= 2.0 \
+            and (stats["rms_std"] / max(rms_mean, 1e-6)) >= 0.75 and centroid < 4500:
         label = "laughter"
-        conf = 0.4 * (stats["rms_std"] / max(rms_mean, 1e-6)) + 0.3 * voiced_ratio + 0.3 * min(1.0, rms_rel)
+        conf = 0.4 * min(1.0, (stats["rms_std"] / max(rms_mean, 1e-6)) / 0.75) \
+            + 0.3 * voiced_ratio + 0.3 * min(1.0, rms_rel)
     elif duration <= 1.2 and stats["flatness_mean"] >= 0.3 and voiced_ratio <= 0.4 \
             and centroid >= 2000 and rms_rel >= 0.8:
         label = "gasp"
