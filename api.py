@@ -3942,6 +3942,35 @@ def _detect_harsh_high_frequency_artifact(
     return issues
 
 
+def _apply_noise_gate(waveform, sample_rate: int, floor_db: float = -45.0, fade_ms: float = 8.0):
+    """Attenuate low-energy frames to suppress broadband hiss in non-speech segments."""
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if arr.size < sample_rate // 50:
+        return waveform
+    frame_len = max(1, int(0.01 * sample_rate))
+    num_frames = arr.size // frame_len
+    if num_frames < 4:
+        return waveform
+    frames = arr[: num_frames * frame_len].reshape(num_frames, frame_len)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    speech_rms = float(np.percentile(rms[rms > 0], 70)) if np.any(rms > 0) else 0.0
+    if speech_rms < 1e-6:
+        return waveform
+    threshold = speech_rms * (10.0 ** (floor_db / 20.0))
+    gate_floor = 0.08
+    gain = np.where(rms < threshold, gate_floor, 1.0).astype(np.float32)
+    fade_frames = max(2, int(fade_ms / 10.0))
+    if fade_frames > 1 and num_frames > fade_frames:
+        kernel = np.hanning(fade_frames).astype(np.float32)
+        kernel /= kernel.sum()
+        pad = fade_frames // 2
+        smoothed = np.convolve(gain, kernel, mode="same")
+        gain[pad: num_frames - pad] = smoothed[pad: num_frames - pad]
+    out = arr.copy()
+    out[: num_frames * frame_len] = (frames * gain[:, None]).reshape(-1)
+    return out
+
+
 def _apply_peak_ceiling(waveform, ceiling: float = OUTPUT_PEAK_CEILING):
     arr = np.asarray(waveform, dtype=np.float32)
     if arr.size == 0 or ceiling <= 0:
@@ -7143,6 +7172,7 @@ async def synthesize_voxcpm(request):
         if "duration_off_target" not in quality_issues:
             quality_issues.append("duration_off_target")
 
+    audio_waveform = _apply_noise_gate(audio_waveform, sample_rate)
     audio_waveform, peak_limited = _apply_peak_ceiling(audio_waveform, OUTPUT_PEAK_CEILING)
 
     # Leading/trailing trim and peak limiting operate after candidate selection.
