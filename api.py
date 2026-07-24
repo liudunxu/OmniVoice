@@ -154,6 +154,19 @@ OUTPUT_TEXT_QC_MIN_COVERAGE = float(os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN
 OUTPUT_TEXT_QC_MIN_AUDIO_DURATION = float(
     os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_MIN_AUDIO_DURATION", "1.0")
 )
+# Very short target text has a high-variance Whisper/text-QC signal and is
+# particularly easy to make worse by a second stochastic synthesis.  Protect
+# a first usable candidate unless the retry fixes a clear contamination or
+# materially improves coverage without worsening audio quality.
+SHORT_TEXT_PROTECTION_MAX_TOKENS = int(
+    os.environ.get("OMNIVOICE_SHORT_TEXT_PROTECTION_MAX_TOKENS", "4")
+)
+SHORT_TEXT_PROTECTION_MAX_CHARS = int(
+    os.environ.get("OMNIVOICE_SHORT_TEXT_PROTECTION_MAX_CHARS", "10")
+)
+SHORT_TEXT_MIN_COVERAGE_GAIN = float(
+    os.environ.get("OMNIVOICE_SHORT_TEXT_MIN_COVERAGE_GAIN", "0.18")
+)
 OUTPUT_TEXT_QC_PROMPT_LEAK_DURATION_RATIO = float(
     os.environ.get("OMNIVOICE_OUTPUT_TEXT_QC_PROMPT_LEAK_DURATION_RATIO", "1.6")
 )
@@ -4733,6 +4746,16 @@ def _text_qc_tokens(text: str) -> list[str]:
     )
 
 
+def _is_short_protected_text(text: str) -> bool:
+    """Return whether text-QC retries need the conservative short-text gate."""
+    normalized = re.sub(r"\s+", "", str(text or ""))
+    tokens = _text_qc_tokens(text)
+    return bool(tokens) and (
+        len(tokens) <= max(1, SHORT_TEXT_PROTECTION_MAX_TOKENS)
+        or len(normalized) <= max(1, SHORT_TEXT_PROTECTION_MAX_CHARS)
+    )
+
+
 def _lcs_coverage(expected_tokens: list[str], actual_tokens: list[str]) -> float:
     if not expected_tokens:
         return 1.0
@@ -4932,6 +4955,12 @@ def _should_accept_text_qc_candidate(
     current_signal_severe_count: int,
     candidate_signal_severe_count: int,
     prompt_leak: bool,
+    expected_text: Optional[str] = None,
+    current_audio_issues: Optional[list[str]] = None,
+    candidate_audio_issues: Optional[list[str]] = None,
+    current_duration_error: float = 0.0,
+    candidate_duration_error: float = 0.0,
+    target_duration: Optional[float] = None,
 ) -> bool:
     current_coverage = float((current_qc or {}).get("coverage") or 0.0)
     candidate_coverage = float((candidate_qc or {}).get("coverage") or 0.0)
@@ -4939,7 +4968,7 @@ def _should_accept_text_qc_candidate(
         (current_qc or {}).get("source_script_residue")
         or (current_qc or {}).get("prompt_leak_detected")
     )
-    return (
+    accepted = (
         candidate_coverage >= OUTPUT_TEXT_QC_MIN_COVERAGE
         and (current_contaminated or candidate_coverage >= current_coverage + 0.05)
         and candidate_signal_severe_count <= current_signal_severe_count
@@ -4947,6 +4976,46 @@ def _should_accept_text_qc_candidate(
         and not bool((candidate_qc or {}).get("source_script_residue"))
         and not bool((candidate_qc or {}).get("prompt_leak_detected"))
     )
+    if not accepted or not _is_short_protected_text(expected_text):
+        return accepted
+
+    # For short phrases, a small Whisper coverage fluctuation is not enough to
+    # justify replacing a clean first render.  A contaminated first render can
+    # still be rescued, but the retry must gain materially more text and not
+    # score worse on waveform/identity quality.
+    if not current_contaminated and candidate_coverage < current_coverage + SHORT_TEXT_MIN_COVERAGE_GAIN:
+        return False
+    current_score = _quality_candidate_score(
+        current_audio_issues or [], current_duration_error, target_duration
+    )
+    candidate_score = _quality_candidate_score(
+        candidate_audio_issues or [], candidate_duration_error, target_duration
+    )
+    return candidate_score <= current_score + 1e-6
+
+
+def _should_retry_incomplete_text_qc(
+    expected_text: str,
+    text_qc: Optional[Dict[str, Any]],
+    quality_issues: Optional[list[str]],
+) -> bool:
+    """Avoid stochastic retries for otherwise usable very short phrases."""
+    if not text_qc or text_qc.get("status") != "incomplete":
+        return False
+    if not _is_short_protected_text(expected_text):
+        return True
+    if text_qc.get("source_script_residue") or text_qc.get("prompt_leak_detected"):
+        return True
+    try:
+        coverage = float(text_qc.get("coverage") or 0.0)
+    except (TypeError, ValueError):
+        coverage = 0.0
+    if coverage < 0.45:
+        return True
+    retryable_signal_issues = _SEVERE_ISSUE_LABELS.difference(
+        {"duration_off_target", "duration_off_reference", "text_incomplete"}
+    )
+    return any(issue in retryable_signal_issues for issue in (quality_issues or []))
 
 
 routes = web.RouteTableDef()
@@ -7376,6 +7445,7 @@ async def synthesize_voxcpm(request):
         output_path_for_response
         and quality_retry
         and _qc_language_mismatch_triggers_retry(text_completeness_qc, language)
+        and _should_retry_incomplete_text_qc(text, text_completeness_qc, quality_issues)
     ):
         regen_promptless = bool(prompt_path is not None and prompt_audio_bytes is not None)
         regen_kwargs = dict(gen_kwargs)
@@ -7443,6 +7513,12 @@ async def synthesize_voxcpm(request):
                 len(current_signal_severe),
                 len(regen_signal_severe),
                 regen_prompt_leak,
+                expected_text=text,
+                current_audio_issues=quality_issues,
+                candidate_audio_issues=regen_issues,
+                current_duration_error=_duration_error(audio_waveform, sample_rate, target_duration_sec),
+                candidate_duration_error=_duration_error(regen_wav, sample_rate, target_duration_sec),
+                target_duration=target_duration_sec,
             ):
                 audio_waveform = regen_wav
                 wav_bytes = regen_wav_bytes
@@ -7474,7 +7550,7 @@ async def synthesize_voxcpm(request):
         output_path_for_response
         and quality_retry
         and text_completeness_qc is not None
-        and text_completeness_qc.get("status") == "incomplete"
+        and _should_retry_incomplete_text_qc(text, text_completeness_qc, quality_issues)
         and not lang_regen
     ):
         text_regen_promptless = bool(prompt_path is not None and prompt_audio_bytes is not None)
@@ -7553,6 +7629,12 @@ async def synthesize_voxcpm(request):
                 len(current_signal_severe),
                 len(text_regen_signal_severe),
                 text_regen_prompt_leak,
+                expected_text=text,
+                current_audio_issues=quality_issues,
+                candidate_audio_issues=text_regen_issues,
+                current_duration_error=_duration_error(audio_waveform, sample_rate, target_duration_sec),
+                candidate_duration_error=_duration_error(text_regen_wav, sample_rate, target_duration_sec),
+                target_duration=target_duration_sec,
             ):
                 old_coverage = float(text_completeness_qc.get("coverage") or 0.0)
                 new_coverage = float(text_regen_qc.get("coverage") or 0.0)

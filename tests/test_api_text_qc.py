@@ -5,6 +5,7 @@ import numpy as np
 from api import (
     _detect_metallic_resonance_artifact,
     _quality_candidate_score,
+    _should_retry_incomplete_text_qc,
     _should_accept_text_qc_candidate,
     _text_qc_tokens,
 )
@@ -51,6 +52,16 @@ class ApiTextQcTokenTest(unittest.TestCase):
         rng = np.random.default_rng(3)
         broadband = 0.12 * rng.normal(size=t.size).astype(np.float32)
         self.assertEqual(_detect_metallic_resonance_artifact(broadband, sample_rate), [])
+
+    def test_short_text_retry_requires_clear_failure(self):
+        incomplete = {"status": "incomplete", "coverage": 0.67}
+        self.assertFalse(_should_retry_incomplete_text_qc("好的", incomplete, []))
+        self.assertTrue(_should_retry_incomplete_text_qc("好的", {"status": "incomplete", "coverage": 0.0}, []))
+        self.assertTrue(
+            _should_retry_incomplete_text_qc(
+                "好的", incomplete, ["metallic_resonance"]
+            )
+        )
 
 
 if __name__ == "__main__":
