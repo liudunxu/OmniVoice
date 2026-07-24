@@ -195,7 +195,7 @@ _SEVERE_ISSUE_LABELS = frozenset({
     "empty", "clipping", "near_clipping", "harsh_high_freq",
     "impulsive_spike", "plosive", "periodic_pulse", "text_incomplete",
     "source_script_residue", "duration_off_target", "duration_off_reference",
-    "gender_mismatch",
+    "gender_mismatch", "metallic_resonance", "noise", "hiss",
 })
 GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT = float(
     os.environ.get("GENDER_MISMATCH_MIN_RELATIVE_F0_SHIFT", "1.25")
@@ -1871,6 +1871,7 @@ def _get_cached_voice_clone_prompt(
     cache_key = _make_voice_prompt_cache_key(audio_bytes, prompt_text, preprocess_prompt)
     cached = _VOICE_PROMPT_CACHE.get(cache_key)
     if cached is not None:
+        _VOICE_PROMPT_CACHE.move_to_end(cache_key)
         logger.debug("Voice clone prompt cache hit: %s", cache_key[:16])
         return cached
 
@@ -3974,6 +3975,46 @@ def _detect_harsh_high_frequency_artifact(
     return issues
 
 
+def _detect_metallic_resonance_artifact(waveform, sampling_rate: int) -> list[str]:
+    """Detect sustained narrow-band resonance without penalizing sibilants."""
+    arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if arr.size < int(max(0.45, sampling_rate * 0.45)) or sampling_rate < 12000:
+        return []
+    frame = max(256, int(0.040 * sampling_rate))
+    hop = max(128, int(0.020 * sampling_rate))
+    if arr.size < frame:
+        return []
+    window = np.hanning(frame).astype(np.float32)
+    spectra = []
+    rms_values = []
+    for start in range(0, arr.size - frame + 1, hop):
+        block = arr[start : start + frame]
+        rms_values.append(float(np.sqrt(np.mean(np.square(block), dtype=np.float64))))
+        spectra.append(np.abs(np.fft.rfft(block * window)) ** 2)
+    if len(spectra) < 8:
+        return []
+    rms = np.asarray(rms_values, dtype=np.float64)
+    active_floor = max(0.008, float(np.percentile(rms, 70)) * 0.22)
+    active = rms >= active_floor
+    if int(active.sum()) < 6:
+        return []
+    spec = np.asarray(spectra, dtype=np.float64)
+    freqs = np.fft.rfftfreq(frame, 1.0 / sampling_rate)
+    band = (freqs >= 1800.0) & (freqs <= min(10000.0, sampling_rate / 2.0))
+    if not np.any(band):
+        return []
+    band_spec = spec[:, band]
+    peak_ratio = np.max(band_spec, axis=1) / np.maximum(np.sum(band_spec, axis=1), 1e-12)
+    sustained = (peak_ratio >= 0.20) & active
+    run = max_run = 0
+    for value in sustained.tolist():
+        run = run + 1 if value else 0
+        max_run = max(max_run, run)
+    if max_run < 5 or float(np.mean(sustained[active])) < 0.28:
+        return []
+    return ["metallic_resonance"]
+
+
 def _apply_noise_gate(waveform, sample_rate: int, floor_db: float = -45.0, fade_ms: float = 8.0, gate_floor: float = 0.08):
     """Attenuate low-energy frames to suppress broadband hiss in non-speech segments."""
     arr = np.asarray(waveform, dtype=np.float32).reshape(-1)
@@ -4084,6 +4125,7 @@ def _check_audio_quality(
     issues.extend(pulse_issues)
     spike_locations.extend(pulse_locations)
     issues.extend(_detect_harsh_high_frequency_artifact(arr, sampling_rate))
+    issues.extend(_detect_metallic_resonance_artifact(arr, sampling_rate))
     return issues, spike_locations
 
 
@@ -4099,6 +4141,7 @@ _WAVEFORM_QUALITY_ISSUES = frozenset({
     "impulsive_spike",
     "periodic_pulse",
     "harsh_high_freq",
+    "metallic_resonance",
 })
 
 
@@ -4128,10 +4171,10 @@ def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dic
             float(fallback.get("position_temperature", 5.0)) * 0.6, 1.0
         )
 
-    if "harsh_high_freq" in issues or "near_clipping" in issues:
+    if "harsh_high_freq" in issues or "metallic_resonance" in issues or "near_clipping" in issues:
         fallback["cfg_value"] = max(float(fallback.get("cfg_value", 2.0)) * 0.85, 1.2)
 
-    if "periodic_pulse" in issues or "harsh_high_freq" in issues:
+    if "periodic_pulse" in issues or "harsh_high_freq" in issues or "metallic_resonance" in issues:
         fallback["t_shift"] = max(float(fallback.get("t_shift", 0.1)) * 0.6, 0.03)
 
     if (
@@ -4141,6 +4184,7 @@ def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dic
         or "impulsive_spike" in issues
         or "periodic_pulse" in issues
         or "harsh_high_freq" in issues
+        or "metallic_resonance" in issues
     ):
         # Disable post-processing in case aggressive trimming/leveling/spike limiting
         # caused the artifact; let the raw diffusion output through.
@@ -4156,6 +4200,34 @@ def _apply_fallback_params(gen_kwargs: Dict[str, Any], issues: list[str]) -> Dic
         fallback["t_shift"] = max(float(fallback.get("t_shift", 0.1)) * 0.7, 0.03)
 
     return fallback
+
+
+_QUALITY_CANDIDATE_PENALTIES = {
+    "empty": 1000.0,
+    "source_script_residue": 800.0,
+    "text_incomplete": 500.0,
+    "metallic_resonance": 240.0,
+    "clipping": 220.0,
+    "near_clipping": 150.0,
+    "harsh_high_freq": 140.0,
+    "impulsive_spike": 120.0,
+    "periodic_pulse": 120.0,
+    "plosive": 90.0,
+    "gender_mismatch": 400.0,
+    "too_much_silence": 180.0,
+    "too_quiet": 160.0,
+    "duration_off_target": 70.0,
+    "duration_off_reference": 30.0,
+    "emotion_mismatch": 80.0,
+}
+
+
+def _quality_candidate_score(issues, duration_error: float, target_duration: Optional[float]) -> float:
+    """Rank outputs by audible severity, not merely number of labels."""
+    penalty = sum(_QUALITY_CANDIDATE_PENALTIES.get(issue, 18.0) for issue in set(issues or []))
+    if target_duration and target_duration > 0:
+        penalty += min(100.0, 40.0 * float(duration_error) / max(float(target_duration), 0.25))
+    return penalty
 
 
 def _duration_error(waveform, sampling_rate: int, target_duration: Optional[float]) -> float:
@@ -4262,11 +4334,12 @@ def _generate_with_quality_retry(
         ref_duration=ref_duration,
     )
 
-    # Choose the result with fewer issues; tie-break by duration closeness.
-    if len(issues2) < len(issues) or (
-        len(issues2) == len(issues)
-        and _duration_error(audio2, model.sampling_rate, target_duration)
-        < _duration_error(audio, model.sampling_rate, target_duration)
+    # Choose by weighted audible severity; one metallic/contaminated candidate
+    # must not beat a clean candidate merely because it has fewer labels.
+    first_error = _duration_error(audio, model.sampling_rate, target_duration)
+    second_error = _duration_error(audio2, model.sampling_rate, target_duration)
+    if _quality_candidate_score(issues2, second_error, target_duration) < _quality_candidate_score(
+        issues, first_error, target_duration
     ):
         return audio2, attempts + attempts2, log + log2, issues2, True
 
@@ -4883,7 +4956,16 @@ routes = web.RouteTableDef()
 @routes.get("/api/health")
 async def health(request):
     logger.info(f"[{request.method}] {request.path} from {request.remote}")
-    return _json_response({"ok": True, "service": "voxcpm2_api"})
+    denoiser_available = _voxcpm_denoise_available()
+    return _json_response({
+        "ok": True,
+        "service": "voxcpm2_api",
+        "denoiser": {
+            "requested": VOXCPM_LOAD_DENOISER,
+            "available": denoiser_available,
+            "loaded": bool(_VOXCPM_MODEL is not None and VOXCPM_LOAD_DENOISER and denoiser_available),
+        },
+    })
 
 
 @routes.get("/v1/models")
@@ -7003,10 +7085,20 @@ async def synthesize_voxcpm(request):
                         if i in _SEVERE_ISSUE_LABELS
                         and not (duration_cap_relaxed and i == "duration_off_target")
                     ]
-                    # Keep whichever output has fewer severe issues.
-                    if len(retry_severe) < len(severe) or (
-                        len(retry_severe) == len(severe) and len(retry_issues) <= len(quality_issues)
-                    ):
+                    # Rank by audible severity rather than label count.  A retry
+                    # with one fewer minor label must not replace a clean candidate
+                    # with metallic/robotic resonance or another high-impact defect.
+                    retry_score = _quality_candidate_score(
+                        retry_issues,
+                        _duration_error(retry_wav, sample_rate, target_duration_sec),
+                        target_duration_sec,
+                    )
+                    current_score = _quality_candidate_score(
+                        quality_issues,
+                        _duration_error(audio_waveform, sample_rate, target_duration_sec),
+                        target_duration_sec,
+                    )
+                    if retry_score + 1e-6 < current_score:
                         audio_waveform = retry_wav
                         quality_issues = list(retry_issues)
                         spike_locations = retry_spikes
@@ -7052,22 +7144,15 @@ async def synthesize_voxcpm(request):
                         duration_tolerance=duration_tolerance_sec,
                         ref_duration=None,
                     )
-                    current_severe = [
-                        i for i in quality_issues
-                        if i in _SEVERE_ISSUE_LABELS
-                        and not (duration_cap_relaxed and i == "duration_off_target")
-                    ]
-                    duration_severe = [
-                        i for i in duration_issues
-                        if i in _SEVERE_ISSUE_LABELS
-                        and not (duration_cap_relaxed and i == "duration_off_target")
-                    ]
                     current_error = _duration_error(audio_waveform, sample_rate, target_duration_sec)
                     duration_error = _duration_error(duration_wav, sample_rate, target_duration_sec)
-                    if len(duration_severe) < len(current_severe) or (
-                        len(duration_severe) == len(current_severe)
-                        and duration_error + 0.03 < current_error
-                    ):
+                    duration_score = _quality_candidate_score(
+                        duration_issues, duration_error, target_duration_sec
+                    )
+                    current_score = _quality_candidate_score(
+                        quality_issues, current_error, target_duration_sec
+                    )
+                    if duration_score + 1e-6 < current_score:
                         audio_waveform = duration_wav
                         quality_issues = list(duration_issues)
                         spike_locations = duration_spikes
